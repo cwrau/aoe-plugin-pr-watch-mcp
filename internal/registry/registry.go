@@ -69,21 +69,31 @@ func (s *Store) Add(ctx context.Context, r Registration) error {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(pr_url) DO UPDATE SET session_id = excluded.session_id, next_due_at = excluded.next_due_at
 	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.Unresolved, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix())
-	return err
+	if err != nil {
+		return fmt.Errorf("add registration: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) Remove(ctx context.Context, prURL string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM registrations WHERE pr_url = ?`, prURL)
-	return err
+	if err != nil {
+		return fmt.Errorf("remove registration: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) List(ctx context.Context) ([]Registration, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, next_due_at, archived, created_at FROM registrations ORDER BY next_due_at ASC`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query registrations: %w", err)
 	}
 	defer rows.Close()
-	return scanAll(rows)
+	regs, err := scanAll(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan registrations: %w", err)
+	}
+	return regs, nil
 }
 
 // DueBefore returns every registration whose next_due_at has passed,
@@ -91,20 +101,30 @@ func (s *Store) List(ctx context.Context) ([]Registration, error) {
 func (s *Store) DueBefore(ctx context.Context, t time.Time) ([]Registration, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, next_due_at, archived, created_at FROM registrations WHERE next_due_at <= ? ORDER BY next_due_at ASC`, t.Unix())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query due registrations: %w", err)
 	}
 	defer rows.Close()
-	return scanAll(rows)
+	regs, err := scanAll(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan due registrations: %w", err)
+	}
+	return regs, nil
 }
 
 func (s *Store) UpdateState(ctx context.Context, prURL string, reviewCount int, ciBucket string, unresolved int, nextDueAt time.Time) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE registrations SET review_count = ?, ci_bucket = ?, unresolved = ?, next_due_at = ? WHERE pr_url = ?`, reviewCount, ciBucket, unresolved, nextDueAt.Unix(), prURL)
-	return err
+	if err != nil {
+		return fmt.Errorf("update state: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) SetArchived(ctx context.Context, prURL string, archived bool) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE registrations SET archived = ? WHERE pr_url = ?`, boolToInt(archived), prURL)
-	return err
+	if err != nil {
+		return fmt.Errorf("set archived: %w", err)
+	}
+	return nil
 }
 
 func scanAll(rows *sql.Rows) ([]Registration, error) {
@@ -114,14 +134,17 @@ func scanAll(rows *sql.Rows) ([]Registration, error) {
 		var nextDue, created int64
 		var archived int
 		if err := rows.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.Unresolved, &nextDue, &archived, &created); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan row: %w", err)
 		}
 		r.NextDueAt = time.Unix(nextDue, 0)
 		r.Archived = archived != 0
 		r.CreatedAt = time.Unix(created, 0)
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("row iteration: %w", err)
+	}
+	return out, nil
 }
 
 func boolToInt(b bool) int {
