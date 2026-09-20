@@ -122,14 +122,36 @@ func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration, c
 	}
 
 	if checkErr != nil {
-		s.log().Warn("check failed, will retry next tick", "pr_url", reg.PRURL, "error", checkErr)
+		// Push next_due_at out by the poll floor before giving up on this
+		// registration: a permanently-broken one (revoked token, deleted
+		// repo) would otherwise be retried on every scheduler tick forever,
+		// far below MinPollInterval and outside the rate-limit budget math.
+		// The stored state is written back unchanged — only the due time
+		// moves — so the next successful check still diffs against the real
+		// last-seen state.
+		s.log().Warn("check failed, retrying after the poll floor", "pr_url", reg.PRURL, "retry_in", MinPollInterval, "error", checkErr)
+		if err := s.Store.UpdateState(ctx, reg.PRURL, reg.ReviewCount, reg.CIBucket, reg.Unresolved, time.Now().Add(MinPollInterval)); err != nil {
+			s.log().Error("back off failed check", "pr_url", reg.PRURL, "error", err)
+		}
 		return
 	}
 
+	// A notification that couldn't be delivered must not advance the stored
+	// state or drop the registration: leaving both untouched means the next
+	// tick's Diff recomputes against the same prev state and re-sends the
+	// same events, which is the only retry this worker has. Advancing anyway
+	// would silently discard the event — and on MERGED/CLOSED it would
+	// discard the registration along with it.
+	sentAll := true
 	for _, ev := range provider.Diff(prev, result) {
 		if err := s.Notify.Send(ctx, reg.SessionID, eventMessage(ev)); err != nil {
-			s.log().Warn("notify failed, will retry next tick", "pr_url", reg.PRURL, "error", err)
+			s.log().Warn("notify failed", "pr_url", reg.PRURL, "session_id", reg.SessionID, "error", err)
+			sentAll = false
 		}
+	}
+	if !sentAll {
+		s.log().Warn("some notifications failed, leaving state unchanged to retry next tick", "pr_url", reg.PRURL)
+		return
 	}
 
 	if result.State == "merged" || result.State == "closed" {
