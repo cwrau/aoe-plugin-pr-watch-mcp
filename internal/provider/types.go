@@ -12,12 +12,12 @@ type PrevState struct {
 
 // CheckResult is one provider's raw poll result for a single PR/MR.
 type CheckResult struct {
-	State              string // "open" | "merged" | "closed"
-	ReviewCount        int
-	LatestReviewer     string
-	LatestReviewState  string
-	CIBucket           string // "none" | "success" | "failure" | "pending" | "action_required"
-	Unresolved         int
+	State             string // "open" | "merged" | "closed"
+	ReviewCount       int
+	LatestReviewer    string
+	LatestReviewState string
+	CIBucket          string // "none" | "success" | "failure" | "pending" | "action_required"
+	Unresolved        int
 }
 
 type Event struct {
