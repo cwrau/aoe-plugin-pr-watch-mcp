@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -104,6 +105,14 @@ type githubGraphQLResponse struct {
 		Remaining int    `json:"remaining"`
 		ResetAt   string `json:"resetAt"`
 	} `json:"rateLimit"`
+	// Errors carries GraphQL-level failures (rate limiting, NOT_FOUND,
+	// field errors). GitHub returns these with HTTP 200, so checkHTTPStatus
+	// never sees them — without this, an error response decodes into a
+	// zero-value PullRequest that mapGitHubState reads as a freshly "open"
+	// PR with no reviews and no CI.
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
 }
 
 func mapGitHubRollupState(state string) string {
@@ -130,6 +139,14 @@ func (c *GitHubChecker) Check(ctx context.Context, prURL string) (CheckResult, G
 		return CheckResult{}, GitHubBudgets{}, err
 	}
 	pr := gqlResp.Data.Repository.PullRequest
+	// An empty state means `pullRequest` came back null (e.g. the number
+	// doesn't exist in that repo). Treating that as data would hand
+	// mapGitHubState("") -> "open" a zero-value CheckResult, which then gets
+	// persisted as the new PrevState and makes the next successful poll
+	// re-fire every review/CI event as if it were new.
+	if pr.State == "" {
+		return CheckResult{}, GitHubBudgets{}, fmt.Errorf("github graphql: no pullRequest in response for %s", prURL)
+	}
 
 	result := CheckResult{
 		State:       mapGitHubState(pr.State),
@@ -216,6 +233,13 @@ func (c *GitHubChecker) queryGraphQL(ctx context.Context, owner, repo string, nu
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode github graphql response: %w", err)
 	}
+	if len(out.Errors) > 0 {
+		messages := make([]string, 0, len(out.Errors))
+		for _, e := range out.Errors {
+			messages = append(messages, e.Message)
+		}
+		return nil, fmt.Errorf("github graphql returned %d error(s): %s", len(out.Errors), strings.Join(messages, "; "))
+	}
 	return &out, nil
 }
 
@@ -229,8 +253,15 @@ func (c *GitHubChecker) checkActionRequired(ctx context.Context, owner, repo, he
 	if headSHA == "" {
 		return RateBudget{}, false, nil
 	}
-	url := fmt.Sprintf("%s/repos/%s/%s/actions/runs?head_sha=%s", c.baseURL(), owner, repo, headSHA)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// Escape every interpolated component: an owner/repo containing "?" or
+	// "#" would otherwise retarget the request path. per_page=100 raises the
+	// page size from GitHub's default of 30 so a PR with many workflow
+	// reruns can't push the one action_required run this cross-check exists
+	// to catch off the first page.
+	query := neturl.Values{"head_sha": {headSHA}, "per_page": {"100"}}
+	endpoint := fmt.Sprintf("%s/repos/%s/%s/actions/runs?%s",
+		c.baseURL(), neturl.PathEscape(owner), neturl.PathEscape(repo), query.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return RateBudget{}, false, err
 	}

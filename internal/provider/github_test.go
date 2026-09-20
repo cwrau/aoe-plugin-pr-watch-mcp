@@ -188,3 +188,76 @@ func TestGitHubCheckerRespectsContextTimeout(t *testing.T) {
 		t.Error("Check() with an expired context, want error")
 	}
 }
+
+// GitHub answers GraphQL-level failures (rate limiting, NOT_FOUND, field
+// errors) with HTTP 200 and a body-level `errors` array. Such a response
+// must be a hard error: decoded as data it becomes a zero-value "open PR,
+// no reviews, no CI" that gets persisted as PrevState and makes the next
+// successful poll re-fire every event as if it were new.
+func TestGitHubCheckerRejectsGraphQLErrors(t *testing.T) {
+	const body = `{
+	  "data": { "repository": null },
+	  "errors": [{ "message": "API rate limit exceeded" }]
+	}`
+	srv := fakeGitHubServer(t, body, 0)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://github.com/o/r/pull/1")
+	if err == nil {
+		t.Fatalf("Check() on a GraphQL errors response, want error, got result = %+v", result)
+	}
+	if !strings.Contains(err.Error(), "API rate limit exceeded") {
+		t.Errorf("Check() error = %v, want it to carry the GraphQL error message", err)
+	}
+}
+
+// A null pullRequest (e.g. the PR number doesn't exist) arrives without any
+// `errors` array at all, so it needs its own guard: mapGitHubState("")
+// would otherwise report it as an open PR.
+func TestGitHubCheckerRejectsNullPullRequest(t *testing.T) {
+	const body = `{
+	  "data": { "repository": { "pullRequest": null } },
+	  "rateLimit": { "limit": 5000, "remaining": 4999, "resetAt": "2026-09-20T23:00:00Z" }
+	}`
+	srv := fakeGitHubServer(t, body, 0)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://github.com/o/r/pull/1")
+	if err == nil {
+		t.Fatalf("Check() on a null pullRequest, want error, got result = %+v", result)
+	}
+}
+
+// checkActionRequired must escape its path components and ask for a full
+// page of runs: GitHub's default page size is 30, small enough for workflow
+// reruns to bury the one action_required run this cross-check exists for.
+func TestGitHubCheckerActionRequiredQueryIsEscapedAndPaginated(t *testing.T) {
+	var gotPath, gotQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(graphqlOpenSuccessBody))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery = r.URL.EscapedPath(), r.URL.Query().Encode()
+		json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]any{}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	if _, _, err := c.Check(t.Context(), "https://github.com/o/r/pull/1"); err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if gotPath != "/repos/o/r/actions/runs" {
+		t.Errorf("actions/runs path = %q, want /repos/o/r/actions/runs", gotPath)
+	}
+	if !strings.Contains(gotQuery, "per_page=100") {
+		t.Errorf("actions/runs query = %q, want it to request per_page=100", gotQuery)
+	}
+	if !strings.Contains(gotQuery, "head_sha=deadbeef") {
+		t.Errorf("actions/runs query = %q, want head_sha=deadbeef", gotQuery)
+	}
+}
