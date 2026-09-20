@@ -36,6 +36,17 @@ func TestComputeIntervalNearFloorWaitsForReset(t *testing.T) {
 	}
 }
 
+func TestComputeIntervalNoHeadroomShortWindowRespectsCeiling(t *testing.T) {
+	now := time.Now()
+	// No usable headroom (Remaining=500 is exactly the floor), and window is only 5s.
+	// Even though there's no headroom to use, we must not return an interval below MinPollInterval (30s).
+	budget := provider.RateBudget{Limit: 5000, Remaining: 500, ResetAt: now.Add(5 * time.Second)}
+	got := ComputeInterval(budget, 1, now)
+	if got < MinPollInterval {
+		t.Errorf("ComputeInterval() with short window and no headroom = %v, want >= floor %v", got, MinPollInterval)
+	}
+}
+
 func TestComputeIntervalResetInThePastUsesFallback(t *testing.T) {
 	now := time.Now()
 	budget := provider.RateBudget{Limit: 5000, Remaining: 100, ResetAt: now.Add(-time.Minute)}
