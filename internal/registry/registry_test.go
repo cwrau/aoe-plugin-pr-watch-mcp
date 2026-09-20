@@ -142,6 +142,30 @@ func TestUpdateState(t *testing.T) {
 	}
 }
 
+func TestCountByProvider(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now()
+	regs := []Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "a", Provider: "github", NextDueAt: now, CreatedAt: now},
+		{PRURL: "https://github.com/o/r/pull/2", SessionID: "b", Provider: "github", NextDueAt: now, CreatedAt: now},
+		{PRURL: "https://gitlab.example.com/g/p/-/merge_requests/1", SessionID: "c", Provider: "gitlab", NextDueAt: now, CreatedAt: now},
+	}
+	for _, r := range regs {
+		if err := s.Add(ctx, r); err != nil {
+			t.Fatalf("Add() error = %v", err)
+		}
+	}
+
+	got, err := s.CountByProvider(ctx)
+	if err != nil {
+		t.Fatalf("CountByProvider() error = %v", err)
+	}
+	if got["github"] != 2 || got["gitlab"] != 1 {
+		t.Errorf("CountByProvider() = %v, want {github:2, gitlab:1}", got)
+	}
+}
+
 func TestSetArchived(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)

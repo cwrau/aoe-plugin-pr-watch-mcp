@@ -197,6 +197,54 @@ func TestTickDropsRegistrationForGoneSession(t *testing.T) {
 	}
 }
 
+func TestTickUsesRealActiveCountsNotPlaceholder(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+	// Two GitHub registrations sharing one pool: the interval each gets
+	// should reflect 2 active consumers, not the old hardcoded placeholder.
+	for i, url := range []string{"https://github.com/o/r/pull/1", "https://github.com/o/r/pull/2"} {
+		reg := registry.Registration{PRURL: url, SessionID: "sess", Provider: "github", NextDueAt: now.Add(-time.Duration(i) * time.Second), CreatedAt: now}
+		if err := store.Add(ctx, reg); err != nil {
+			t.Fatalf("Add() error = %v", err)
+		}
+	}
+
+	// Remaining is set low enough (relative to Limit) that the per-
+	// registration interval clears the MinPollInterval floor for both
+	// activeCount=1 and activeCount=2, so the two are actually
+	// distinguishable — at Remaining:4500/Limit:5000 (used elsewhere in this
+	// package) both clamp to the same 30s floor regardless of activeCount,
+	// which would make this test pass or fail independent of whether Tick
+	// uses the real count at all.
+	gh := &fakeGitHubChecker{
+		result: provider.CheckResult{State: "open", CIBucket: "success"},
+		budgets: provider.GitHubBudgets{
+			GraphQL: provider.RateBudget{Limit: 5000, Remaining: 550, ResetAt: now.Add(time.Hour)},
+			REST:    provider.RateBudget{Limit: 5000, Remaining: 550, ResetAt: now.Add(time.Hour)},
+		},
+	}
+	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{}}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	remaining, err := store.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	// With 2 active GitHub registrations, ComputeInterval(budget, 2, now)
+	// must produce a longer per-registration interval than
+	// ComputeInterval(budget, 1, now) would — confirms the real count (2),
+	// not the old placeholder (1), reached ComputeInterval.
+	withOne := ComputeInterval(gh.budgets.GraphQL, 1, now)
+	for _, r := range remaining {
+		if r.NextDueAt.Sub(now) <= withOne {
+			t.Errorf("registration %s got interval %v, want > single-registration interval %v (real count of 2 should widen it)", r.PRURL, r.NextDueAt.Sub(now), withOne)
+		}
+	}
+}
+
 // alwaysLiveSessions/alwaysArchivedSessions/alwaysGoneSessions are minimal
 // SessionClassifier fakes (see the SessionClassifier interface added to
 // scheduler.go) so the scheduler's lifecycle branching can be tested
