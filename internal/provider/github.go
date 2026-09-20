@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -206,6 +208,10 @@ func (c *GitHubChecker) queryGraphQL(ctx context.Context, owner, repo string, nu
 	}
 	defer resp.Body.Close()
 
+	if err := checkHTTPStatus(resp); err != nil {
+		return nil, fmt.Errorf("github graphql: %w", err)
+	}
+
 	var out githubGraphQLResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode github graphql response: %w", err)
@@ -238,6 +244,10 @@ func (c *GitHubChecker) checkActionRequired(ctx context.Context, owner, repo, he
 
 	budget := parseGitHubRESTRateHeaders(resp)
 
+	if err := checkHTTPStatus(resp); err != nil {
+		return budget, false, fmt.Errorf("github actions runs: %w", err)
+	}
+
 	var out githubActionsRunsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return budget, false, fmt.Errorf("decode github actions runs response: %w", err)
@@ -248,6 +258,27 @@ func (c *GitHubChecker) checkActionRequired(ctx context.Context, owner, repo, he
 		}
 	}
 	return budget, false, nil
+}
+
+// maxHTTPErrorBodyBytes caps how much of a non-2xx response body is read
+// into an error message, so a large or misbehaving error page can't blow up
+// the error string.
+const maxHTTPErrorBodyBytes = 512
+
+// checkHTTPStatus returns an error describing the status code and a
+// truncated response body if resp is not a 2xx response. Callers must check
+// this before decoding resp.Body as JSON: an auth failure, secondary rate
+// limit, or outage response often isn't shaped like the expected payload
+// and would otherwise decode silently into zero values (e.g. a PR
+// mis-reported as freshly "open" with no reviews), which can then get
+// persisted as PrevState and cause spurious diff events on the next
+// successful poll.
+func checkHTTPStatus(resp *http.Response) error {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxHTTPErrorBodyBytes))
+	return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 }
 
 func parseGitHubRESTRateHeaders(resp *http.Response) RateBudget {

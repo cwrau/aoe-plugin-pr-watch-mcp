@@ -140,6 +140,40 @@ func TestGitHubCheckerActionRequiredDoesNotOverrideFailure(t *testing.T) {
 	}
 }
 
+func TestGitHubCheckerErrorsOnNon2xxGraphQLStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"message":"Bad credentials"}`))
+	}))
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "bad-token", BaseURL: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://github.com/o/r/pull/1")
+	if err == nil {
+		t.Fatalf("Check() with a 401 graphql response, want error, got result = %+v", result)
+	}
+}
+
+func TestGitHubCheckerErrorsOnNon2xxActionsRunsStatus(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(graphqlOpenSuccessBody))
+	})
+	mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`internal server error`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://github.com/o/r/pull/1")
+	if err == nil {
+		t.Fatalf("Check() with a 500 actions/runs response, want error, got result = %+v", result)
+	}
+}
+
 func TestGitHubCheckerRespectsContextTimeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(50 * time.Millisecond)
