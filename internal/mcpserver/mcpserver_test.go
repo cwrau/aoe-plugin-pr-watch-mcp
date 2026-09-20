@@ -198,3 +198,90 @@ func TestUnregisterRequiresMatchingSessionID(t *testing.T) {
 		t.Fatalf("after unregister with correct session_id, store.List() = %+v, want empty", regs)
 	}
 }
+
+// TestRegisterRejectsEmptySessionID: an empty session_id can never match a
+// real AoE session, so the scheduler would classify it gone and delete the
+// registration on the next tick — register must reject it up front rather
+// than reporting a success that silently evaporates.
+func TestRegisterRejectsEmptySessionID(t *testing.T) {
+	store := openTestStore(t)
+	srv := httptest.NewServer(NewHandler(store))
+	defer srv.Close()
+
+	callToolExpectError(t, srv, "register", map[string]any{
+		"pr_url":     "https://github.com/o/r/pull/1",
+		"session_id": "",
+	})
+
+	regs, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(regs) != 0 {
+		t.Fatalf("after rejected register, store.List() = %+v, want empty", regs)
+	}
+}
+
+// TestRegisterRejectsCrossSessionReassignment: store.Add upserts, so without
+// an ownership check a caller could re-register another session's pr_url
+// under its own session_id — hijacking its notifications and gaining the
+// right to unregister it, which is exactly what unregister's ownership
+// check is supposed to prevent.
+func TestRegisterRejectsCrossSessionReassignment(t *testing.T) {
+	store := openTestStore(t)
+	srv := httptest.NewServer(NewHandler(store))
+	defer srv.Close()
+
+	callTool(t, srv, "register", map[string]any{
+		"pr_url":     "https://github.com/o/r/pull/1",
+		"session_id": "sess1",
+	})
+
+	callToolExpectError(t, srv, "register", map[string]any{
+		"pr_url":     "https://github.com/o/r/pull/1",
+		"session_id": "sess-attacker",
+	})
+
+	regs, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(regs) != 1 || regs[0].SessionID != "sess1" {
+		t.Fatalf("store.List() = %+v, want the original sess1 registration untouched", regs)
+	}
+
+	// The original owner must still be able to unregister it, proving the
+	// rejected call didn't take ownership.
+	callTool(t, srv, "unregister", map[string]any{
+		"pr_url":     "https://github.com/o/r/pull/1",
+		"session_id": "sess1",
+	})
+	regs, err = store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(regs) != 0 {
+		t.Fatalf("after the owner unregistered, store.List() = %+v, want empty", regs)
+	}
+}
+
+// TestRegisterIsIdempotentForSameSession: re-registering the same pr_url
+// from the same session (e.g. reconnecting after a worker restart) must
+// still succeed — the ownership check only rejects a *different* session.
+func TestRegisterIsIdempotentForSameSession(t *testing.T) {
+	store := openTestStore(t)
+	srv := httptest.NewServer(NewHandler(store))
+	defer srv.Close()
+
+	args := map[string]any{"pr_url": "https://github.com/o/r/pull/1", "session_id": "sess1"}
+	callTool(t, srv, "register", args)
+	callTool(t, srv, "register", args)
+
+	regs, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(regs) != 1 || regs[0].SessionID != "sess1" {
+		t.Fatalf("store.List() = %+v, want exactly one sess1 registration", regs)
+	}
+}

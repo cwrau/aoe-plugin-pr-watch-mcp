@@ -66,9 +66,28 @@ func NewHandler(store *registry.Store) http.Handler {
 			Name:        "register",
 			Description: "Start watching a GitHub PR or GitLab MR for review/CI/merge activity, waking this session on changes.",
 		}, func(ctx context.Context, req *mcp.CallToolRequest, in registerInput) (*mcp.CallToolResult, registerOutput, error) {
+			// An empty session_id can never match a real AoE session, so the
+			// scheduler would classify it SessionGone and silently delete
+			// the registration on the very next tick — a watch that reports
+			// success and then evaporates.
+			if in.SessionID == "" {
+				return nil, registerOutput{}, fmt.Errorf("session_id is required")
+			}
 			prov, err := detectProvider(in.PRURL)
 			if err != nil {
 				return nil, registerOutput{}, err
+			}
+			// Refuse to reassign someone else's watch. store.Add upserts, so
+			// without this check a caller could re-register another
+			// session's pr_url under its own session_id and thereby both
+			// hijack its notifications and gain the right to unregister it —
+			// defeating unregister's ownership check entirely.
+			existing, ok, err := store.Get(ctx, in.PRURL)
+			if err != nil {
+				return nil, registerOutput{}, err
+			}
+			if ok && existing.SessionID != in.SessionID {
+				return nil, registerOutput{}, fmt.Errorf("pr_url %q is already registered by a different session", in.PRURL)
 			}
 			reg := registry.Registration{
 				PRURL:     in.PRURL,
@@ -88,21 +107,17 @@ func NewHandler(store *registry.Store) http.Handler {
 			Name:        "unregister",
 			Description: "Stop watching a previously-registered GitHub PR or GitLab MR.",
 		}, func(ctx context.Context, req *mcp.CallToolRequest, in unregisterInput) (*mcp.CallToolResult, unregisterOutput, error) {
-			existing, ok, err := store.Get(ctx, in.PRURL)
+			// One atomic ownership-scoped delete rather than a Get-then-
+			// Remove pair: nothing can change the row's owner between the
+			// check and the delete. A false result covers both "not
+			// registered" and "registered by a different session" without
+			// distinguishing them, so a caller can't probe for which PRs/MRs
+			// other sessions are watching.
+			removed, err := store.RemoveOwnedBy(ctx, in.PRURL, in.SessionID)
 			if err != nil {
 				return nil, unregisterOutput{}, err
 			}
-			// Not registered, or registered by a different session: report
-			// "nothing removed" without distinguishing the two cases, so a
-			// caller can't probe for which PRs/MRs other sessions are
-			// watching.
-			if !ok || existing.SessionID != in.SessionID {
-				return nil, unregisterOutput{Removed: false}, nil
-			}
-			if err := store.Remove(ctx, in.PRURL); err != nil {
-				return nil, unregisterOutput{}, err
-			}
-			return nil, unregisterOutput{Removed: true}, nil
+			return nil, unregisterOutput{Removed: removed}, nil
 		})
 
 		mcp.AddTool(server, &mcp.Tool{

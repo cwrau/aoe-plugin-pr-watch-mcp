@@ -62,7 +62,9 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // Add registers a PR/MR, or updates its session_id and next_due_at if
 // already registered (re-registering the same URL is idempotent, not an
-// error).
+// error). This upsert does not enforce ownership — whether a caller may
+// take over an existing URL's session_id is decided one layer up, in the
+// register tool, which rejects a cross-session reassignment outright.
 func (s *Store) Add(ctx context.Context, r Registration) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, unresolved, next_due_at, archived, created_at)
@@ -104,6 +106,24 @@ func (s *Store) Get(ctx context.Context, prURL string) (Registration, bool, erro
 	r.Archived = archived != 0
 	r.CreatedAt = time.Unix(created, 0)
 	return r, true, nil
+}
+
+// RemoveOwnedBy deletes prURL's registration only if it belongs to
+// sessionID, reporting whether a row was actually deleted. The check and
+// the delete are one statement so a concurrent re-register can't slip
+// between them. A false result deliberately doesn't distinguish "not
+// registered" from "registered by someone else", so a caller can't probe
+// for which PRs/MRs other sessions are watching.
+func (s *Store) RemoveOwnedBy(ctx context.Context, prURL, sessionID string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM registrations WHERE pr_url = ? AND session_id = ?`, prURL, sessionID)
+	if err != nil {
+		return false, fmt.Errorf("remove owned registration: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("remove owned registration: rows affected: %w", err)
+	}
+	return affected > 0, nil
 }
 
 func (s *Store) List(ctx context.Context) ([]Registration, error) {
