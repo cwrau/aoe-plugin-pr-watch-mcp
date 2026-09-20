@@ -47,7 +47,7 @@ func TestComputeIntervalResetInThePastUsesFallback(t *testing.T) {
 
 func TestComputeIntervalScalesWithActiveRegistrations(t *testing.T) {
 	now := time.Now()
-	budget := provider.RateBudget{Limit: 5000, Remaining: 4500, ResetAt: now.Add(time.Hour)}
+	budget := provider.RateBudget{Limit: 5000, Remaining: 550, ResetAt: now.Add(time.Hour)}
 	one := ComputeInterval(budget, 1, now)
 	ten := ComputeInterval(budget, 10, now)
 	if ten <= one {
