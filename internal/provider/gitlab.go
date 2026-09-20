@@ -31,8 +31,19 @@ func ParseGitLabMRURL(mrURL string) (host, projectPath string, iid int, err erro
 // poll_gitlab, ported to Go so the scheduler can read RateLimit-* response
 // headers directly instead of shelling to `glab`.
 type GitLabChecker struct {
-	HTTPClient  *http.Client
-	Token       string
+	HTTPClient *http.Client
+
+	// TokenFunc resolves the credential to send for a given MR's host,
+	// called fresh on every Check — never cached across hosts. This is
+	// deliberate: a single static token sent to whatever host a
+	// registered pr_url happens to name would hand a real, working
+	// GitLab credential to any host an attacker can get accepted as a
+	// registration (URL shape validation alone can't distinguish a
+	// trusted self-hosted GitLab instance from an attacker's server
+	// formatted to look like one). Resolving per-host means an
+	// unconfigured host naturally has no secret to leak; see
+	// TokenFunc's caller in Check for the empty-token short-circuit.
+	TokenFunc   func(host string) (string, error)
 	TokenHeader string // defaults to "PRIVATE-TOKEN"; see Task 4's auth-header note
 
 	// apiBaseOverride replaces "https://{host}/api/v4" with a fixed base
@@ -86,13 +97,25 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 	if err != nil {
 		return CheckResult{}, RateBudget{}, err
 	}
+
+	if c.TokenFunc == nil {
+		return CheckResult{}, RateBudget{}, fmt.Errorf("gitlab %s: no TokenFunc configured", host)
+	}
+	token, err := c.TokenFunc(host)
+	if err != nil {
+		return CheckResult{}, RateBudget{}, fmt.Errorf("resolve gitlab token for %s: %w", host, err)
+	}
+	if token == "" {
+		return CheckResult{}, RateBudget{}, fmt.Errorf("no gitlab token configured for host %s", host)
+	}
+
 	base := c.apiBaseOverride
 	if base == "" {
 		base = "https://" + host
 	}
 	encodedPath := url.PathEscape(projectPath)
 
-	mr, budget, err := c.getJSON(ctx, fmt.Sprintf("%s/api/v4/projects/%s/merge_requests/%d", base, encodedPath, iid), &gitlabMRResponse{})
+	mr, budget, err := c.getJSON(ctx, token, fmt.Sprintf("%s/api/v4/projects/%s/merge_requests/%d", base, encodedPath, iid), &gitlabMRResponse{})
 	if err != nil {
 		return CheckResult{}, RateBudget{}, err
 	}
@@ -111,14 +134,14 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 	}
 	result.CIBucket = mapGitLabPipelineStatus(pipelineStatus)
 
-	approvalsRaw, _, err := c.getJSON(ctx, fmt.Sprintf("%s/api/v4/projects/%s/merge_requests/%d/approvals", base, encodedPath, iid), &gitlabApprovalsResponse{})
+	approvalsRaw, _, err := c.getJSON(ctx, token, fmt.Sprintf("%s/api/v4/projects/%s/merge_requests/%d/approvals", base, encodedPath, iid), &gitlabApprovalsResponse{})
 	if err != nil {
 		return CheckResult{}, RateBudget{}, err
 	}
 	result.ReviewCount = len(approvalsRaw.(*gitlabApprovalsResponse).ApprovedBy)
 
 	var discussions []gitlabDiscussion
-	if _, _, err := c.getJSON(ctx, fmt.Sprintf("%s/api/v4/projects/%s/merge_requests/%d/discussions?per_page=100", base, encodedPath, iid), &discussions); err != nil {
+	if _, _, err := c.getJSON(ctx, token, fmt.Sprintf("%s/api/v4/projects/%s/merge_requests/%d/discussions?per_page=100", base, encodedPath, iid), &discussions); err != nil {
 		return CheckResult{}, RateBudget{}, err
 	}
 	for _, d := range discussions {
@@ -150,12 +173,12 @@ func mapGitLabState(state string) string {
 // before decoding — see checkHTTPStatus in github.go for why: an
 // auth/rate-limit/outage response often isn't shaped like the expected
 // payload and would otherwise decode silently into zero values.
-func (c *GitLabChecker) getJSON(ctx context.Context, url string, out any) (any, RateBudget, error) {
+func (c *GitLabChecker) getJSON(ctx context.Context, token, url string, out any) (any, RateBudget, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, RateBudget{}, err
 	}
-	req.Header.Set(c.tokenHeader(), c.Token)
+	req.Header.Set(c.tokenHeader(), token)
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {

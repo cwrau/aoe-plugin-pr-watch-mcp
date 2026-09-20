@@ -65,7 +65,12 @@ func main() {
 		},
 		GitLab: &provider.GitLabChecker{
 			HTTPClient: http.DefaultClient,
-			Token:      mustGitLabToken(logger),
+			// Resolved fresh per-host at check time, not once globally:
+			// see provider.GitLabChecker.TokenFunc's doc comment for why
+			// a single static token is a credential leak across hosts.
+			TokenFunc: func(host string) (string, error) {
+				return runToken("glab", "config", "get", "token", "--host", host)
+			},
 		},
 		Sessions: aoe,
 		Notify:   &notifier.Notifier{},
@@ -124,10 +129,12 @@ func runHTTPServer(ctx context.Context, store *registry.Store, logger *slog.Logg
 	}
 }
 
-// runToken shells out to a CLI's token-printing subcommand once at
-// startup. Low frequency (not per-poll), so subprocess overhead doesn't
-// matter; the alternative (parsing gh's/glab's own credential storage
-// directly) is far more fragile across keyring backends.
+// runToken shells out to a CLI's token-printing subcommand: once at
+// startup for the GitHub token, and once per host per Check for the
+// GitLab token (see provider.GitLabChecker.TokenFunc). Either way it's
+// low frequency (not per-poll-per-registration), so subprocess overhead
+// doesn't matter; the alternative (parsing gh's/glab's own credential
+// storage directly) is far more fragile across keyring backends.
 func runToken(name string, args ...string) (string, error) {
 	out, err := exec.Command(name, args...).Output()
 	if err != nil {
@@ -141,13 +148,4 @@ func bytesTrimSpace(b []byte) []byte {
 		b = b[:len(b)-1]
 	}
 	return b
-}
-
-func mustGitLabToken(logger *slog.Logger) string {
-	token, err := runToken("glab", "config", "get", "token")
-	if err != nil {
-		logger.Warn("glab config get token unavailable at startup; GitLab checks will fail until it is", "error", err)
-		return ""
-	}
-	return token
 }
