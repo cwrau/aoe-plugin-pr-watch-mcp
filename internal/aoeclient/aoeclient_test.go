@@ -85,3 +85,23 @@ func TestClassifyLiveArchivedGone(t *testing.T) {
 		}
 	}
 }
+
+func TestRefreshSessionSetsNonOKStatus(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("state") {
+		case "live":
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("[]"))
+		default:
+			json.NewEncoder(w).Encode([]map[string]any{})
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL, HTTPClient: srv.Client()}
+	if err := c.RefreshSessionSets(t.Context()); err == nil {
+		t.Error("RefreshSessionSets() with a non-2xx response for one state, want error")
+	}
+}
