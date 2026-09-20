@@ -75,6 +75,10 @@ func (c *Client) fetchIDs(ctx context.Context, state string) (map[string]bool, e
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, fmt.Errorf("GET %s: unexpected status %d", url, resp.StatusCode)
+	}
+
 	var rows []sessionRow
 	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
 		return nil, fmt.Errorf("decode %s response: %w", url, err)
