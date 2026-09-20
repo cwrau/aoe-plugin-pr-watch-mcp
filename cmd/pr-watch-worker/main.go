@@ -22,6 +22,20 @@ import (
 const (
 	defaultPort  = 8632
 	tickInterval = 15 * time.Second
+
+	// httpTimeout bounds every provider API call. Without it a half-open
+	// connection to GitHub/GitLab would hang a Tick indefinitely.
+	httpTimeout = 30 * time.Second
+
+	// tickTimeout bounds one whole scheduler pass. A normal tick is far
+	// shorter; this only exists so a pathological one can't wedge the loop
+	// forever.
+	tickTimeout = 60 * time.Second
+
+	// tokenTimeout bounds a credential-helper subprocess (`gh auth token`,
+	// `glab config get token`), which can block on a stuck keyring or dbus
+	// backend.
+	tokenTimeout = 10 * time.Second
 )
 
 func main() {
@@ -52,24 +66,33 @@ func main() {
 		os.Exit(1)
 	}
 
-	ghToken, err := runToken("gh", "auth", "token")
+	tokenCtx, cancelToken := context.WithTimeout(context.Background(), tokenTimeout)
+	ghToken, err := runToken(tokenCtx, "gh", "auth", "token")
+	cancelToken()
 	if err != nil {
 		logger.Warn("gh auth token unavailable at startup; GitHub checks will fail until it is", "error", err)
 	}
 
+	// One shared client for both checkers, with an explicit timeout:
+	// http.DefaultClient has none, so a stalled provider connection would
+	// block a Tick forever.
+	httpClient := &http.Client{Timeout: httpTimeout}
+
 	sched := &scheduler.Scheduler{
 		Store: store,
 		GitHub: &provider.GitHubChecker{
-			HTTPClient: http.DefaultClient,
+			HTTPClient: httpClient,
 			Token:      ghToken,
 		},
 		GitLab: &provider.GitLabChecker{
-			HTTPClient: http.DefaultClient,
+			HTTPClient: httpClient,
 			// Resolved fresh per-host at check time, not once globally:
 			// see provider.GitLabChecker.TokenFunc's doc comment for why
 			// a single static token is a credential leak across hosts.
-			TokenFunc: func(host string) (string, error) {
-				return runToken("glab", "config", "get", "token", "--host", host)
+			// Check's context is passed straight through so the glab fork
+			// is bounded by the same deadline as the poll it serves.
+			TokenFunc: func(ctx context.Context, host string) (string, error) {
+				return runToken(ctx, "glab", "config", "get", "token", "--host", host)
 			},
 		},
 		Sessions: aoe,
@@ -102,7 +125,13 @@ func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, logger *s
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := sched.Tick(ctx); err != nil {
+			// Bound each pass: ctx alone is only cancelled at shutdown, so
+			// without a deadline a single wedged tick would stop the loop
+			// from ever running again.
+			tickCtx, cancel := context.WithTimeout(ctx, tickTimeout)
+			err := sched.Tick(tickCtx)
+			cancel()
+			if err != nil {
 				logger.Error("scheduler tick", "error", err)
 			}
 		}
@@ -129,14 +158,17 @@ func runHTTPServer(ctx context.Context, store *registry.Store, logger *slog.Logg
 	}
 }
 
-// runToken shells out to a CLI's token-printing subcommand: once at
-// startup for the GitHub token, and once per host per Check for the
-// GitLab token (see provider.GitLabChecker.TokenFunc). Either way it's
-// low frequency (not per-poll-per-registration), so subprocess overhead
-// doesn't matter; the alternative (parsing gh's/glab's own credential
-// storage directly) is far more fragile across keyring backends.
-func runToken(name string, args ...string) (string, error) {
-	out, err := exec.Command(name, args...).Output()
+// runToken shells out to a CLI's token-printing subcommand: once at startup
+// for the GitHub token, and once per GitLab poll for the GitLab token (see
+// provider.GitLabChecker.TokenFunc — it resolves per-host at check time, so
+// every GitLab registration's every poll forks one `glab`). That puts it in
+// the scheduler's hot path, which is why it runs under the caller's context
+// rather than unbounded: a stuck keyring backend would otherwise hang the
+// whole scheduler, not just one registration. The alternative (parsing gh's
+// /glab's own credential storage directly) is far more fragile across
+// keyring backends, so the subprocess stays.
+func runToken(ctx context.Context, name string, args ...string) (string, error) {
+	out, err := exec.CommandContext(ctx, name, args...).Output()
 	if err != nil {
 		return "", err
 	}
