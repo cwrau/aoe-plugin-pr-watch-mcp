@@ -10,13 +10,6 @@ import (
 	"github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
 )
 
-// activeCountPlaceholder stands in for the real per-provider-pool active
-// registration count until Task 9 wires up a proper Store.CountByProvider
-// query in main.go's Run loop (the full registry isn't available at this
-// layer yet). Every use below is a placeholder to be replaced with real
-// counts in Task 9, at which point this constant should be removed.
-const activeCountPlaceholder = 1
-
 // GitHubChecker and GitLabChecker are narrow views of provider.GitHubChecker
 // / provider.GitLabChecker, so the scheduler can be tested against fakes
 // without a real HTTP round trip.
@@ -68,18 +61,23 @@ func (s *Scheduler) Tick(ctx context.Context) error {
 		return err
 	}
 
+	counts, err := s.Store.CountByProvider(ctx)
+	if err != nil {
+		return err
+	}
+
 	due, err := s.Store.DueBefore(ctx, time.Now())
 	if err != nil {
 		return err
 	}
 
 	for _, reg := range due {
-		s.processOne(ctx, reg)
+		s.processOne(ctx, reg, counts)
 	}
 	return nil
 }
 
-func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration) {
+func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration, counts map[string]int) {
 	switch s.Sessions.Classify(reg.SessionID) {
 	case aoeclient.SessionGone:
 		if err := s.Store.Remove(ctx, reg.PRURL); err != nil {
@@ -97,6 +95,7 @@ func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration) {
 	}
 
 	prev := provider.PrevState{ReviewCount: reg.ReviewCount, CIBucket: reg.CIBucket, Unresolved: reg.Unresolved}
+	activeCount := counts[reg.Provider]
 
 	var (
 		result   provider.CheckResult
@@ -110,13 +109,13 @@ func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration) {
 		// Whichever pool has less relative headroom governs the interval:
 		// both calls happened, both must stay under budget.
 		interval = minInterval(
-			ComputeInterval(budgets.GraphQL, activeCountPlaceholder, time.Now()),
-			ComputeInterval(budgets.REST, activeCountPlaceholder, time.Now()),
+			ComputeInterval(budgets.GraphQL, activeCount, time.Now()),
+			ComputeInterval(budgets.REST, activeCount, time.Now()),
 		)
 	case "gitlab":
 		var budget provider.RateBudget
 		result, budget, checkErr = s.GitLab.Check(ctx, reg.PRURL)
-		interval = ComputeInterval(budget, activeCountPlaceholder, time.Now())
+		interval = ComputeInterval(budget, activeCount, time.Now())
 	default:
 		s.log().Error("unknown provider", "pr_url", reg.PRURL, "provider", reg.Provider)
 		return

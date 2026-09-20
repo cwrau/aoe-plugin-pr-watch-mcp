@@ -119,6 +119,28 @@ func (s *Store) UpdateState(ctx context.Context, prURL string, reviewCount int, 
 	return nil
 }
 
+// CountByProvider returns the number of currently-registered PRs/MRs per
+// provider, used by the scheduler to spread each rate-limit pool's budget
+// across its real number of consumers rather than a guess.
+func (s *Store) CountByProvider(ctx context.Context) (map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT provider, COUNT(*) FROM registrations GROUP BY provider`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	counts := make(map[string]int)
+	for rows.Next() {
+		var provider string
+		var count int
+		if err := rows.Scan(&provider, &count); err != nil {
+			return nil, err
+		}
+		counts[provider] = count
+	}
+	return counts, rows.Err()
+}
+
 func (s *Store) SetArchived(ctx context.Context, prURL string, archived bool) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE registrations SET archived = ? WHERE pr_url = ?`, boolToInt(archived), prURL)
 	if err != nil {
