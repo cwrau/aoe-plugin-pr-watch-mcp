@@ -48,7 +48,7 @@ func main() {
 
 	aoe, err := aoeclient.New()
 	if err != nil {
-		logger.Error("resolve aoe daemon URL", "error", err)
+		logger.Error("create aoe session client", "error", err)
 		os.Exit(1)
 	}
 

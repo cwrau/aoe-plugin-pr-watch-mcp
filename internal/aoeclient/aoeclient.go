@@ -3,28 +3,11 @@ package aoeclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
-	"os"
-	"path/filepath"
+	"os/exec"
 	"strings"
 )
-
-// ResolveServeURL reads the local AoE daemon's base URL the same way the
-// `aoe` CLI itself does when no --daemon-url is given: from
-// ~/.config/agent-of-empires/serve.url, written by the running daemon.
-func ResolveServeURL() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
-	}
-	path := filepath.Join(home, ".config", "agent-of-empires", "serve.url")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read %s: %w", path, err)
-	}
-	return strings.TrimSpace(string(data)), nil
-}
 
 type SessionClass int
 
@@ -37,100 +20,85 @@ const (
 	SessionArchived
 )
 
+// Client classifies AoE sessions by shelling out to the `aoe` CLI rather
+// than calling the daemon's HTTP API directly. The daemon can be run with
+// `--auth passphrase`, in which case the public HTTP API rejects every
+// unauthenticated request (401 "Passphrase login required") and there is no
+// static bearer token a headless worker could present — only an interactive
+// browser login would do. The local CLI has a local-trust path the raw HTTP
+// API does not grant, so it works with no login at all. Same
+// "shell out to the trusted local CLI" pattern as the notifier.
 type Client struct {
-	BaseURL    string
-	HTTPClient *http.Client
+	AoeBinary string // defaults to "aoe" resolved on PATH; overridable for tests
 
-	live     map[string]bool
-	archived map[string]bool
-	known    map[string]bool
+	classes map[string]SessionClass
 }
 
-// New resolves the daemon's base URL via ResolveServeURL and returns a
-// ready-to-use Client. Call RefreshSessionSets before the first Classify.
+// New returns a ready-to-use Client. Call RefreshSessionSets before the
+// first Classify.
 func New() (*Client, error) {
-	base, err := ResolveServeURL()
-	if err != nil {
-		return nil, err
+	return &Client{}, nil
+}
+
+func (c *Client) binary() string {
+	if c.AoeBinary != "" {
+		return c.AoeBinary
 	}
-	return &Client{BaseURL: strings.TrimRight(base, "/"), HTTPClient: http.DefaultClient}, nil
+	return "aoe"
 }
 
 type sessionRow struct {
-	ID string `json:"id"`
+	ID    string `json:"id"`
+	State string `json:"state"`
 }
 
-func (c *Client) fetchIDs(ctx context.Context, state string) (map[string]bool, error) {
-	url := strings.TrimRight(c.BaseURL, "/") + "/api/sessions"
-	if state != "" {
-		url += "?state=" + state
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// RefreshSessionSets runs `aoe list --json --all` once (one call per
+// scheduler cycle, not per registration) and caches the resulting id ->
+// class mapping for subsequent Classify calls. The CLI reports an exact
+// per-row state — "live", "archived" or "trashed" — so no set-difference
+// inference is needed. Trashed ids are deliberately left out of the map so
+// Classify falls through to SessionGone for them: a trashed session is not
+// sent to and its registration is dropped, identical to an id the daemon
+// no longer knows about at all.
+func (c *Client) RefreshSessionSets(ctx context.Context) error {
+	cmd := exec.CommandContext(ctx, c.binary(), "list", "--json", "--all")
+	out, err := cmd.Output()
 	if err != nil {
-		return nil, err
-	}
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", url, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("GET %s: unexpected status %d", url, resp.StatusCode)
+		var stderr string
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			stderr = strings.TrimSpace(string(exitErr.Stderr))
+		}
+		if stderr != "" {
+			return fmt.Errorf("%s list --json --all: %w: %s", c.binary(), err, stderr)
+		}
+		return fmt.Errorf("%s list --json --all: %w", c.binary(), err)
 	}
 
 	var rows []sessionRow
-	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
-		return nil, fmt.Errorf("decode %s response: %w", url, err)
+	if err := json.Unmarshal(out, &rows); err != nil {
+		return fmt.Errorf("decode %s list --json --all output: %w", c.binary(), err)
 	}
-	ids := make(map[string]bool, len(rows))
+
+	classes := make(map[string]SessionClass, len(rows))
 	for _, r := range rows {
-		ids[r.ID] = true
-	}
-	return ids, nil
-}
-
-// RefreshSessionSets fetches the live, trashed, and all-known id sets once
-// (three calls per scheduler cycle, not per registration) and caches them
-// for subsequent Classify calls. A session in "all" but neither "live" nor
-// "trashed" is archived — the documented state-filter semantics give us
-// this without guessing at an undocumented per-row archived field.
-func (c *Client) RefreshSessionSets(ctx context.Context) error {
-	live, err := c.fetchIDs(ctx, "live")
-	if err != nil {
-		return err
-	}
-	trashed, err := c.fetchIDs(ctx, "trashed")
-	if err != nil {
-		return err
-	}
-	all, err := c.fetchIDs(ctx, "")
-	if err != nil {
-		return err
-	}
-
-	archived := make(map[string]bool)
-	for id := range all {
-		if !live[id] && !trashed[id] {
-			archived[id] = true
+		switch r.State {
+		case "live":
+			classes[r.ID] = SessionLive
+		case "archived":
+			classes[r.ID] = SessionArchived
 		}
 	}
-
-	c.live = live
-	c.archived = archived
-	c.known = all
+	c.classes = classes
 	return nil
 }
 
 // Classify reports a session's lifecycle state as of the last
-// RefreshSessionSets call. An id absent from the last-fetched "all" set is
-// SessionGone (hard-deleted or never existed).
+// RefreshSessionSets call. An id absent from that snapshot is SessionGone
+// (trashed, hard-deleted, or never existed).
 func (c *Client) Classify(id string) SessionClass {
-	if c.live[id] {
-		return SessionLive
-	}
-	if c.archived[id] {
-		return SessionArchived
+	if cls, ok := c.classes[id]; ok {
+		return cls
 	}
 	return SessionGone
 }

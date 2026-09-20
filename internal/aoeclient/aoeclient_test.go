@@ -1,83 +1,43 @@
 package aoeclient
 
 import (
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"testing"
 )
 
-func TestResolveServeURLReadsConfigFile(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("HOME", dir)
-	configDir := filepath.Join(dir, ".config", "agent-of-empires")
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll() error = %v", err)
+// fakeAoeBinary writes a shell script standing in for the real `aoe` CLI
+// that prints stdout verbatim and exits with exitCode, so RefreshSessionSets
+// can be exercised without a real AoE daemon. Same pattern as
+// internal/notifier's fakeAoeBinary.
+func fakeAoeBinary(t *testing.T, stdout string, exitCode int) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake binary script is posix-shell only")
 	}
-	if err := os.WriteFile(filepath.Join(configDir, "serve.url"), []byte("http://127.0.0.1:25808/\n"), 0o644); err != nil {
+	binPath := filepath.Join(t.TempDir(), "aoe")
+	script := "#!/bin/sh\ncat <<'EOF'\n" + stdout + "\nEOF\nexit " + strconv.Itoa(exitCode) + "\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
-
-	got, err := ResolveServeURL()
-	if err != nil {
-		t.Fatalf("ResolveServeURL() error = %v", err)
-	}
-	if got != "http://127.0.0.1:25808/" {
-		t.Errorf("ResolveServeURL() = %q, want %q", got, "http://127.0.0.1:25808/")
-	}
+	return binPath
 }
 
-func TestResolveServeURLMissingFile(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	if _, err := ResolveServeURL(); err == nil {
-		t.Error("ResolveServeURL() with no serve.url file, want error")
-	}
-}
+func TestRefreshSessionSetsClassifiesAllThreeStates(t *testing.T) {
+	bin := fakeAoeBinary(t, `[{"id":"a","state":"live"},{"id":"b","state":"archived"},{"id":"c","state":"trashed"}]`, 0)
+	c := &Client{AoeBinary: bin}
 
-func sessionsHandler(live, trashed, all []string) http.HandlerFunc {
-	toRows := func(ids []string) []map[string]any {
-		rows := make([]map[string]any, len(ids))
-		for i, id := range ids {
-			rows[i] = map[string]any{"id": id}
-		}
-		return rows
-	}
-	return func(w http.ResponseWriter, r *http.Request) {
-		var rows []map[string]any
-		switch r.URL.Query().Get("state") {
-		case "live":
-			rows = toRows(live)
-		case "trashed":
-			rows = toRows(trashed)
-		case "all", "":
-			rows = toRows(all)
-		}
-		json.NewEncoder(w).Encode(rows)
-	}
-}
-
-func TestClassifyLiveArchivedGone(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/sessions", sessionsHandler(
-		[]string{"live1"},
-		[]string{"trashed1"},
-		[]string{"live1", "trashed1", "archived1"}, // archived1 is known but neither live nor trashed
-	))
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	c := &Client{BaseURL: srv.URL, HTTPClient: srv.Client()}
 	if err := c.RefreshSessionSets(t.Context()); err != nil {
 		t.Fatalf("RefreshSessionSets() error = %v", err)
 	}
 
 	cases := map[string]SessionClass{
-		"live1":     SessionLive,
-		"trashed1":  SessionGone,
-		"archived1": SessionArchived,
-		"unknown1":  SessionGone,
+		"a":       SessionLive,
+		"b":       SessionArchived,
+		"c":       SessionGone, // trashed folds into Gone: don't send, drop the registration
+		"unknown": SessionGone,
 	}
 	for id, want := range cases {
 		if got := c.Classify(id); got != want {
@@ -86,22 +46,34 @@ func TestClassifyLiveArchivedGone(t *testing.T) {
 	}
 }
 
-func TestRefreshSessionSetsNonOKStatus(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Query().Get("state") {
-		case "live":
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte("[]"))
-		default:
-			json.NewEncoder(w).Encode([]map[string]any{})
-		}
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
+func TestRefreshSessionSetsFailsOnNonZeroExit(t *testing.T) {
+	bin := fakeAoeBinary(t, "", 1)
+	c := &Client{AoeBinary: bin}
 
-	c := &Client{BaseURL: srv.URL, HTTPClient: srv.Client()}
 	if err := c.RefreshSessionSets(t.Context()); err == nil {
-		t.Error("RefreshSessionSets() with a non-2xx response for one state, want error")
+		t.Error("RefreshSessionSets() with a failing aoe binary, want error")
+	}
+}
+
+func TestRefreshSessionSetsFailsOnMalformedJSON(t *testing.T) {
+	bin := fakeAoeBinary(t, "not json at all", 0)
+	c := &Client{AoeBinary: bin}
+
+	if err := c.RefreshSessionSets(t.Context()); err == nil {
+		t.Error("RefreshSessionSets() with malformed JSON output, want error")
+	}
+}
+
+func TestNewReturnsUsableClient(t *testing.T) {
+	c, err := New()
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if c.binary() != "aoe" {
+		t.Errorf("binary() = %q, want %q", c.binary(), "aoe")
+	}
+	// Classify before any refresh must not panic on the nil map.
+	if got := c.Classify("anything"); got != SessionGone {
+		t.Errorf("Classify() before refresh = %v, want SessionGone", got)
 	}
 }
