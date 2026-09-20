@@ -1,0 +1,35 @@
+# io.cwrau.pr-watch: persistent PR/MR watch service. See
+# docs/superpowers/specs/2026-09-20-pr-watch-mcp-design.md for the design
+# this manifest implements, and docs/superpowers/plans/2026-09-20-pr-watch-mcp.md
+# for how the worker binary itself is built.
+
+id = "io.cwrau.pr-watch"
+name = "PR Watch"
+version = "0.1.0"
+api_version = 13
+aoe_version = ">=1.11.0, <2.0.0"
+description = "Persistent GitHub PR / GitLab MR watcher: register once, get woken on review/CI/merge activity, even across session restarts."
+
+# net             - GitHub GraphQL/REST calls, GitLab REST calls, and the
+#                   worker's own MCP-over-HTTP listener (loopback, but still
+#                   an outbound/listening socket from the worker's own code,
+#                   not delegated to a spawned subprocess).
+# runtime.worker  - required for any Tier 1 worker.
+#
+# No process.spawn declared: the worker shells to `aoe`/`gh`/`glab` as an
+# ordinary child process (the NoSandbox worker model already permits this,
+# same as the reference agent-of-empires.github plugin, which shells to
+# `git`/`gh` under just the `net` capability). No session.read/session.write
+# needed either: this plugin is never "attached" to a single session in the
+# host's sense — it serves every session equally over its own MCP-over-HTTP
+# listener, and resolves session identity from the caller's own
+# $AOE_ARTIFACT_DIR, not via a host RPC.
+capabilities = ["net", "runtime.worker"]
+
+[runtime]
+kind = "command"
+command = [".aoe-build/pr-watch-worker"]
+
+[[runtime.build]]
+command = ["go", "build", "-o", ".aoe-build/pr-watch-worker", "./cmd/pr-watch-worker"]
+platforms = ["linux", "macos"]
