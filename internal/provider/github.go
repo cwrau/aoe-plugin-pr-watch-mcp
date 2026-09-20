@@ -285,11 +285,7 @@ func parseGitHubRESTRateHeaders(resp *http.Response) RateBudget {
 	limit, _ := strconv.Atoi(resp.Header.Get("X-RateLimit-Limit"))
 	remaining, _ := strconv.Atoi(resp.Header.Get("X-RateLimit-Remaining"))
 	resetUnix, _ := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64)
-	var resetAt time.Time
-	if resetUnix > 0 {
-		resetAt = time.Unix(resetUnix, 0)
-	}
-	return RateBudget{Limit: limit, Remaining: remaining, ResetAt: resetAt}
+	return RateBudget{Limit: limit, Remaining: remaining, ResetAt: parseUnixOrZero(resetUnix)}
 }
 
 func parseRFC3339OrZero(s string) time.Time {
@@ -298,4 +294,15 @@ func parseRFC3339OrZero(s string) time.Time {
 		return time.Time{}
 	}
 	return t
+}
+
+// parseUnixOrZero converts a Unix timestamp to time.Time, treating
+// non-positive values (missing/unparseable header) as the zero time —
+// shared by both GitHub's REST rate-limit headers and GitLab's RateLimit-*
+// headers, which use the same encoding.
+func parseUnixOrZero(u int64) time.Time {
+	if u <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(u, 0)
 }
