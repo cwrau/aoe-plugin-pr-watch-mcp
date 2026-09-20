@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -36,11 +37,12 @@ func (f *fakeGitLabChecker) Check(ctx context.Context, url string) (provider.Che
 
 type fakeNotifier struct {
 	sent []string // "sessionID: message"
+	err  error    // when non-nil, every Send fails with it
 }
 
 func (f *fakeNotifier) Send(ctx context.Context, sessionID, message string) error {
 	f.sent = append(f.sent, sessionID+": "+message)
-	return nil
+	return f.err
 }
 
 func openTestStore(t *testing.T) *registry.Store {
@@ -242,6 +244,121 @@ func TestTickUsesRealActiveCountsNotPlaceholder(t *testing.T) {
 		if r.NextDueAt.Sub(now) <= withOne {
 			t.Errorf("registration %s got interval %v, want > single-registration interval %v (real count of 2 should widen it)", r.PRURL, r.NextDueAt.Sub(now), withOne)
 		}
+	}
+}
+
+// getReg fetches the single registration the test registered, failing the
+// test if it's gone.
+func getReg(t *testing.T, store *registry.Store, prURL string) registry.Registration {
+	t.Helper()
+	r, ok, err := store.Get(context.Background(), prURL)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if !ok {
+		t.Fatalf("registration %q is gone, want it still present", prURL)
+	}
+	return r
+}
+
+// TestTickKeepsStateWhenNotifyFails: a notification that couldn't be
+// delivered is only ever retried by the next tick re-diffing the same
+// unchanged prev state, so a failed Send must leave both the stored state
+// and next_due_at alone.
+func TestTickKeepsStateWhenNotifyFails(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+	reg := registry.Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github",
+		ReviewCount: 1, CIBucket: "pending", Unresolved: 2,
+		NextDueAt: now.Add(-time.Minute), CreatedAt: now,
+	}
+	if err := store.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+
+	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "open", ReviewCount: 1, CIBucket: "failure", Unresolved: 2}}
+	notify := &fakeNotifier{err: errors.New("aoe send exploded")}
+	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: notify}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	if len(notify.sent) != 1 {
+		t.Fatalf("notify.sent = %v, want exactly one attempted send", notify.sent)
+	}
+	got := getReg(t, store, reg.PRURL)
+	if got.ReviewCount != 1 || got.CIBucket != "pending" || got.Unresolved != 2 {
+		t.Errorf("stored state = {reviews:%d ci:%q unresolved:%d}, want the unchanged prev state {1 pending 2} so the next tick re-diffs and resends", got.ReviewCount, got.CIBucket, got.Unresolved)
+	}
+	if got.NextDueAt.Unix() != reg.NextDueAt.Unix() {
+		t.Errorf("next_due_at = %v, want it left at %v (a failed send must not advance the schedule)", got.NextDueAt, reg.NextDueAt)
+	}
+}
+
+// TestTickKeepsRegistrationWhenMergedNotifyFails: on MERGED the registration
+// is deleted right after the send, so a failed send would lose the
+// notification permanently. It must survive to be retried.
+func TestTickKeepsRegistrationWhenMergedNotifyFails(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+	reg := registry.Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github",
+		NextDueAt: now.Add(-time.Minute), CreatedAt: now,
+	}
+	if err := store.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+
+	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "merged"}}
+	notify := &fakeNotifier{err: errors.New("aoe send exploded")}
+	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: notify}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	remaining, err := store.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("List() len = %d, want 1 (a failed MERGED notification must not take the registration with it)", len(remaining))
+	}
+}
+
+// TestTickBacksOffOnCheckerError: a registration whose check keeps failing
+// must not be retried on every 15s tick forever — push next_due_at out by at
+// least the poll floor, leaving the last-seen state untouched.
+func TestTickBacksOffOnCheckerError(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+	reg := registry.Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github",
+		ReviewCount: 3, CIBucket: "success", Unresolved: 1,
+		NextDueAt: now.Add(-time.Minute), CreatedAt: now,
+	}
+	if err := store.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+
+	gh := &fakeGitHubChecker{err: errors.New("bad credentials")}
+	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{}}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	got := getReg(t, store, reg.PRURL)
+	// next_due_at round-trips through the registry as whole Unix seconds, so
+	// compare against a second-truncated baseline rather than the raw now.
+	wantAtLeast := now.Truncate(time.Second).Add(MinPollInterval)
+	if got.NextDueAt.Before(wantAtLeast) {
+		t.Errorf("next_due_at = %v, want at least %v (one MinPollInterval out) after a checker error", got.NextDueAt, wantAtLeast)
+	}
+	if got.ReviewCount != 3 || got.CIBucket != "success" || got.Unresolved != 1 {
+		t.Errorf("stored state = {reviews:%d ci:%q unresolved:%d}, want the unchanged {3 success 1} (a failed check knows nothing new)", got.ReviewCount, got.CIBucket, got.Unresolved)
 	}
 }
 
