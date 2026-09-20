@@ -1,0 +1,6 @@
+/.aoe-build/
+/.superpowers/
+*.db
+*.db-shm
+*.db-wal
+/pr-watch-worker
