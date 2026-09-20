@@ -48,6 +48,10 @@ func ComputeInterval(budget provider.RateBudget, activeRegistrations int, now ti
 	usable := budget.Remaining - floor
 	if usable <= 0 {
 		// No headroom left this window: don't check again until reset.
+		// But still respect the MinPollInterval floor.
+		if window < MinPollInterval {
+			return MinPollInterval
+		}
 		return window
 	}
 
