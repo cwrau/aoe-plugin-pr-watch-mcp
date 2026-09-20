@@ -25,7 +25,11 @@ func (n *Notifier) binary() string {
 }
 
 func (n *Notifier) Send(ctx context.Context, sessionID, message string) error {
-	cmd := exec.CommandContext(ctx, n.binary(), "send", sessionID, message)
+	// Use -- to mark end-of-options: message is untrusted external content
+	// (GitHub/GitLab comment, reviewer name, etc.) and must not be interpretable
+	// as a CLI flag by the clap parser. Without --, a message like "--no-revive"
+	// could be misparsed as the --no-revive option instead of the <MESSAGE> positional.
+	cmd := exec.CommandContext(ctx, n.binary(), "send", "--", sessionID, message)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("aoe send %s: %w: %s", sessionID, err, string(output))

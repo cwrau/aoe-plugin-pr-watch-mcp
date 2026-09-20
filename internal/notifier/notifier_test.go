@@ -58,8 +58,8 @@ func TestSendInvokesAoeSendWithSessionAndMessage(t *testing.T) {
 		t.Fatalf("ReadFile(argv.log) error = %v", err)
 	}
 	argv := strings.TrimSpace(string(got))
-	if argv != "send abc123 CI failure" {
-		t.Errorf("aoe invoked with argv %q, want %q", argv, "send abc123 CI failure")
+	if argv != "send -- abc123 CI failure" {
+		t.Errorf("aoe invoked with argv %q, want %q", argv, "send -- abc123 CI failure")
 	}
 }
 
@@ -69,5 +69,28 @@ func TestSendReturnsErrorOnNonZeroExit(t *testing.T) {
 
 	if err := n.Send(t.Context(), "abc123", "CI failure"); err == nil {
 		t.Error("Send() with a failing aoe binary, want error")
+	}
+}
+
+func TestSendTreatsMessageLikeAFlagAsPositional(t *testing.T) {
+	// Verify that messages starting with - or -- are treated as positional
+	// arguments, not as CLI flags. This is critical because message is
+	// untrusted external content (GitHub/GitLab comments, etc.).
+	bin, log := fakeAoeBinary(t, 0)
+	n := &Notifier{AoeBinary: bin}
+
+	if err := n.Send(t.Context(), "abc123", "--no-revive"); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	got, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatalf("ReadFile(argv.log) error = %v", err)
+	}
+	argv := strings.TrimSpace(string(got))
+	// The -- end-of-options marker ensures --no-revive is treated as the <MESSAGE>
+	// positional argument, not misparsed as a flag.
+	if argv != "send -- abc123 --no-revive" {
+		t.Errorf("aoe invoked with argv %q, want %q", argv, "send -- abc123 --no-revive")
 	}
 }
