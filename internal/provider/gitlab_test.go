@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -65,7 +66,7 @@ func TestGitLabCheckerOpenWithApprovalsAndPipeline(t *testing.T) {
 	srv := fakeGitLabServer(t, "opened", "success", 2, 1)
 	defer srv.Close()
 
-	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
 	result, budget, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
 	if err != nil {
 		t.Fatalf("Check() error = %v", err)
@@ -82,7 +83,7 @@ func TestGitLabCheckerMergedShortCircuits(t *testing.T) {
 	srv := fakeGitLabServer(t, "merged", "success", 0, 0)
 	defer srv.Close()
 
-	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
 	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
 	if err != nil {
 		t.Fatalf("Check() error = %v", err)
@@ -105,7 +106,7 @@ func TestGitLabCheckerPipelineBucketing(t *testing.T) {
 		t.Run(pipelineStatus, func(t *testing.T) {
 			srv := fakeGitLabServer(t, "opened", pipelineStatus, 0, 0)
 			defer srv.Close()
-			c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+			c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
 			result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
 			if err != nil {
 				t.Fatalf("Check() error = %v", err)
@@ -131,7 +132,7 @@ func TestGitLabCheckerNonOKStatusErrors(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
 	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
 	if err == nil {
 		t.Fatalf("Check() error = nil, want error for 401 response; result = %+v", result)
@@ -160,7 +161,7 @@ func TestGitLabCheckerServerErrorOnApprovals(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
 	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
 	if err == nil {
 		t.Fatalf("Check() error = nil, want error for 500 response on approvals; result = %+v", result)
@@ -185,11 +186,42 @@ func TestGitLabCheckerNoTokenForHostMakesNoRequest(t *testing.T) {
 
 	c := &GitLabChecker{
 		HTTPClient:      srv.Client(),
-		TokenFunc:       func(string) (string, error) { return "", nil },
+		TokenFunc:       func(context.Context, string) (string, error) { return "", nil },
 		apiBaseOverride: srv.URL,
 	}
 	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
 	if err == nil {
 		t.Fatalf("Check() error = nil, want error when no token is configured for the host; result = %+v", result)
+	}
+}
+
+// TokenFunc runs in the scheduler's hot path (one credential-helper fork
+// per GitLab poll), so it must receive Check's own context — otherwise a
+// hung keyring backend outlives the poll's deadline and stalls the whole
+// scheduler.
+func TestGitLabCheckerPassesCheckContextToTokenFunc(t *testing.T) {
+	srv := fakeGitLabServer(t, "opened", "success", 0, 0)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var sawCancelledCtx bool
+	c := &GitLabChecker{
+		HTTPClient: srv.Client(),
+		TokenFunc: func(tokenCtx context.Context, host string) (string, error) {
+			if tokenCtx != nil && tokenCtx.Err() != nil {
+				sawCancelledCtx = true
+				return "", tokenCtx.Err()
+			}
+			return "test-token", nil
+		},
+		apiBaseOverride: srv.URL,
+	}
+	if _, _, err := c.Check(ctx, "https://gitlab.corp.example/team/project/-/merge_requests/17"); err == nil {
+		t.Error("Check() with an already-cancelled context, want error")
+	}
+	if !sawCancelledCtx {
+		t.Error("TokenFunc did not observe Check's cancelled context, so the token subprocess would outlive the poll's deadline")
 	}
 }

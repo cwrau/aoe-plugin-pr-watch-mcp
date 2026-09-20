@@ -34,7 +34,11 @@ type GitLabChecker struct {
 	HTTPClient *http.Client
 
 	// TokenFunc resolves the credential to send for a given MR's host,
-	// called fresh on every Check — never cached across hosts. This is
+	// called fresh on every Check — never cached across hosts. It takes
+	// Check's own context because resolving a token typically means forking
+	// a credential-helper subprocess in the scheduler's hot path, and a
+	// hung keyring backend would otherwise stall the whole scheduler. This
+	// per-host resolution is
 	// deliberate: a single static token sent to whatever host a
 	// registered pr_url happens to name would hand a real, working
 	// GitLab credential to any host an attacker can get accepted as a
@@ -43,7 +47,7 @@ type GitLabChecker struct {
 	// formatted to look like one). Resolving per-host means an
 	// unconfigured host naturally has no secret to leak; see
 	// TokenFunc's caller in Check for the empty-token short-circuit.
-	TokenFunc   func(host string) (string, error)
+	TokenFunc   func(ctx context.Context, host string) (string, error)
 	TokenHeader string // defaults to "PRIVATE-TOKEN"; see Task 4's auth-header note
 
 	// apiBaseOverride replaces "https://{host}/api/v4" with a fixed base
@@ -101,7 +105,7 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 	if c.TokenFunc == nil {
 		return CheckResult{}, RateBudget{}, fmt.Errorf("gitlab %s: no TokenFunc configured", host)
 	}
-	token, err := c.TokenFunc(host)
+	token, err := c.TokenFunc(ctx, host)
 	if err != nil {
 		return CheckResult{}, RateBudget{}, fmt.Errorf("resolve gitlab token for %s: %w", host, err)
 	}
