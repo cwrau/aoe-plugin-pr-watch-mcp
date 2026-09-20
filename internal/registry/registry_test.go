@@ -185,3 +185,66 @@ func TestSetArchived(t *testing.T) {
 		t.Errorf("Archived = false, want true")
 	}
 }
+
+func TestRemoveOwnedByMatchingSession(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now()
+	reg := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "owner", Provider: "github", NextDueAt: now, CreatedAt: now}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+
+	removed, err := s.RemoveOwnedBy(ctx, reg.PRURL, "owner")
+	if err != nil {
+		t.Fatalf("RemoveOwnedBy() error = %v", err)
+	}
+	if !removed {
+		t.Error("RemoveOwnedBy() = false, want true for the owning session")
+	}
+	got, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("List() len = %d, want 0 after RemoveOwnedBy by the owner", len(got))
+	}
+}
+
+func TestRemoveOwnedByWrongSessionLeavesItAlone(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now()
+	reg := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "owner", Provider: "github", NextDueAt: now, CreatedAt: now}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+
+	removed, err := s.RemoveOwnedBy(ctx, reg.PRURL, "someone-else")
+	if err != nil {
+		t.Fatalf("RemoveOwnedBy() error = %v", err)
+	}
+	if removed {
+		t.Error("RemoveOwnedBy() = true, want false for a non-owning session")
+	}
+	got, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(got) != 1 || got[0].SessionID != "owner" {
+		t.Errorf("List() = %+v, want the owner's registration untouched", got)
+	}
+}
+
+func TestRemoveOwnedByUnknownURL(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+
+	removed, err := s.RemoveOwnedBy(ctx, "https://github.com/o/r/pull/404", "anyone")
+	if err != nil {
+		t.Fatalf("RemoveOwnedBy() error = %v", err)
+	}
+	if removed {
+		t.Error("RemoveOwnedBy() on an unregistered URL = true, want false")
+	}
+}
