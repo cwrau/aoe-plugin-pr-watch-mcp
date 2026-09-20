@@ -83,6 +83,29 @@ func (s *Store) Remove(ctx context.Context, prURL string) error {
 	return nil
 }
 
+// Get returns the registration for prURL, if any. The bool result is false
+// (with a zero Registration and nil error) when no registration exists for
+// that URL — "not found" is not treated as an error condition, matching
+// callers that need to distinguish "not registered" from a real query
+// failure (e.g. unregister's ownership check).
+func (s *Store) Get(ctx context.Context, prURL string) (Registration, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, next_due_at, archived, created_at FROM registrations WHERE pr_url = ?`, prURL)
+
+	var r Registration
+	var nextDue, created int64
+	var archived int
+	if err := row.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.Unresolved, &nextDue, &archived, &created); err != nil {
+		if err == sql.ErrNoRows {
+			return Registration{}, false, nil
+		}
+		return Registration{}, false, fmt.Errorf("get registration: %w", err)
+	}
+	r.NextDueAt = time.Unix(nextDue, 0)
+	r.Archived = archived != 0
+	r.CreatedAt = time.Unix(created, 0)
+	return r, true, nil
+}
+
 func (s *Store) List(ctx context.Context) ([]Registration, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, next_due_at, archived, created_at FROM registrations ORDER BY next_due_at ASC`)
 	if err != nil {

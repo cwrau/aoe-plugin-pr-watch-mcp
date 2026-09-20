@@ -44,6 +44,31 @@ func callTool(t *testing.T, srv *httptest.Server, name string, args map[string]a
 	return result
 }
 
+// callToolExpectError is callTool's counterpart for cases that must be
+// rejected by the tool handler (e.g. a malformed pr_url): it asserts the
+// call reaches the server and comes back as a tool error, rather than
+// treating IsError as a test failure.
+func callToolExpectError(t *testing.T, srv *httptest.Server, name string, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	ctx := context.Background()
+	transport := &mcp.StreamableClientTransport{Endpoint: srv.URL}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.0.1"}, nil)
+	session, err := client.Connect(ctx, transport, nil)
+	if err != nil {
+		t.Fatalf("client.Connect() error = %v", err)
+	}
+	defer session.Close()
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		t.Fatalf("CallTool(%s) error = %v", name, err)
+	}
+	if !result.IsError {
+		t.Fatalf("CallTool(%s) = %+v, want an error result", name, result)
+	}
+	return result
+}
+
 func TestRegisterThenListThenUnregister(t *testing.T) {
 	store := openTestStore(t)
 	srv := httptest.NewServer(NewHandler(store))
@@ -62,7 +87,7 @@ func TestRegisterThenListThenUnregister(t *testing.T) {
 		t.Fatalf("after register, store.List() = %+v", regs)
 	}
 
-	callTool(t, srv, "unregister", map[string]any{"pr_url": "https://github.com/o/r/pull/1"})
+	callTool(t, srv, "unregister", map[string]any{"pr_url": "https://github.com/o/r/pull/1", "session_id": "sess1"})
 
 	regs, err = store.List(context.Background())
 	if err != nil {
@@ -103,5 +128,73 @@ func TestListToolReturnsRegistrations(t *testing.T) {
 	result := callTool(t, srv, "list", map[string]any{})
 	if len(result.Content) == 0 {
 		t.Fatal("list tool returned no content")
+	}
+}
+
+// TestRegisterRejectsMalformedURL guards against the SSRF/token-exfiltration
+// path where a pr_url that isn't shaped like a real GitHub PR or GitLab MR
+// URL would otherwise get stored verbatim and later handed to a checker
+// that sends the real provider auth token to whatever host it extracts from
+// it. register must reject such input outright rather than defaulting it to
+// "gitlab" and storing it.
+func TestRegisterRejectsMalformedURL(t *testing.T) {
+	store := openTestStore(t)
+	srv := httptest.NewServer(NewHandler(store))
+	defer srv.Close()
+
+	callToolExpectError(t, srv, "register", map[string]any{
+		"pr_url":     "https://attacker.example.com/steal-token",
+		"session_id": "sess1",
+	})
+
+	regs, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(regs) != 0 {
+		t.Fatalf("after rejected register, store.List() = %+v, want empty (nothing should be persisted)", regs)
+	}
+}
+
+// TestUnregisterRequiresMatchingSessionID guards against one session
+// deregistering another session's watch: unregister must only remove a
+// registration when the caller's session_id matches the one that created
+// it.
+func TestUnregisterRequiresMatchingSessionID(t *testing.T) {
+	store := openTestStore(t)
+	srv := httptest.NewServer(NewHandler(store))
+	defer srv.Close()
+
+	callTool(t, srv, "register", map[string]any{
+		"pr_url":     "https://github.com/o/r/pull/1",
+		"session_id": "sess1",
+	})
+
+	// Wrong session_id: must not remove the registration.
+	callTool(t, srv, "unregister", map[string]any{
+		"pr_url":     "https://github.com/o/r/pull/1",
+		"session_id": "sess-attacker",
+	})
+
+	regs, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(regs) != 1 {
+		t.Fatalf("after unregister with wrong session_id, store.List() = %+v, want 1 registration still present", regs)
+	}
+
+	// Correct session_id: must remove it.
+	callTool(t, srv, "unregister", map[string]any{
+		"pr_url":     "https://github.com/o/r/pull/1",
+		"session_id": "sess1",
+	})
+
+	regs, err = store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(regs) != 0 {
+		t.Fatalf("after unregister with correct session_id, store.List() = %+v, want empty", regs)
 	}
 }

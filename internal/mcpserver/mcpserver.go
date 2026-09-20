@@ -2,12 +2,13 @@ package mcpserver
 
 import (
 	"context"
+	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/cwrau/aoe-pr-watch-mcp/internal/provider"
 	"github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
 )
 
@@ -21,7 +22,8 @@ type registerOutput struct {
 }
 
 type unregisterInput struct {
-	PRURL string `json:"pr_url" jsonschema:"the PR/MR URL to stop watching"`
+	PRURL     string `json:"pr_url" jsonschema:"the PR/MR URL to stop watching"`
+	SessionID string `json:"session_id" jsonschema:"the calling AoE session's id, read from $AOE_ARTIFACT_DIR's basename; must match the session that registered this URL"`
 }
 
 type unregisterOutput struct {
@@ -34,15 +36,22 @@ type listOutput struct {
 	Registrations []registry.Registration `json:"registrations"`
 }
 
-// detectProvider mirrors the URL shapes ParseGitHubPRURL/ParseGitLabMRURL
-// already recognize, without importing the provider package just for this
-// one branch: github.com PR URLs are "github", everything else register
-// accepts is "gitlab".
-func detectProvider(prURL string) string {
-	if strings.HasPrefix(prURL, "https://github.com/") {
-		return "github"
+// detectProvider validates prURL against the same shapes the scheduler's
+// checkers require (ParseGitHubPRURL / ParseGitLabMRURL) and returns which
+// provider it matched. Rejecting anything that doesn't parse as a real
+// PR/MR URL up front — rather than defaulting unrecognized shapes to
+// "gitlab" — closes the SSRF/token-exfiltration path where an arbitrary
+// pr_url would otherwise get stored verbatim and later fed to
+// GitLabChecker.Check, which sends the real GitLab auth token to whatever
+// host it extracts from the URL.
+func detectProvider(prURL string) (string, error) {
+	if _, _, _, err := provider.ParseGitHubPRURL(prURL); err == nil {
+		return "github", nil
 	}
-	return "gitlab"
+	if _, _, _, err := provider.ParseGitLabMRURL(prURL); err == nil {
+		return "gitlab", nil
+	}
+	return "", fmt.Errorf("pr_url %q is not a recognized GitHub PR or GitLab MR URL", prURL)
 }
 
 // NewHandler builds the MCP-over-HTTP handler exposing register/unregister/
@@ -57,10 +66,14 @@ func NewHandler(store *registry.Store) http.Handler {
 			Name:        "register",
 			Description: "Start watching a GitHub PR or GitLab MR for review/CI/merge activity, waking this session on changes.",
 		}, func(ctx context.Context, req *mcp.CallToolRequest, in registerInput) (*mcp.CallToolResult, registerOutput, error) {
+			prov, err := detectProvider(in.PRURL)
+			if err != nil {
+				return nil, registerOutput{}, err
+			}
 			reg := registry.Registration{
 				PRURL:     in.PRURL,
 				SessionID: in.SessionID,
-				Provider:  detectProvider(in.PRURL),
+				Provider:  prov,
 				CIBucket:  "none",
 				NextDueAt: time.Now(),
 				CreatedAt: time.Now(),
@@ -75,6 +88,17 @@ func NewHandler(store *registry.Store) http.Handler {
 			Name:        "unregister",
 			Description: "Stop watching a previously-registered GitHub PR or GitLab MR.",
 		}, func(ctx context.Context, req *mcp.CallToolRequest, in unregisterInput) (*mcp.CallToolResult, unregisterOutput, error) {
+			existing, ok, err := store.Get(ctx, in.PRURL)
+			if err != nil {
+				return nil, unregisterOutput{}, err
+			}
+			// Not registered, or registered by a different session: report
+			// "nothing removed" without distinguishing the two cases, so a
+			// caller can't probe for which PRs/MRs other sessions are
+			// watching.
+			if !ok || existing.SessionID != in.SessionID {
+				return nil, unregisterOutput{Removed: false}, nil
+			}
 			if err := store.Remove(ctx, in.PRURL); err != nil {
 				return nil, unregisterOutput{}, err
 			}
