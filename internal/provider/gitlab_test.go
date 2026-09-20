@@ -65,7 +65,7 @@ func TestGitLabCheckerOpenWithApprovalsAndPipeline(t *testing.T) {
 	srv := fakeGitLabServer(t, "opened", "success", 2, 1)
 	defer srv.Close()
 
-	c := &GitLabChecker{HTTPClient: srv.Client(), Token: "test-token", apiBaseOverride: srv.URL}
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
 	result, budget, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
 	if err != nil {
 		t.Fatalf("Check() error = %v", err)
@@ -82,7 +82,7 @@ func TestGitLabCheckerMergedShortCircuits(t *testing.T) {
 	srv := fakeGitLabServer(t, "merged", "success", 0, 0)
 	defer srv.Close()
 
-	c := &GitLabChecker{HTTPClient: srv.Client(), Token: "test-token", apiBaseOverride: srv.URL}
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
 	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
 	if err != nil {
 		t.Fatalf("Check() error = %v", err)
@@ -105,7 +105,7 @@ func TestGitLabCheckerPipelineBucketing(t *testing.T) {
 		t.Run(pipelineStatus, func(t *testing.T) {
 			srv := fakeGitLabServer(t, "opened", pipelineStatus, 0, 0)
 			defer srv.Close()
-			c := &GitLabChecker{HTTPClient: srv.Client(), Token: "test-token", apiBaseOverride: srv.URL}
+			c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
 			result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
 			if err != nil {
 				t.Fatalf("Check() error = %v", err)
@@ -131,7 +131,7 @@ func TestGitLabCheckerNonOKStatusErrors(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	c := &GitLabChecker{HTTPClient: srv.Client(), Token: "test-token", apiBaseOverride: srv.URL}
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
 	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
 	if err == nil {
 		t.Fatalf("Check() error = nil, want error for 401 response; result = %+v", result)
@@ -160,9 +160,36 @@ func TestGitLabCheckerServerErrorOnApprovals(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	c := &GitLabChecker{HTTPClient: srv.Client(), Token: "test-token", apiBaseOverride: srv.URL}
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
 	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
 	if err == nil {
 		t.Fatalf("Check() error = nil, want error for 500 response on approvals; result = %+v", result)
+	}
+}
+
+// TestGitLabCheckerNoTokenForHostMakesNoRequest is the core regression test
+// for the per-host-token fix: a TokenFunc that reports "no credentials
+// configured for this host" (empty string, nil error — mirroring `glab
+// config get --host <unconfigured>`, which prints nothing and exits 0)
+// must cause Check to fail before issuing a single HTTP request. Sending a
+// real, working token to an arbitrary pr_url's host — because the token
+// was resolved once globally instead of per-host — is exactly the leak
+// this closes: the handler below fails the test if it's ever hit at all.
+func TestGitLabCheckerNoTokenForHostMakesNoRequest(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected HTTP request made with no token configured: %s %s", r.Method, r.URL)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{
+		HTTPClient:      srv.Client(),
+		TokenFunc:       func(string) (string, error) { return "", nil },
+		apiBaseOverride: srv.URL,
+	}
+	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+	if err == nil {
+		t.Fatalf("Check() error = nil, want error when no token is configured for the host; result = %+v", result)
 	}
 }
