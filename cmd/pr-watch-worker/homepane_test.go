@@ -39,6 +39,7 @@ func githubReg(ciBucket, reviewState string) registry.Registration {
 
 func TestBuildHomePanePayloadGitHubRow(t *testing.T) {
 	regs := []registry.Registration{githubReg("failure", "CHANGES_REQUESTED")}
+	regs[0].Title = "Fix the widget rendering bug"
 	payload := buildHomePanePayload(regs, func(id string) string {
 		if id == "sess1" {
 			return "Fix the thing"
@@ -59,8 +60,11 @@ func TestBuildHomePanePayloadGitHubRow(t *testing.T) {
 	}
 
 	prRow := cols.Children[0].(rowBlock)
-	if prRow.Label != "cwrau/aoe-pr-watch-mcp#42" {
-		t.Errorf("prRow.Label = %q, want %q", prRow.Label, "cwrau/aoe-pr-watch-mcp#42")
+	if prRow.Label != "Fix the widget rendering bug" {
+		t.Errorf("prRow.Label = %q, want the PR title %q", prRow.Label, "Fix the widget rendering bug")
+	}
+	if prRow.Prefix != "cwrau/aoe-pr-watch-mcp#42" {
+		t.Errorf("prRow.Prefix = %q, want the short ref %q", prRow.Prefix, "cwrau/aoe-pr-watch-mcp#42")
 	}
 	if prRow.Href != regs[0].PRURL {
 		t.Errorf("prRow.Href = %q, want %q", prRow.Href, regs[0].PRURL)
@@ -127,7 +131,10 @@ func TestBuildHomePanePayloadGitLabRow(t *testing.T) {
 	cols := sec.Children[0].(columnsBlock)
 	prRow := cols.Children[0].(rowBlock)
 	if prRow.Label != "team/project!17" {
-		t.Errorf("prRow.Label = %q, want %q", prRow.Label, "team/project!17")
+		t.Errorf("prRow.Label = %q, want the short ref as a fallback label when no title has been fetched yet (%q)", prRow.Label, "team/project!17")
+	}
+	if prRow.Prefix != "" {
+		t.Errorf("prRow.Prefix = %q, want empty when falling back to the short ref as Label (avoid showing it twice)", prRow.Prefix)
 	}
 	if prRow.Badges[0].Text != "GL" {
 		t.Errorf("prRow.Badges[0].Text = %q, want %q", prRow.Badges[0].Text, "GL")

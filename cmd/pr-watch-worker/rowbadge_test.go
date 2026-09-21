@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
@@ -28,7 +29,7 @@ func TestBuildRowBadgePayloadsGroupsBySession(t *testing.T) {
 
 func TestBuildRowBadgePayloadsChipFields(t *testing.T) {
 	regs := []registry.Registration{
-		{PRURL: "https://github.com/cwrau/aoe-pr-watch-mcp/pull/42", SessionID: "sess1", Provider: "github", CIBucket: "failure", LatestReviewState: "CHANGES_REQUESTED"},
+		{PRURL: "https://github.com/cwrau/aoe-pr-watch-mcp/pull/42", SessionID: "sess1", Provider: "github", CIBucket: "failure", LatestReviewState: "CHANGES_REQUESTED", Title: "Fix the widget rendering bug"},
 	}
 
 	got := buildRowBadgePayloads(regs)
@@ -43,8 +44,24 @@ func TestBuildRowBadgePayloadsChipFields(t *testing.T) {
 	if chip.Href != regs[0].PRURL {
 		t.Errorf("chip.Href = %q, want %q", chip.Href, regs[0].PRURL)
 	}
-	if chip.Tooltip == "" {
-		t.Error("chip.Tooltip is empty, want a short PR ref + status summary")
+	if !strings.Contains(chip.Tooltip, "Fix the widget rendering bug") {
+		t.Errorf("chip.Tooltip = %q, want it to include the PR title", chip.Tooltip)
+	}
+	if !strings.Contains(chip.Tooltip, "cwrau/aoe-pr-watch-mcp#42") {
+		t.Errorf("chip.Tooltip = %q, want it to still include the short ref too", chip.Tooltip)
+	}
+}
+
+func TestBuildRowBadgePayloadsChipTooltipFallsBackWithoutTitle(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/cwrau/aoe-pr-watch-mcp/pull/42", SessionID: "sess1", Provider: "github", CIBucket: "none"},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	chip := got["sess1"].Items[0]
+
+	if !strings.Contains(chip.Tooltip, "cwrau/aoe-pr-watch-mcp#42") {
+		t.Errorf("chip.Tooltip = %q, want the short ref when no title has been fetched yet", chip.Tooltip)
 	}
 }
 

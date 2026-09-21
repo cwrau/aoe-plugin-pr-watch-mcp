@@ -47,10 +47,15 @@ func buildRowBadgePayloads(regs []registry.Registration) map[string]rowBadgePayl
 		for _, r := range sessionRegs {
 			ci := ciBadge(r.CIBucket)
 			review := reviewBadge(r.LatestReviewState)
+			ref := shortRef(r)
+			subject := ref
+			if r.Title != "" {
+				subject = fmt.Sprintf("%s: %s", ref, r.Title)
+			}
 			items = append(items, badgeChip{
 				Icon:    "eye",
 				Tone:    ci.Tone,
-				Tooltip: fmt.Sprintf("%s — CI %s, review %s", shortRef(r), ci.Text, review.Text),
+				Tooltip: fmt.Sprintf("%s — CI %s, review %s", subject, ci.Text, review.Text),
 				Href:    r.PRURL,
 			})
 		}

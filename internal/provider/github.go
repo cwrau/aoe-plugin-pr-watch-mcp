@@ -59,6 +59,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       state
+      title
       headRefOid
       reviewCount: reviews { totalCount }
       latestReview: reviews(last: 1) { nodes { author { login } state } }
@@ -76,6 +77,7 @@ type githubGraphQLResponse struct {
 		Repository struct {
 			PullRequest struct {
 				State       string `json:"state"`
+				Title       string `json:"title"`
 				HeadRefOid  string `json:"headRefOid"`
 				ReviewCount struct {
 					TotalCount int `json:"totalCount"`
@@ -150,6 +152,7 @@ func (c *GitHubChecker) Check(ctx context.Context, prURL string) (CheckResult, G
 
 	result := CheckResult{
 		State:       mapGitHubState(pr.State),
+		Title:       pr.Title,
 		ReviewCount: pr.ReviewCount.TotalCount,
 	}
 	if len(pr.LatestReview.Nodes) > 0 {
