@@ -46,6 +46,25 @@ func TestRefreshSessionSetsClassifiesAllThreeStates(t *testing.T) {
 	}
 }
 
+func TestRefreshSessionSetsCachesTitles(t *testing.T) {
+	bin := fakeAoeBinary(t, `[{"id":"a","state":"live","title":"Fix the thing"},{"id":"b","state":"archived","title":""}]`, 0)
+	c := &Client{AoeBinary: bin}
+
+	if err := c.RefreshSessionSets(t.Context()); err != nil {
+		t.Fatalf("RefreshSessionSets() error = %v", err)
+	}
+
+	if got := c.Title("a"); got != "Fix the thing" {
+		t.Errorf("Title(%q) = %q, want %q", "a", got, "Fix the thing")
+	}
+	if got := c.Title("b"); got != "" {
+		t.Errorf("Title(%q) = %q, want empty for a session with no title", "b", got)
+	}
+	if got := c.Title("unknown"); got != "" {
+		t.Errorf("Title(%q) = %q, want empty for an unknown id", "unknown", got)
+	}
+}
+
 func TestRefreshSessionSetsFailsOnNonZeroExit(t *testing.T) {
 	bin := fakeAoeBinary(t, "", 1)
 	c := &Client{AoeBinary: bin}

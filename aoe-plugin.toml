@@ -26,6 +26,12 @@ description = "Persistent GitHub PR / GitLab MR watcher: register once, get woke
 # $AOE_ARTIFACT_DIR, not via a host RPC.
 capabilities = ["net", "runtime.worker"]
 
+# Host-wide dashboard panel listing every currently-watched PR/MR and its
+# owning session, pushed via ui.state.set (requires api_version >= 13).
+[[ui]]
+slot = "home-pane"
+id = "watched_prs"
+
 [runtime]
 kind = "command"
 command = [".aoe-build/pr-watch-worker"]
