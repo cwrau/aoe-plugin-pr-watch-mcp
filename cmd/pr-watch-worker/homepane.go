@@ -43,6 +43,7 @@ type columnsBlock struct {
 type rowBlock struct {
 	Kind   string     `json:"kind"`
 	Label  string     `json:"label,omitempty"`
+	Prefix string     `json:"prefix,omitempty"`
 	Href   string     `json:"href,omitempty"`
 	Badges []rowBadge `json:"badges,omitempty"`
 }
@@ -111,13 +112,24 @@ func registrationColumns(reg registry.Registration, titleOf func(string) string,
 		sessionHref = strings.TrimRight(dashboardBaseURL, "/") + "/session/" + reg.SessionID
 	}
 
+	// Prefer the PR/MR's real title once the first successful check has
+	// fetched it; before that (or if a fetch ever comes back empty), fall
+	// back to the derived short ref alone rather than showing it twice.
+	prLabel := reg.Title
+	prPrefix := shortRef(reg)
+	if prLabel == "" {
+		prLabel = prPrefix
+		prPrefix = ""
+	}
+
 	return columnsBlock{
 		Kind: "columns",
 		Children: []any{
 			rowBlock{
-				Kind:  "row",
-				Label: shortRef(reg),
-				Href:  reg.PRURL,
+				Kind:   "row",
+				Label:  prLabel,
+				Prefix: prPrefix,
+				Href:   reg.PRURL,
 				Badges: []rowBadge{
 					providerBadge(reg.Provider),
 					ciBadge(reg.CIBucket),

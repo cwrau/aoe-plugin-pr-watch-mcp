@@ -13,6 +13,7 @@ type PrevState struct {
 // CheckResult is one provider's raw poll result for a single PR/MR.
 type CheckResult struct {
 	State             string // "open" | "merged" | "closed"
+	Title             string
 	ReviewCount       int
 	LatestReviewer    string
 	LatestReviewState string
