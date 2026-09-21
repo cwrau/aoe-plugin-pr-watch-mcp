@@ -34,6 +34,7 @@ func githubReg(ciBucket, reviewState string) registry.Registration {
 		Provider:          "github",
 		CIBucket:          ciBucket,
 		LatestReviewState: reviewState,
+		Status:            registry.StatusWatching,
 	}
 }
 
@@ -124,6 +125,7 @@ func TestBuildHomePanePayloadGitLabRow(t *testing.T) {
 		SessionID: "sess2",
 		Provider:  "gitlab",
 		CIBucket:  "success",
+		Status:    registry.StatusWatching,
 	}}
 	payload := buildHomePanePayload(regs, func(string) string { return "" }, "")
 
@@ -164,6 +166,31 @@ func TestBuildHomePanePayloadSortsFailuresFirst(t *testing.T) {
 	first := sec.Children[0].(columnsBlock).Children[0].(rowBlock)
 	if first.Href != failure.PRURL {
 		t.Errorf("first row href = %q, want the failing PR first (%q)", first.Href, failure.PRURL)
+	}
+}
+
+func TestBuildHomePanePayloadExcludesTerminalStatusRegistrations(t *testing.T) {
+	watching := githubReg("success", "APPROVED")
+	watching.PRURL = "https://github.com/o/r/pull/1"
+	merged := githubReg("success", "APPROVED")
+	merged.PRURL = "https://github.com/o/r/pull/2"
+	merged.Status = registry.StatusMerged
+	stopped := githubReg("success", "APPROVED")
+	stopped.PRURL = "https://github.com/o/r/pull/3"
+	stopped.Status = registry.StatusStopped
+
+	payload := buildHomePanePayload([]registry.Registration{watching, merged, stopped}, func(string) string { return "" }, "")
+
+	sec := payload.Blocks[0].(sectionBlock)
+	if sec.Value != "1" {
+		t.Errorf("section.Value = %q, want %q (only the watching registration should count)", sec.Value, "1")
+	}
+	if len(sec.Children) != 1 {
+		t.Fatalf("section.Children len = %d, want 1", len(sec.Children))
+	}
+	row := sec.Children[0].(columnsBlock).Children[0].(rowBlock)
+	if row.Href != watching.PRURL {
+		t.Errorf("row.Href = %q, want the still-watching registration's URL %q", row.Href, watching.PRURL)
 	}
 }
 

@@ -10,6 +10,17 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Status values for Registration.Status. A registration is never deleted —
+// once created it lives forever, moving through these statuses so a
+// permanently-set UI badge (e.g. row-badge) always has a durable source of
+// truth to reconcile against, even across a worker restart.
+const (
+	StatusWatching = "watching" // scheduler actively polls this PR/MR
+	StatusMerged   = "merged"   // terminal: PR/MR was merged
+	StatusClosed   = "closed"   // terminal: PR/MR was closed without merging
+	StatusStopped  = "stopped"  // terminal: owning session unregistered it, or its session is gone
+)
+
 // Registration is one watched PR/MR: which session to wake, where its
 // last-seen state sits, and when the scheduler should check it next.
 type Registration struct {
@@ -21,6 +32,7 @@ type Registration struct {
 	Unresolved        int
 	LatestReviewState string // e.g. "APPROVED", "CHANGES_REQUESTED", "COMMENTED"; empty if no review yet
 	Title             string // empty until the first successful check populates it
+	Status            string // one of the Status* constants; see their doc comments
 	NextDueAt         time.Time
 	Archived          bool
 	CreatedAt         time.Time
@@ -40,6 +52,7 @@ CREATE TABLE IF NOT EXISTS registrations (
 	unresolved INTEGER NOT NULL DEFAULT 0,
 	latest_review_state TEXT NOT NULL DEFAULT '',
 	title TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL DEFAULT 'watching',
 	next_due_at INTEGER NOT NULL,
 	archived INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL
@@ -78,6 +91,7 @@ func Open(path string) (*Store, error) {
 var columnMigrations = []string{
 	`ALTER TABLE registrations ADD COLUMN latest_review_state TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE registrations ADD COLUMN title TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE registrations ADD COLUMN status TEXT NOT NULL DEFAULT 'watching'`,
 }
 
 func migrateAddedColumns(db *sql.DB) error {
@@ -91,27 +105,23 @@ func migrateAddedColumns(db *sql.DB) error {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-// Add registers a PR/MR, or updates its session_id and next_due_at if
-// already registered (re-registering the same URL is idempotent, not an
+// Add registers a PR/MR, or updates its session_id, next_due_at and status
+// if already registered (re-registering the same URL is idempotent, not an
 // error). This upsert does not enforce ownership — whether a caller may
 // take over an existing URL's session_id is decided one layer up, in the
 // register tool, which rejects a cross-session reassignment outright.
+// Every call, insert or update, forces status back to StatusWatching: a
+// fresh registration is always actively watched, and re-registering a PR/MR
+// that had previously reached a terminal status (merged/closed/stopped) is
+// how that PR/MR resumes being watched.
 func (s *Store) Add(ctx context.Context, r Registration) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, unresolved, latest_review_state, title, next_due_at, archived, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(pr_url) DO UPDATE SET session_id = excluded.session_id, next_due_at = excluded.next_due_at
-	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.Unresolved, r.LatestReviewState, r.Title, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix())
+		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, unresolved, latest_review_state, title, status, next_due_at, archived, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(pr_url) DO UPDATE SET session_id = excluded.session_id, next_due_at = excluded.next_due_at, status = excluded.status
+	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.Unresolved, r.LatestReviewState, r.Title, StatusWatching, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix())
 	if err != nil {
 		return fmt.Errorf("add registration: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) Remove(ctx context.Context, prURL string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM registrations WHERE pr_url = ?`, prURL)
-	if err != nil {
-		return fmt.Errorf("remove registration: %w", err)
 	}
 	return nil
 }
@@ -122,12 +132,12 @@ func (s *Store) Remove(ctx context.Context, prURL string) error {
 // callers that need to distinguish "not registered" from a real query
 // failure (e.g. unregister's ownership check).
 func (s *Store) Get(ctx context.Context, prURL string) (Registration, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, latest_review_state, title, next_due_at, archived, created_at FROM registrations WHERE pr_url = ?`, prURL)
+	row := s.db.QueryRowContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, latest_review_state, title, status, next_due_at, archived, created_at FROM registrations WHERE pr_url = ?`, prURL)
 
 	var r Registration
 	var nextDue, created int64
 	var archived int
-	if err := row.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.Unresolved, &r.LatestReviewState, &r.Title, &nextDue, &archived, &created); err != nil {
+	if err := row.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.Unresolved, &r.LatestReviewState, &r.Title, &r.Status, &nextDue, &archived, &created); err != nil {
 		if err == sql.ErrNoRows {
 			return Registration{}, false, nil
 		}
@@ -139,26 +149,40 @@ func (s *Store) Get(ctx context.Context, prURL string) (Registration, bool, erro
 	return r, true, nil
 }
 
-// RemoveOwnedBy deletes prURL's registration only if it belongs to
-// sessionID, reporting whether a row was actually deleted. The check and
-// the delete are one statement so a concurrent re-register can't slip
-// between them. A false result deliberately doesn't distinguish "not
-// registered" from "registered by someone else", so a caller can't probe
-// for which PRs/MRs other sessions are watching.
-func (s *Store) RemoveOwnedBy(ctx context.Context, prURL, sessionID string) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM registrations WHERE pr_url = ? AND session_id = ?`, prURL, sessionID)
+// SetStatus moves prURL to status unconditionally, without an ownership
+// check — for the scheduler's own use (e.g. marking a PR merged/closed, or
+// stopping a registration whose session is gone), never exposed to the MCP
+// tools directly.
+func (s *Store) SetStatus(ctx context.Context, prURL, status string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE registrations SET status = ? WHERE pr_url = ?`, status, prURL)
 	if err != nil {
-		return false, fmt.Errorf("remove owned registration: %w", err)
+		return fmt.Errorf("set status: %w", err)
+	}
+	return nil
+}
+
+// SetStatusOwnedBy moves prURL to status only if it belongs to sessionID,
+// reporting whether a row was actually updated. The check and the update
+// are one statement so a concurrent re-register can't slip between them. A
+// false result deliberately doesn't distinguish "not registered" from
+// "registered by someone else", so a caller can't probe for which PRs/MRs
+// other sessions are watching. The registration is never deleted — this
+// mirrors the former RemoveOwnedBy's ownership semantics, but leaves the
+// row in place at a terminal status instead.
+func (s *Store) SetStatusOwnedBy(ctx context.Context, prURL, sessionID, status string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE registrations SET status = ? WHERE pr_url = ? AND session_id = ?`, status, prURL, sessionID)
+	if err != nil {
+		return false, fmt.Errorf("set owned status: %w", err)
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("remove owned registration: rows affected: %w", err)
+		return false, fmt.Errorf("set owned status: rows affected: %w", err)
 	}
 	return affected > 0, nil
 }
 
 func (s *Store) List(ctx context.Context) ([]Registration, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, latest_review_state, title, next_due_at, archived, created_at FROM registrations ORDER BY next_due_at ASC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, latest_review_state, title, status, next_due_at, archived, created_at FROM registrations ORDER BY next_due_at ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query registrations: %w", err)
 	}
@@ -170,10 +194,12 @@ func (s *Store) List(ctx context.Context) ([]Registration, error) {
 	return regs, nil
 }
 
-// DueBefore returns every registration whose next_due_at has passed,
-// earliest first, so the scheduler processes the most-overdue check first.
+// DueBefore returns every actively-watched registration whose next_due_at
+// has passed, earliest first, so the scheduler processes the most-overdue
+// check first. Terminal-status registrations are excluded: they're never
+// polled again, even if their old next_due_at is in the past.
 func (s *Store) DueBefore(ctx context.Context, t time.Time) ([]Registration, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, latest_review_state, title, next_due_at, archived, created_at FROM registrations WHERE next_due_at <= ? ORDER BY next_due_at ASC`, t.Unix())
+	rows, err := s.db.QueryContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, latest_review_state, title, status, next_due_at, archived, created_at FROM registrations WHERE status = ? AND next_due_at <= ? ORDER BY next_due_at ASC`, StatusWatching, t.Unix())
 	if err != nil {
 		return nil, fmt.Errorf("query due registrations: %w", err)
 	}
@@ -193,11 +219,12 @@ func (s *Store) UpdateState(ctx context.Context, prURL string, reviewCount int, 
 	return nil
 }
 
-// CountByProvider returns the number of currently-registered PRs/MRs per
+// CountByProvider returns the number of actively-watched PRs/MRs per
 // provider, used by the scheduler to spread each rate-limit pool's budget
-// across its real number of consumers rather than a guess.
+// across its real number of consumers rather than a guess. Terminal-status
+// registrations don't consume any polling budget, so they're excluded.
 func (s *Store) CountByProvider(ctx context.Context) (map[string]int, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT provider, COUNT(*) FROM registrations GROUP BY provider`)
+	rows, err := s.db.QueryContext(ctx, `SELECT provider, COUNT(*) FROM registrations WHERE status = ? GROUP BY provider`, StatusWatching)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +256,7 @@ func scanAll(rows *sql.Rows) ([]Registration, error) {
 		var r Registration
 		var nextDue, created int64
 		var archived int
-		if err := rows.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.Unresolved, &r.LatestReviewState, &r.Title, &nextDue, &archived, &created); err != nil {
+		if err := rows.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.Unresolved, &r.LatestReviewState, &r.Title, &r.Status, &nextDue, &archived, &created); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
 		r.NextDueAt = time.Unix(nextDue, 0)

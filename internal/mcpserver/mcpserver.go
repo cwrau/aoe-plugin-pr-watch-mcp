@@ -107,13 +107,15 @@ func NewHandler(store *registry.Store) http.Handler {
 			Name:        "unregister",
 			Description: "Stop watching a previously-registered GitHub PR or GitLab MR.",
 		}, func(ctx context.Context, req *mcp.CallToolRequest, in unregisterInput) (*mcp.CallToolResult, unregisterOutput, error) {
-			// One atomic ownership-scoped delete rather than a Get-then-
-			// Remove pair: nothing can change the row's owner between the
-			// check and the delete. A false result covers both "not
+			// One atomic ownership-scoped update rather than a Get-then-
+			// SetStatus pair: nothing can change the row's owner between the
+			// check and the update. A false result covers both "not
 			// registered" and "registered by a different session" without
 			// distinguishing them, so a caller can't probe for which PRs/MRs
-			// other sessions are watching.
-			removed, err := store.RemoveOwnedBy(ctx, in.PRURL, in.SessionID)
+			// other sessions are watching. The registration itself is never
+			// deleted, just moved to StatusStopped — its badge (if the host
+			// UI has one) reflects that permanently instead of vanishing.
+			removed, err := store.SetStatusOwnedBy(ctx, in.PRURL, in.SessionID, registry.StatusStopped)
 			if err != nil {
 				return nil, unregisterOutput{}, err
 			}
@@ -128,7 +130,13 @@ func NewHandler(store *registry.Store) http.Handler {
 			if err != nil {
 				return nil, listOutput{}, err
 			}
-			return nil, listOutput{Registrations: regs}, nil
+			watching := regs[:0]
+			for _, r := range regs {
+				if r.Status == registry.StatusWatching {
+					watching = append(watching, r)
+				}
+			}
+			return nil, listOutput{Registrations: watching}, nil
 		})
 
 		return server

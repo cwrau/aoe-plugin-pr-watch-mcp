@@ -72,6 +72,64 @@ func TestBuildRowBadgePayloadsEmptyInputGivesEmptyMap(t *testing.T) {
 	}
 }
 
+func TestBuildRowBadgePayloadsMergedChipIsDistinctAndFixed(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/cwrau/aoe-pr-watch-mcp/pull/42", SessionID: "sess1", Provider: "github", Status: registry.StatusMerged, CIBucket: "failure", LatestReviewState: "CHANGES_REQUESTED"},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	chip := got["sess1"].Items[0]
+
+	if chip.Icon != "check-circle" || chip.Tone != "success" {
+		t.Errorf("merged chip = {Icon:%q Tone:%q}, want {check-circle success} regardless of stale CI/review state", chip.Icon, chip.Tone)
+	}
+	if !strings.Contains(chip.Tooltip, "merged") {
+		t.Errorf("chip.Tooltip = %q, want it to say merged", chip.Tooltip)
+	}
+}
+
+func TestBuildRowBadgePayloadsClosedChipIsDistinctAndFixed(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/cwrau/aoe-pr-watch-mcp/pull/42", SessionID: "sess1", Provider: "github", Status: registry.StatusClosed},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	chip := got["sess1"].Items[0]
+
+	if chip.Icon != "circle-slash" || chip.Tone != "neutral" {
+		t.Errorf("closed chip = {Icon:%q Tone:%q}, want {circle-slash neutral}", chip.Icon, chip.Tone)
+	}
+	if !strings.Contains(chip.Tooltip, "closed") {
+		t.Errorf("chip.Tooltip = %q, want it to say closed", chip.Tooltip)
+	}
+}
+
+func TestBuildRowBadgePayloadsExcludesStoppedRegistrations(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", Status: registry.StatusStopped},
+		{PRURL: "https://github.com/o/r/pull/2", SessionID: "sess1", Provider: "github", Status: registry.StatusWatching},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	if len(got["sess1"].Items) != 1 {
+		t.Fatalf("sess1 items = %d, want 1 (the stopped registration must not contribute a chip)", len(got["sess1"].Items))
+	}
+	if got["sess1"].Items[0].Href != "https://github.com/o/r/pull/2" {
+		t.Errorf("sess1 chip href = %q, want the still-watching registration's URL", got["sess1"].Items[0].Href)
+	}
+}
+
+func TestBuildRowBadgePayloadsSessionWithOnlyStoppedRegistrationsGetsNoEntry(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", Status: registry.StatusStopped},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	if _, ok := got["sess1"]; ok {
+		t.Errorf("got[%q] present, want no entry so the caller knows to remove any existing badge", "sess1")
+	}
+}
+
 func TestBuildRowBadgePayloadsChipOrderIsDeterministic(t *testing.T) {
 	regs := []registry.Registration{
 		{PRURL: "https://github.com/o/r/pull/9", SessionID: "sess1", Provider: "github", CIBucket: "none"},

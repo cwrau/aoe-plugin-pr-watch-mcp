@@ -80,8 +80,8 @@ func (s *Scheduler) Tick(ctx context.Context) error {
 func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration, counts map[string]int) {
 	switch s.Sessions.Classify(reg.SessionID) {
 	case aoeclient.SessionGone:
-		if err := s.Store.Remove(ctx, reg.PRURL); err != nil {
-			s.log().Error("drop registration for gone session", "pr_url", reg.PRURL, "error", err)
+		if err := s.Store.SetStatus(ctx, reg.PRURL, registry.StatusStopped); err != nil {
+			s.log().Error("stop registration for gone session", "pr_url", reg.PRURL, "error", err)
 		}
 		return
 	case aoeclient.SessionArchived:
@@ -154,9 +154,9 @@ func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration, c
 		return
 	}
 
-	if result.State == "merged" || result.State == "closed" {
-		if err := s.Store.Remove(ctx, reg.PRURL); err != nil {
-			s.log().Error("drop resolved registration", "pr_url", reg.PRURL, "error", err)
+	if result.State == registry.StatusMerged || result.State == registry.StatusClosed {
+		if err := s.Store.SetStatus(ctx, reg.PRURL, result.State); err != nil {
+			s.log().Error("mark resolved registration", "pr_url", reg.PRURL, "error", err)
 		}
 		return
 	}

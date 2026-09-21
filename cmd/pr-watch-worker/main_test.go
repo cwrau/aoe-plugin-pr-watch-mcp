@@ -71,12 +71,9 @@ func TestPushUIStateRemovesBadgeForSessionThatDroppedOut(t *testing.T) {
 	pushCtx1, cancel1 := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel1()
 
-	// First push: sess1 has a registration, so it should get a row-badge
-	// set and no remove.
-	badgeSessions := pushUIState(pushCtx1, store, aoe, rpc, nil, logger)
-	if !badgeSessions["sess1"] {
-		t.Fatalf("badgeSessions after first push = %v, want sess1 present", badgeSessions)
-	}
+	// First push: sess1 has a watching registration, so it should get a
+	// row-badge set and no remove.
+	pushUIState(pushCtx1, store, aoe, rpc, logger)
 	firstRound := methodsOf(t, &buf)
 	sawSetForSess1 := false
 	for _, m := range firstRound {
@@ -91,20 +88,19 @@ func TestPushUIStateRemovesBadgeForSessionThatDroppedOut(t *testing.T) {
 		t.Fatalf("first push never sent ui.state.set for sess1, got %+v", firstRound)
 	}
 
-	// Now drop the registration (as if it merged/closed) and push again:
-	// sess1 must get an explicit remove this time, and the returned set
-	// must no longer contain it.
-	if err := store.Remove(t.Context(), "https://github.com/o/r/pull/1"); err != nil {
-		t.Fatalf("Remove() error = %v", err)
+	// Now stop the registration (as if the owner unregistered it) and push
+	// again: sess1 must get an explicit remove this time. The registration
+	// row itself survives (never deleted) — it's the status change alone
+	// that must drive the badge to disappear, restart-safe with no
+	// in-memory bookkeeping needed to know sess1 previously had one.
+	if err := store.SetStatus(t.Context(), "https://github.com/o/r/pull/1", registry.StatusStopped); err != nil {
+		t.Fatalf("SetStatus() error = %v", err)
 	}
 	buf.Reset()
 
 	pushCtx2, cancel2 := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel2()
-	badgeSessions = pushUIState(pushCtx2, store, aoe, rpc, badgeSessions, logger)
-	if badgeSessions["sess1"] {
-		t.Errorf("badgeSessions after second push = %v, want sess1 gone", badgeSessions)
-	}
+	pushUIState(pushCtx2, store, aoe, rpc, logger)
 	secondRound := methodsOf(t, &buf)
 	sawRemoveForSess1 := false
 	for _, m := range secondRound {
@@ -114,5 +110,61 @@ func TestPushUIStateRemovesBadgeForSessionThatDroppedOut(t *testing.T) {
 	}
 	if !sawRemoveForSess1 {
 		t.Errorf("second push (registration dropped) never sent ui.state.remove for sess1, got %+v", secondRound)
+	}
+}
+
+// TestPushUIStateReconcilesStatelesslyOnFirstCall guards the actual bug
+// being fixed here: the old implementation tracked which sessions had a
+// badge in an in-memory map that reset to nil on every worker restart, so a
+// registration that turned terminal while the worker was down left a
+// permanently stale badge behind (nothing was ever there to diff against).
+// Reconciliation must instead be derived fresh from the durable registry
+// state every single call — including the very first one, with no prior
+// in-memory tracking at all — which this test exercises directly by calling
+// pushUIState exactly once against a session that only has a stopped
+// registration.
+func TestPushUIStateReconcilesStatelesslyOnFirstCall(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	store, err := registry.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("registry.Open() error = %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now()
+	if err := store.Add(t.Context(), registry.Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github",
+		NextDueAt: now, CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	if err := store.SetStatus(t.Context(), "https://github.com/o/r/pull/1", registry.StatusStopped); err != nil {
+		t.Fatalf("SetStatus() error = %v", err)
+	}
+
+	aoe, err := aoeclient.New()
+	if err != nil {
+		t.Fatalf("aoeclient.New() error = %v", err)
+	}
+
+	var buf bytes.Buffer
+	rpc := newHostRPC(&buf)
+
+	pushCtx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	pushUIState(pushCtx, store, aoe, rpc, logger)
+
+	sawRemoveForSess1 := false
+	for _, m := range methodsOf(t, &buf) {
+		if m.Method == "ui.state.set" && m.SessionID == "sess1" {
+			t.Errorf("first-ever push sent ui.state.set for sess1, want no badge for an already-stopped registration")
+		}
+		if m.Method == "ui.state.remove" && m.SessionID == "sess1" {
+			sawRemoveForSess1 = true
+		}
+	}
+	if !sawRemoveForSess1 {
+		t.Error("first-ever push never sent ui.state.remove for sess1, want it removed even with no prior in-memory state (restart-safety)")
 	}
 }

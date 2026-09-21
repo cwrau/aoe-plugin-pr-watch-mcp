@@ -133,7 +133,7 @@ func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, store *re
 	// titles may still be unresolved at this point (RefreshSessionSets
 	// hasn't run yet), so rows briefly fall back to raw session ids until
 	// the first tick fills them in.
-	badgeSessions := pushUIState(ctx, store, aoe, rpc, nil, logger)
+	pushUIState(ctx, store, aoe, rpc, logger)
 
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
@@ -151,32 +151,29 @@ func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, store *re
 			if err != nil {
 				logger.Error("scheduler tick", "error", err)
 			}
-			badgeSessions = pushUIState(ctx, store, aoe, rpc, badgeSessions, logger)
+			pushUIState(ctx, store, aoe, rpc, logger)
 		}
 	}
 }
 
-// pushHomePane renders the current registrations as a home-pane payload
-// and pushes it via ui.state.set. Best-effort: a failure here (a listing
-// error, a write error on the stdio channel) is logged and left for the
-// next tick's push rather than treated as fatal — the pane is a dashboard
-// convenience, not load-bearing for polling or notifications.
 // pushUIState renders and pushes both UI slots this worker owns — the
 // global home-pane and each session's row-badge — from one consistent
-// snapshot of the registry. badgeSessions is the set of session ids that
-// had a row-badge as of the last call; pushUIState diffs against the
-// current set and issues ui.state.remove for any that dropped out (a
-// session whose last watched registration just merged/closed/unregistered
-// would otherwise keep a stale badge forever), returning the new set for
-// the next call.
-func pushUIState(ctx context.Context, store *registry.Store, aoe *aoeclient.Client, rpc *hostRPC, badgeSessions map[string]bool, logger *slog.Logger) map[string]bool {
+// snapshot of the registry. Because registrations are never deleted (see
+// registry.Store.Add's doc comment), the set of session ids that have ever
+// registered anything is itself durable state, readable fresh from the
+// store every call — so reconciliation (deciding which sessions should have
+// a badge right now, and issuing ui.state.remove for the rest) needs no
+// in-memory bookkeeping across calls and is safe across a worker restart:
+// a badgeSessions parameter tracked in memory would silently go stale the
+// moment the worker restarted mid-way through a session's watch lifecycle.
+func pushUIState(ctx context.Context, store *registry.Store, aoe *aoeclient.Client, rpc *hostRPC, logger *slog.Logger) {
 	pushCtx, cancel := context.WithTimeout(ctx, panePushTimeout)
 	defer cancel()
 
 	regs, err := store.List(pushCtx)
 	if err != nil {
 		logger.Warn("list registrations for UI push", "error", err)
-		return badgeSessions
+		return
 	}
 
 	baseURL := rpc.getStringSetting(pushCtx, dashboardBaseURLSettingKey, "")
@@ -185,22 +182,19 @@ func pushUIState(ctx context.Context, store *registry.Store, aoe *aoeclient.Clie
 	}
 
 	badges := buildRowBadgePayloads(regs)
-	newBadgeSessions := make(map[string]bool, len(badges))
-	for sessionID, payload := range badges {
-		if err := rpc.setRowBadge(sessionID, payload); err != nil {
-			logger.Warn("set row badge", "session_id", sessionID, "error", err)
-		}
-		newBadgeSessions[sessionID] = true
+	allSessions := make(map[string]bool, len(regs))
+	for _, r := range regs {
+		allSessions[r.SessionID] = true
 	}
-	for sessionID := range badgeSessions {
-		if !newBadgeSessions[sessionID] {
-			if err := rpc.removeRowBadge(sessionID); err != nil {
-				logger.Warn("remove row badge", "session_id", sessionID, "error", err)
+	for sessionID := range allSessions {
+		if payload, ok := badges[sessionID]; ok {
+			if err := rpc.setRowBadge(sessionID, payload); err != nil {
+				logger.Warn("set row badge", "session_id", sessionID, "error", err)
 			}
+		} else if err := rpc.removeRowBadge(sessionID); err != nil {
+			logger.Warn("remove row badge", "session_id", sessionID, "error", err)
 		}
 	}
-
-	return newBadgeSessions
 }
 
 func runHTTPServer(ctx context.Context, store *registry.Store, logger *slog.Logger) {
