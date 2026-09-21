@@ -36,6 +36,13 @@ const (
 	// `glab config get token`), which can block on a stuck keyring or dbus
 	// backend.
 	tokenTimeout = 10 * time.Second
+
+	// panePushTimeout bounds one home-pane push, including its config.get
+	// round trip for dashboard_base_url. pushHomePane runs synchronously in
+	// the scheduler loop (once at startup, once after every tick), so an
+	// unbounded wait here — e.g. a host that never replies — would stall
+	// the entire loop, not just the pane feature.
+	panePushTimeout = 10 * time.Second
 )
 
 func main() {
@@ -108,13 +115,14 @@ func main() {
 	go runHTTPServer(ctx, store, logger)
 
 	// The ndjson stdio channel is how the AoE daemon supervises this
-	// worker: it never sends us anything we need to act on (we declare no
-	// commands), so this loop's only job is to notice stdin EOF, the host's
-	// shutdown signal, same as the reference agent-of-empires.github
-	// worker's read loop.
+	// worker, and also how it answers this worker's own outbound calls
+	// (config.get for settings). Every line is handed to
+	// rpc.handleInboundLine, which delivers replies to whichever call is
+	// waiting on them; EOF is still the host's shutdown signal, same as
+	// the reference agent-of-empires.github worker's read loop.
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
-		// No inbound RPCs to dispatch; drain and ignore.
+		rpc.handleInboundLine(scanner.Bytes())
 	}
 	logger.Info("stdin closed, shutting down")
 }
@@ -154,12 +162,16 @@ func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, store *re
 // next tick's push rather than treated as fatal — the pane is a dashboard
 // convenience, not load-bearing for polling or notifications.
 func pushHomePane(ctx context.Context, store *registry.Store, aoe *aoeclient.Client, rpc *hostRPC, logger *slog.Logger) {
-	regs, err := store.List(ctx)
+	pushCtx, cancel := context.WithTimeout(ctx, panePushTimeout)
+	defer cancel()
+
+	regs, err := store.List(pushCtx)
 	if err != nil {
 		logger.Warn("list registrations for home pane", "error", err)
 		return
 	}
-	payload := buildHomePanePayload(regs, aoe.Title, resolveDashboardBaseURL())
+	baseURL := rpc.getStringSetting(pushCtx, dashboardBaseURLSettingKey, "")
+	payload := buildHomePanePayload(regs, aoe.Title, baseURL)
 	if err := rpc.pushHomePane(payload); err != nil {
 		logger.Warn("push home pane", "error", err)
 	}

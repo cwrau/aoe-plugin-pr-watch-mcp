@@ -12,6 +12,13 @@ import (
 const homePaneSlot = "home-pane"
 const homePaneID = "watched_prs"
 
+// dashboardBaseURLSettingKey must match the [[settings]] key declared in
+// aoe-plugin.toml. There's no way for the worker to know which of the
+// daemon's possibly-several externally-reachable URLs (loopback, LAN,
+// Tailscale, a reverse-proxied domain) the person viewing the dashboard is
+// actually using, so this is user-configured rather than inferred.
+const dashboardBaseURLSettingKey = "dashboard_base_url"
+
 // panePayload mirrors the shape ui.state.set expects for a pane-family
 // slot (docs/plugin-api.md "Pane payload"). Only title/blocks are set —
 // default_location/icon/footer are per-session-pane concepts that don't

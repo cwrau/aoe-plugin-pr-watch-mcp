@@ -32,6 +32,19 @@ capabilities = ["net", "runtime.worker"]
 slot = "home-pane"
 id = "watched_prs"
 
+# The worker has no way to know which of the daemon's possibly-several
+# externally-reachable URLs (loopback, LAN, Tailscale, a reverse-proxied
+# domain) you actually view the dashboard from, so the session link in the
+# panel above needs this set explicitly — leave it empty to just show the
+# session id as plain, unlinked text instead.
+[[settings]]
+key = "dashboard_base_url"
+label = "Dashboard base URL"
+description = "The URL you use to open the AoE dashboard (e.g. https://agent.example.com), used to build session links in the Watched PRs/MRs panel. Leave empty to show session ids without a link."
+type = "string"
+default = ""
+advanced = true
+
 [runtime]
 kind = "command"
 command = [".aoe-build/pr-watch-worker"]
