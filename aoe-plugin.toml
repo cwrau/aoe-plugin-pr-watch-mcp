@@ -38,6 +38,15 @@ id = "watched_prs"
 slot = "row-badge"
 id = "watched_badge"
 
+# In-session tool-window pane (opened from that session's own dock, same
+# pattern as the reference agent-of-empires.github plugin's pane): a plain
+# list of links straight to whatever that session is watching, with no
+# rigid-grid layout to fight and no nested-anchor click-target problem —
+# the simple, reliable alternative to the small row-badge chip.
+[[ui]]
+slot = "pane"
+id = "pr_pane"
+
 # The worker has no way to know which of the daemon's possibly-several
 # externally-reachable URLs (loopback, LAN, Tailscale, a reverse-proxied
 # domain) you actually view the dashboard from, so the session link in the
