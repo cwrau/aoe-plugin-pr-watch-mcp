@@ -182,9 +182,11 @@ func pushUIState(ctx context.Context, store *registry.Store, aoe *aoeclient.Clie
 	}
 
 	badges := buildRowBadgePayloads(regs)
+	regsBySession := make(map[string][]registry.Registration, len(regs))
 	allSessions := make(map[string]bool, len(regs))
 	for _, r := range regs {
 		allSessions[r.SessionID] = true
+		regsBySession[r.SessionID] = append(regsBySession[r.SessionID], r)
 	}
 	for sessionID := range allSessions {
 		if payload, ok := badges[sessionID]; ok {
@@ -193,6 +195,14 @@ func pushUIState(ctx context.Context, store *registry.Store, aoe *aoeclient.Clie
 			}
 		} else if err := rpc.removeRowBadge(sessionID); err != nil {
 			logger.Warn("remove row badge", "session_id", sessionID, "error", err)
+		}
+
+		if payload, ok := buildSessionPanePayload(regsBySession[sessionID]); ok {
+			if err := rpc.pushSessionPane(sessionID, payload); err != nil {
+				logger.Warn("push session pane", "session_id", sessionID, "error", err)
+			}
+		} else if err := rpc.removeSessionPane(sessionID); err != nil {
+			logger.Warn("remove session pane", "session_id", sessionID, "error", err)
 		}
 	}
 }

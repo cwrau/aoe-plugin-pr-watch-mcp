@@ -20,12 +20,14 @@ const homePaneID = "watched_prs"
 const dashboardBaseURLSettingKey = "dashboard_base_url"
 
 // panePayload mirrors the shape ui.state.set expects for a pane-family
-// slot (docs/plugin-api.md "Pane payload"). Only title/blocks are set —
-// default_location/icon/footer are per-session-pane concepts that don't
-// apply to a host-wide home-pane.
+// slot (docs/plugin-api.md "Pane payload"), shared by home-pane and the
+// per-session pane. DefaultLocation/icon/footer are per-session-pane
+// concepts that don't apply to a host-wide home-pane, so home-pane's own
+// builder just leaves DefaultLocation unset (omitted from the JSON).
 type panePayload struct {
-	Title  string `json:"title"`
-	Blocks []any  `json:"blocks"`
+	Title           string `json:"title"`
+	DefaultLocation string `json:"default_location,omitempty"`
+	Blocks          []any  `json:"blocks"`
 }
 
 type sectionBlock struct {

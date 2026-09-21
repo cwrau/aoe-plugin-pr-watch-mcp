@@ -210,3 +210,23 @@ func (h *hostRPC) removeRowBadge(sessionID string) error {
 		"session_id": sessionID,
 	})
 }
+
+// pushSessionPane pushes one session's in-session pane state.
+func (h *hostRPC) pushSessionPane(sessionID string, payload panePayload) error {
+	return h.send("ui.state.set", map[string]any{
+		"slot":       sessionPaneSlot,
+		"id":         sessionPaneID,
+		"session_id": sessionID,
+		"payload":    payload,
+	})
+}
+
+// removeSessionPane clears a session's pane entirely — same reasoning as
+// removeRowBadge: nothing left to show must not mean a stale pane lingers.
+func (h *hostRPC) removeSessionPane(sessionID string) error {
+	return h.send("ui.state.remove", map[string]any{
+		"slot":       sessionPaneSlot,
+		"id":         sessionPaneID,
+		"session_id": sessionID,
+	})
+}
