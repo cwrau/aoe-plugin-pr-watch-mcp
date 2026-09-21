@@ -32,6 +32,12 @@ capabilities = ["net", "runtime.worker"]
 slot = "home-pane"
 id = "watched_prs"
 
+# Per-session badge on the session row: one clickable chip per PR/MR that
+# session is watching, tone-colored by CI state.
+[[ui]]
+slot = "row-badge"
+id = "watched_badge"
+
 # The worker has no way to know which of the daemon's possibly-several
 # externally-reachable URLs (loopback, LAN, Tailscale, a reverse-proxied
 # domain) you actually view the dashboard from, so the session link in the

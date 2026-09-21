@@ -128,12 +128,12 @@ func main() {
 }
 
 func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, store *registry.Store, aoe *aoeclient.Client, rpc *hostRPC, logger *slog.Logger) {
-	// Push once at startup so the home-pane isn't blank until the first
-	// tick completes (up to tickInterval later). Session titles may still
-	// be unresolved at this point (RefreshSessionSets hasn't run yet), so
-	// rows briefly fall back to raw session ids until the first tick fills
-	// them in.
-	pushHomePane(ctx, store, aoe, rpc, logger)
+	// Push once at startup so the home-pane and row-badges aren't blank
+	// until the first tick completes (up to tickInterval later). Session
+	// titles may still be unresolved at this point (RefreshSessionSets
+	// hasn't run yet), so rows briefly fall back to raw session ids until
+	// the first tick fills them in.
+	badgeSessions := pushUIState(ctx, store, aoe, rpc, nil, logger)
 
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
@@ -151,7 +151,7 @@ func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, store *re
 			if err != nil {
 				logger.Error("scheduler tick", "error", err)
 			}
-			pushHomePane(ctx, store, aoe, rpc, logger)
+			badgeSessions = pushUIState(ctx, store, aoe, rpc, badgeSessions, logger)
 		}
 	}
 }
@@ -161,20 +161,46 @@ func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, store *re
 // error, a write error on the stdio channel) is logged and left for the
 // next tick's push rather than treated as fatal — the pane is a dashboard
 // convenience, not load-bearing for polling or notifications.
-func pushHomePane(ctx context.Context, store *registry.Store, aoe *aoeclient.Client, rpc *hostRPC, logger *slog.Logger) {
+// pushUIState renders and pushes both UI slots this worker owns — the
+// global home-pane and each session's row-badge — from one consistent
+// snapshot of the registry. badgeSessions is the set of session ids that
+// had a row-badge as of the last call; pushUIState diffs against the
+// current set and issues ui.state.remove for any that dropped out (a
+// session whose last watched registration just merged/closed/unregistered
+// would otherwise keep a stale badge forever), returning the new set for
+// the next call.
+func pushUIState(ctx context.Context, store *registry.Store, aoe *aoeclient.Client, rpc *hostRPC, badgeSessions map[string]bool, logger *slog.Logger) map[string]bool {
 	pushCtx, cancel := context.WithTimeout(ctx, panePushTimeout)
 	defer cancel()
 
 	regs, err := store.List(pushCtx)
 	if err != nil {
-		logger.Warn("list registrations for home pane", "error", err)
-		return
+		logger.Warn("list registrations for UI push", "error", err)
+		return badgeSessions
 	}
+
 	baseURL := rpc.getStringSetting(pushCtx, dashboardBaseURLSettingKey, "")
-	payload := buildHomePanePayload(regs, aoe.Title, baseURL)
-	if err := rpc.pushHomePane(payload); err != nil {
+	if err := rpc.pushHomePane(buildHomePanePayload(regs, aoe.Title, baseURL)); err != nil {
 		logger.Warn("push home pane", "error", err)
 	}
+
+	badges := buildRowBadgePayloads(regs)
+	newBadgeSessions := make(map[string]bool, len(badges))
+	for sessionID, payload := range badges {
+		if err := rpc.setRowBadge(sessionID, payload); err != nil {
+			logger.Warn("set row badge", "session_id", sessionID, "error", err)
+		}
+		newBadgeSessions[sessionID] = true
+	}
+	for sessionID := range badgeSessions {
+		if !newBadgeSessions[sessionID] {
+			if err := rpc.removeRowBadge(sessionID); err != nil {
+				logger.Warn("remove row badge", "session_id", sessionID, "error", err)
+			}
+		}
+	}
+
+	return newBadgeSessions
 }
 
 func runHTTPServer(ctx context.Context, store *registry.Store, logger *slog.Logger) {

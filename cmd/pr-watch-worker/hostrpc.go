@@ -187,3 +187,26 @@ func (h *hostRPC) pushHomePane(payload panePayload) error {
 		"payload": payload,
 	})
 }
+
+// setRowBadge pushes a session's row-badge state. Unlike home-pane, this
+// slot is per-session, so the payload carries session_id alongside slot/id.
+func (h *hostRPC) setRowBadge(sessionID string, payload rowBadgePayload) error {
+	return h.send("ui.state.set", map[string]any{
+		"slot":       rowBadgeSlot,
+		"id":         rowBadgeID,
+		"session_id": sessionID,
+		"payload":    payload,
+	})
+}
+
+// removeRowBadge clears a session's row-badge entirely — required when a
+// session's last watched registration goes away (merged/closed/dropped),
+// or the badge would otherwise linger on that session's row forever with
+// stale content.
+func (h *hostRPC) removeRowBadge(sessionID string) error {
+	return h.send("ui.state.remove", map[string]any{
+		"slot":       rowBadgeSlot,
+		"id":         rowBadgeID,
+		"session_id": sessionID,
+	})
+}
