@@ -267,11 +267,13 @@ func getReg(t *testing.T, store *registry.Store, prURL string) registry.Registra
 	return r
 }
 
-// TestTickKeepsStateWhenNotifyFails: a notification that couldn't be
-// delivered is only ever retried by the next tick re-diffing the same
-// unchanged prev state, so a failed Send must leave both the stored state
-// and next_due_at alone.
-func TestTickKeepsStateWhenNotifyFails(t *testing.T) {
+// TestTickPersistsStateEvenWhenNotifyFails: notify is best-effort, not a
+// gate on persistence. A session that can structurally never receive a
+// message (e.g. an ACP-mode AoE session — `aoe send` always refuses those,
+// there is no future retry that would ever succeed) must not freeze the
+// registration's displayed state or its polling schedule forever just
+// because Send keeps failing.
+func TestTickPersistsStateEvenWhenNotifyFails(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	now := time.Now()
@@ -284,8 +286,8 @@ func TestTickKeepsStateWhenNotifyFails(t *testing.T) {
 		t.Fatalf("Add() error = %v", err)
 	}
 
-	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "open", ReviewCount: 1, CIBucket: "failure", Unresolved: 2}}
-	notify := &fakeNotifier{err: errors.New("aoe send exploded")}
+	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "open", ReviewCount: 1, CIBucket: "failure", Unresolved: 2, Title: "Fix the thing"}}
+	notify := &fakeNotifier{err: errors.New("Acp-mode sessions have no tmux pane; send is not supported")}
 	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: notify}
 	if err := sched.Tick(ctx); err != nil {
 		t.Fatalf("Tick() error = %v", err)
@@ -295,18 +297,19 @@ func TestTickKeepsStateWhenNotifyFails(t *testing.T) {
 		t.Fatalf("notify.sent = %v, want exactly one attempted send", notify.sent)
 	}
 	got := getReg(t, store, reg.PRURL)
-	if got.ReviewCount != 1 || got.CIBucket != "pending" || got.Unresolved != 2 {
-		t.Errorf("stored state = {reviews:%d ci:%q unresolved:%d}, want the unchanged prev state {1 pending 2} so the next tick re-diffs and resends", got.ReviewCount, got.CIBucket, got.Unresolved)
+	if got.CIBucket != "failure" || got.Title != "Fix the thing" {
+		t.Errorf("stored state = {ci:%q title:%q}, want the fresh check result {failure %q} persisted regardless of the failed send", got.CIBucket, got.Title, "Fix the thing")
 	}
-	if got.NextDueAt.Unix() != reg.NextDueAt.Unix() {
-		t.Errorf("next_due_at = %v, want it left at %v (a failed send must not advance the schedule)", got.NextDueAt, reg.NextDueAt)
+	if !got.NextDueAt.After(reg.NextDueAt) {
+		t.Errorf("next_due_at = %v, want it advanced past %v (a failed send must not hold the registration due-immediately forever)", got.NextDueAt, reg.NextDueAt)
 	}
 }
 
-// TestTickKeepsRegistrationWhenMergedNotifyFails: on MERGED the registration
-// is deleted right after the send, so a failed send would lose the
-// notification permanently. It must survive to be retried.
-func TestTickKeepsRegistrationWhenMergedNotifyFails(t *testing.T) {
+// TestTickMarksMergedEvenWhenNotifyFails: same best-effort principle on the
+// terminal path — a MERGED session that can never receive the notification
+// must still move to StatusMerged rather than staying "watching" and
+// re-attempting the undeliverable send on every tick forever.
+func TestTickMarksMergedEvenWhenNotifyFails(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	now := time.Now()
@@ -319,7 +322,7 @@ func TestTickKeepsRegistrationWhenMergedNotifyFails(t *testing.T) {
 	}
 
 	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "merged"}}
-	notify := &fakeNotifier{err: errors.New("aoe send exploded")}
+	notify := &fakeNotifier{err: errors.New("Acp-mode sessions have no tmux pane; send is not supported")}
 	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: notify}
 	if err := sched.Tick(ctx); err != nil {
 		t.Fatalf("Tick() error = %v", err)
@@ -329,8 +332,8 @@ func TestTickKeepsRegistrationWhenMergedNotifyFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if len(remaining) != 1 {
-		t.Fatalf("List() len = %d, want 1 (a failed MERGED notification must not take the registration with it)", len(remaining))
+	if len(remaining) != 1 || remaining[0].Status != registry.StatusMerged {
+		t.Fatalf("List() = %+v, want a single row at status %q even though the notification failed", remaining, registry.StatusMerged)
 	}
 }
 

@@ -136,22 +136,21 @@ func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration, c
 		return
 	}
 
-	// A notification that couldn't be delivered must not advance the stored
-	// state or drop the registration: leaving both untouched means the next
-	// tick's Diff recomputes against the same prev state and re-sends the
-	// same events, which is the only retry this worker has. Advancing anyway
-	// would silently discard the event — and on MERGED/CLOSED it would
-	// discard the registration along with it.
-	sentAll := true
+	// Best-effort only: a session whose Sender can never deliver (e.g. an
+	// ACP-mode AoE session, which has no tmux pane for `aoe send` to write
+	// into) would otherwise fail every single tick forever. Gating state
+	// persistence on delivery success used to mean such a registration's
+	// title/CI/review state froze at its very first check for good, and its
+	// next_due_at never advanced past "immediately due" — hammering Send in
+	// a tight retry loop indefinitely instead of backing off to the normal
+	// polling interval. Logging the failure and moving on trades "guaranteed
+	// eventual delivery" for "the dashboard stays fresh and polling stays
+	// paced" — the right trade given delivery to a structurally incompatible
+	// session was never going to succeed on a later retry anyway.
 	for _, ev := range provider.Diff(prev, result) {
 		if err := s.Notify.Send(ctx, reg.SessionID, eventMessage(ev)); err != nil {
 			s.log().Warn("notify failed", "pr_url", reg.PRURL, "session_id", reg.SessionID, "error", err)
-			sentAll = false
 		}
-	}
-	if !sentAll {
-		s.log().Warn("some notifications failed, leaving state unchanged to retry next tick", "pr_url", reg.PRURL)
-		return
 	}
 
 	if result.State == registry.StatusMerged || result.State == registry.StatusClosed {
