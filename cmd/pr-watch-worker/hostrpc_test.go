@@ -176,6 +176,72 @@ func outboundID(t *testing.T, buf *syncBuffer) int {
 	return int(idFloat)
 }
 
+func TestHostRPCSetRowBadgeSendsCorrectSlotIDAndSession(t *testing.T) {
+	var buf bytes.Buffer
+	h := newHostRPC(&buf)
+
+	payload := rowBadgePayload{Items: []badgeChip{{Icon: "eye", Tone: "success", Tooltip: "hi", Href: "https://example.com"}}}
+	if err := h.setRowBadge("sess1", payload); err != nil {
+		t.Fatalf("setRowBadge() error = %v", err)
+	}
+
+	var msg map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &msg); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if msg["method"] != "ui.state.set" {
+		t.Errorf("method = %v, want %q", msg["method"], "ui.state.set")
+	}
+	params := msg["params"].(map[string]any)
+	if params["slot"] != rowBadgeSlot {
+		t.Errorf("slot = %v, want %q", params["slot"], rowBadgeSlot)
+	}
+	if params["id"] != rowBadgeID {
+		t.Errorf("id = %v, want %q", params["id"], rowBadgeID)
+	}
+	if params["session_id"] != "sess1" {
+		t.Errorf("session_id = %v, want %q", params["session_id"], "sess1")
+	}
+	pushedPayload, ok := params["payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload = %T, want an object", params["payload"])
+	}
+	items, ok := pushedPayload["items"].([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("payload.items = %v, want a 1-element array", pushedPayload["items"])
+	}
+}
+
+func TestHostRPCRemoveRowBadgeSendsCorrectSlotIDAndSession(t *testing.T) {
+	var buf bytes.Buffer
+	h := newHostRPC(&buf)
+
+	if err := h.removeRowBadge("sess1"); err != nil {
+		t.Fatalf("removeRowBadge() error = %v", err)
+	}
+
+	var msg map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &msg); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if msg["method"] != "ui.state.remove" {
+		t.Errorf("method = %v, want %q", msg["method"], "ui.state.remove")
+	}
+	params := msg["params"].(map[string]any)
+	if params["slot"] != rowBadgeSlot {
+		t.Errorf("slot = %v, want %q", params["slot"], rowBadgeSlot)
+	}
+	if params["id"] != rowBadgeID {
+		t.Errorf("id = %v, want %q", params["id"], rowBadgeID)
+	}
+	if params["session_id"] != "sess1" {
+		t.Errorf("session_id = %v, want %q", params["session_id"], "sess1")
+	}
+	if _, hasPayload := params["payload"]; hasPayload {
+		t.Error("ui.state.remove params carry a payload key, want none")
+	}
+}
+
 func TestHostRPCCallDeliversMatchingReply(t *testing.T) {
 	buf := &syncBuffer{}
 	h := newHostRPC(buf)
