@@ -41,6 +41,7 @@ func fakeGitLabServer(t *testing.T, mrState, pipelineStatus string, approvals, u
 		json.NewEncoder(w).Encode(map[string]any{
 			"state":         mrState,
 			"title":         "Fix the thing",
+			"description":   "This fixes the thing by doing the other thing.",
 			"pipeline":      map[string]any{"status": pipelineStatus},
 			"head_pipeline": nil,
 		})
@@ -72,7 +73,7 @@ func TestGitLabCheckerOpenWithApprovalsAndPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Check() error = %v", err)
 	}
-	if result.State != "open" || result.Title != "Fix the thing" || result.ReviewCount != 2 || result.CIBucket != "success" || result.Unresolved != 1 {
+	if result.State != "open" || result.Title != "Fix the thing" || result.Description != "This fixes the thing by doing the other thing." || result.ReviewCount != 2 || result.CIBucket != "success" || result.Unresolved != 1 {
 		t.Errorf("Check() result = %+v", result)
 	}
 	if budget.Remaining != 1999 {
