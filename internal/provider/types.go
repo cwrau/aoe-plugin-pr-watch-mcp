@@ -14,6 +14,7 @@ type PrevState struct {
 type CheckResult struct {
 	State             string // "open" | "merged" | "closed"
 	Title             string
+	Description       string // the PR/MR body, empty if the provider returned none
 	ReviewCount       int
 	LatestReviewer    string
 	LatestReviewState string

@@ -58,6 +58,7 @@ const graphqlOpenSuccessBody = `{
     "repository": { "pullRequest": {
       "state": "OPEN",
       "title": "Fix the thing",
+      "body": "This fixes the thing by doing the other thing.",
       "headRefOid": "deadbeef",
       "reviewCount": { "totalCount": 2 },
       "latestReview": { "nodes": [{ "author": { "login": "alice" }, "state": "APPROVED" }] },
@@ -76,7 +77,7 @@ func TestGitHubCheckerOpenSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Check() error = %v", err)
 	}
-	if result.State != "open" || result.Title != "Fix the thing" || result.ReviewCount != 2 || result.LatestReviewer != "alice" || result.LatestReviewState != "APPROVED" || result.CIBucket != "success" {
+	if result.State != "open" || result.Title != "Fix the thing" || result.Description != "This fixes the thing by doing the other thing." || result.ReviewCount != 2 || result.LatestReviewer != "alice" || result.LatestReviewState != "APPROVED" || result.CIBucket != "success" {
 		t.Errorf("Check() result = %+v", result)
 	}
 	if budgets.GraphQL.Remaining != 4998 || budgets.REST.Remaining != 4999 {

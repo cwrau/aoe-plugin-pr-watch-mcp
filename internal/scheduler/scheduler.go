@@ -88,7 +88,7 @@ func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration, c
 		// Skip the send, but still push next_due_at out using the fallback
 		// interval so an archived registration doesn't spin the due-heap
 		// every tick while archived.
-		if err := s.Store.UpdateState(ctx, reg.PRURL, reg.ReviewCount, reg.CIBucket, reg.Unresolved, reg.LatestReviewState, reg.Title, time.Now().Add(FallbackInterval)); err != nil {
+		if err := s.Store.UpdateState(ctx, reg.PRURL, reg.ReviewCount, reg.CIBucket, reg.Unresolved, reg.LatestReviewState, reg.Title, reg.Description, time.Now().Add(FallbackInterval)); err != nil {
 			s.log().Error("reschedule archived registration", "pr_url", reg.PRURL, "error", err)
 		}
 		return
@@ -130,7 +130,7 @@ func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration, c
 		// moves — so the next successful check still diffs against the real
 		// last-seen state.
 		s.log().Warn("check failed, retrying after the poll floor", "pr_url", reg.PRURL, "retry_in", MinPollInterval, "error", checkErr)
-		if err := s.Store.UpdateState(ctx, reg.PRURL, reg.ReviewCount, reg.CIBucket, reg.Unresolved, reg.LatestReviewState, reg.Title, time.Now().Add(MinPollInterval)); err != nil {
+		if err := s.Store.UpdateState(ctx, reg.PRURL, reg.ReviewCount, reg.CIBucket, reg.Unresolved, reg.LatestReviewState, reg.Title, reg.Description, time.Now().Add(MinPollInterval)); err != nil {
 			s.log().Error("back off failed check", "pr_url", reg.PRURL, "error", err)
 		}
 		return
@@ -160,7 +160,7 @@ func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration, c
 		return
 	}
 
-	if err := s.Store.UpdateState(ctx, reg.PRURL, result.ReviewCount, result.CIBucket, result.Unresolved, result.LatestReviewState, result.Title, time.Now().Add(interval)); err != nil {
+	if err := s.Store.UpdateState(ctx, reg.PRURL, result.ReviewCount, result.CIBucket, result.Unresolved, result.LatestReviewState, result.Title, result.Description, time.Now().Add(interval)); err != nil {
 		s.log().Error("persist new state", "pr_url", reg.PRURL, "error", err)
 	}
 }

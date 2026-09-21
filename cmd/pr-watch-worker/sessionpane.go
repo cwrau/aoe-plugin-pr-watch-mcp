@@ -5,10 +5,15 @@ import "github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
 const sessionPaneSlot = "pane"
 const sessionPaneID = "pr_pane"
 
+type dividerBlock struct {
+	Kind string `json:"kind"`
+}
+
 // buildSessionPanePayload renders one session's watched registrations as an
-// in-session pane: a plain list of rows, each a direct link to a PR/MR that
-// session watches (or has watched — merged/closed included, same as the
-// row-badge, so the link survives after the PR/MR itself is resolved).
+// in-session pane: for each PR/MR that session watches (or has watched —
+// merged/closed included, same as the row-badge, so the link survives after
+// the PR/MR itself is resolved), a title line, a ref/URL line, and its
+// description, title and ref/URL both linking straight to the PR/MR.
 // StatusStopped registrations are excluded, same reasoning as
 // buildRowBadgePayloads: the session explicitly asked to stop watching it.
 // The bool result is false when there is nothing to show (every
@@ -20,7 +25,10 @@ func buildSessionPanePayload(regs []registry.Registration) (panePayload, bool) {
 		if r.Status == registry.StatusStopped {
 			continue
 		}
-		children = append(children, sessionPaneRow(r))
+		if len(children) > 0 {
+			children = append(children, dividerBlock{Kind: "divider"})
+		}
+		children = append(children, sessionPaneBlocks(r)...)
 	}
 	if len(children) == 0 {
 		return panePayload{}, false
@@ -32,10 +40,20 @@ func buildSessionPanePayload(regs []registry.Registration) (panePayload, bool) {
 	}, true
 }
 
-func sessionPaneRow(r registry.Registration) rowBlock {
-	label := r.Title
-	if label == "" {
-		label = shortRef(r)
+// sessionPaneBlocks renders one registration as three stacked pieces: the
+// full title, a reference line (the short owner/repo#N form for GitHub;
+// GitLab's paths don't compress as recognizably, so the full URL instead),
+// and the full description as plain, unlinked text. Title and the
+// reference line are both clickable, direct links to the PR/MR itself.
+func sessionPaneBlocks(r registry.Registration) []any {
+	title := r.Title
+	if title == "" {
+		title = shortRef(r)
+	}
+
+	ref := shortRef(r)
+	if r.Provider == "gitlab" {
+		ref = r.PRURL
 	}
 
 	var badges []rowBadge
@@ -48,10 +66,12 @@ func sessionPaneRow(r registry.Registration) rowBlock {
 		badges = []rowBadge{ciBadge(r.CIBucket), reviewBadge(r.LatestReviewState)}
 	}
 
-	return rowBlock{
-		Kind:   "row",
-		Label:  label,
-		Href:   r.PRURL,
-		Badges: badges,
+	blocks := []any{
+		rowBlock{Kind: "row", Label: title, Href: r.PRURL, Badges: badges},
+		rowBlock{Kind: "row", Label: ref, Href: r.PRURL},
 	}
+	if r.Description != "" {
+		blocks = append(blocks, noteBlock{Kind: "note", Text: r.Description})
+	}
+	return blocks
 }

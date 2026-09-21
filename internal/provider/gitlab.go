@@ -63,9 +63,10 @@ func (c *GitLabChecker) tokenHeader() string {
 }
 
 type gitlabMRResponse struct {
-	State    string `json:"state"`
-	Title    string `json:"title"`
-	Pipeline *struct {
+	State       string `json:"state"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Pipeline    *struct {
 		Status string `json:"status"`
 	} `json:"pipeline"`
 	HeadPipeline *struct {
@@ -126,7 +127,7 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 	}
 	mrData := mr.(*gitlabMRResponse)
 
-	result := CheckResult{State: mapGitLabState(mrData.State), Title: mrData.Title}
+	result := CheckResult{State: mapGitLabState(mrData.State), Title: mrData.Title, Description: mrData.Description}
 	if result.State == "merged" || result.State == "closed" {
 		return result, budget, nil
 	}
