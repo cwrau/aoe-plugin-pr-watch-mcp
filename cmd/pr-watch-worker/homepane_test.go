@@ -7,7 +7,7 @@ import (
 )
 
 func TestBuildHomePanePayloadEmpty(t *testing.T) {
-	payload := buildHomePanePayload(nil, func(string) string { return "" })
+	payload := buildHomePanePayload(nil, func(string) string { return "" }, "")
 
 	if len(payload.Blocks) != 1 {
 		t.Fatalf("Blocks len = %d, want 1", len(payload.Blocks))
@@ -44,7 +44,7 @@ func TestBuildHomePanePayloadGitHubRow(t *testing.T) {
 			return "Fix the thing"
 		}
 		return ""
-	})
+	}, "http://127.0.0.1:25808")
 
 	sec := payload.Blocks[0].(sectionBlock)
 	if len(sec.Children) != 1 {
@@ -82,8 +82,35 @@ func TestBuildHomePanePayloadGitHubRow(t *testing.T) {
 	if sessionRow.Label != "Fix the thing" {
 		t.Errorf("sessionRow.Label = %q, want %q", sessionRow.Label, "Fix the thing")
 	}
-	if sessionRow.Href != "/session/sess1" {
-		t.Errorf("sessionRow.Href = %q, want %q", sessionRow.Href, "/session/sess1")
+	if sessionRow.Href != "http://127.0.0.1:25808/session/sess1" {
+		t.Errorf("sessionRow.Href = %q, want %q", sessionRow.Href, "http://127.0.0.1:25808/session/sess1")
+	}
+}
+
+func TestBuildHomePanePayloadOmitsSessionHrefWhenBaseURLUnavailable(t *testing.T) {
+	regs := []registry.Registration{githubReg("none", "")}
+	payload := buildHomePanePayload(regs, func(string) string { return "" }, "")
+
+	sec := payload.Blocks[0].(sectionBlock)
+	cols := sec.Children[0].(columnsBlock)
+	sessionRow := cols.Children[1].(rowBlock)
+	if sessionRow.Href != "" {
+		t.Errorf("sessionRow.Href = %q, want empty when no dashboard base URL is available (renderer's safeHref rejects anything non-http(s) anyway, so the plugin degrading to plain text is more honest than shipping a broken href)", sessionRow.Href)
+	}
+	if sessionRow.Label == "" {
+		t.Error("sessionRow.Label is empty, want the session id fallback to still show even without a link")
+	}
+}
+
+func TestBuildHomePanePayloadTrimsTrailingSlashOnBaseURL(t *testing.T) {
+	regs := []registry.Registration{githubReg("none", "")}
+	payload := buildHomePanePayload(regs, func(string) string { return "" }, "http://127.0.0.1:25808/")
+
+	sec := payload.Blocks[0].(sectionBlock)
+	cols := sec.Children[0].(columnsBlock)
+	sessionRow := cols.Children[1].(rowBlock)
+	if sessionRow.Href != "http://127.0.0.1:25808/session/sess1" {
+		t.Errorf("sessionRow.Href = %q, want no double slash before /session", sessionRow.Href)
 	}
 }
 
@@ -94,7 +121,7 @@ func TestBuildHomePanePayloadGitLabRow(t *testing.T) {
 		Provider:  "gitlab",
 		CIBucket:  "success",
 	}}
-	payload := buildHomePanePayload(regs, func(string) string { return "" })
+	payload := buildHomePanePayload(regs, func(string) string { return "" }, "")
 
 	sec := payload.Blocks[0].(sectionBlock)
 	cols := sec.Children[0].(columnsBlock)
@@ -124,7 +151,7 @@ func TestBuildHomePanePayloadSortsFailuresFirst(t *testing.T) {
 	failure := githubReg("failure", "")
 	failure.PRURL = "https://github.com/o/r/pull/2"
 
-	payload := buildHomePanePayload([]registry.Registration{success, failure}, func(string) string { return "" })
+	payload := buildHomePanePayload([]registry.Registration{success, failure}, func(string) string { return "" }, "")
 
 	sec := payload.Blocks[0].(sectionBlock)
 	first := sec.Children[0].(columnsBlock).Children[0].(rowBlock)
@@ -138,7 +165,7 @@ func TestBuildHomePanePayloadSectionCountMatchesRegistrations(t *testing.T) {
 	regs[0].PRURL = "https://github.com/o/r/pull/1"
 	regs[1].PRURL = "https://github.com/o/r/pull/2"
 
-	payload := buildHomePanePayload(regs, func(string) string { return "" })
+	payload := buildHomePanePayload(regs, func(string) string { return "" }, "")
 	sec := payload.Blocks[0].(sectionBlock)
 	if sec.Value != "2" {
 		t.Errorf("section.Value = %q, want %q", sec.Value, "2")

@@ -159,7 +159,8 @@ func pushHomePane(ctx context.Context, store *registry.Store, aoe *aoeclient.Cli
 		logger.Warn("list registrations for home pane", "error", err)
 		return
 	}
-	if err := rpc.pushHomePane(buildHomePanePayload(regs, aoe.Title)); err != nil {
+	payload := buildHomePanePayload(regs, aoe.Title, resolveDashboardBaseURL())
+	if err := rpc.pushHomePane(payload); err != nil {
 		logger.Warn("push home pane", "error", err)
 	}
 }
