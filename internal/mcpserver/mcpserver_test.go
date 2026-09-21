@@ -93,8 +93,8 @@ func TestRegisterThenListThenUnregister(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if len(regs) != 0 {
-		t.Fatalf("after unregister, store.List() = %+v, want empty", regs)
+	if len(regs) != 1 || regs[0].Status != registry.StatusStopped {
+		t.Fatalf("after unregister, store.List() = %+v, want a single row at status %q (registrations are never deleted)", regs, registry.StatusStopped)
 	}
 }
 
@@ -184,7 +184,7 @@ func TestUnregisterRequiresMatchingSessionID(t *testing.T) {
 		t.Fatalf("after unregister with wrong session_id, store.List() = %+v, want 1 registration still present", regs)
 	}
 
-	// Correct session_id: must remove it.
+	// Correct session_id: must stop it.
 	callTool(t, srv, "unregister", map[string]any{
 		"pr_url":     "https://github.com/o/r/pull/1",
 		"session_id": "sess1",
@@ -194,8 +194,8 @@ func TestUnregisterRequiresMatchingSessionID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if len(regs) != 0 {
-		t.Fatalf("after unregister with correct session_id, store.List() = %+v, want empty", regs)
+	if len(regs) != 1 || regs[0].Status != registry.StatusStopped {
+		t.Fatalf("after unregister with correct session_id, store.List() = %+v, want a single row at status %q", regs, registry.StatusStopped)
 	}
 }
 
@@ -260,8 +260,8 @@ func TestRegisterRejectsCrossSessionReassignment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if len(regs) != 0 {
-		t.Fatalf("after the owner unregistered, store.List() = %+v, want empty", regs)
+	if len(regs) != 1 || regs[0].Status != registry.StatusStopped {
+		t.Fatalf("after the owner unregistered, store.List() = %+v, want a single row at status %q", regs, registry.StatusStopped)
 	}
 }
 

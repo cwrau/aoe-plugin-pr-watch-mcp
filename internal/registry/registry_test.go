@@ -47,6 +47,9 @@ func TestAddAndList(t *testing.T) {
 	if got[0].PRURL != reg.PRURL || got[0].SessionID != reg.SessionID || got[0].Provider != reg.Provider {
 		t.Errorf("List()[0] = %+v, want match of %+v", got[0], reg)
 	}
+	if got[0].Status != StatusWatching {
+		t.Errorf("List()[0].Status = %q, want %q (a fresh registration always starts actively watched)", got[0].Status, StatusWatching)
+	}
 }
 
 func TestAddIsIdempotentOnConflict(t *testing.T) {
@@ -75,23 +78,32 @@ func TestAddIsIdempotentOnConflict(t *testing.T) {
 	}
 }
 
-func TestRemove(t *testing.T) {
+func TestAddReactivatesStatusOnReregister(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
-	now := time.Now()
-	reg := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "abc", Provider: "github", NextDueAt: now, CreatedAt: now}
+	now := time.Now().Truncate(time.Second)
+
+	reg := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", NextDueAt: now, CreatedAt: now}
 	if err := s.Add(ctx, reg); err != nil {
 		t.Fatalf("Add() error = %v", err)
 	}
-	if err := s.Remove(ctx, reg.PRURL); err != nil {
-		t.Fatalf("Remove() error = %v", err)
+	if err := s.SetStatus(ctx, reg.PRURL, StatusMerged); err != nil {
+		t.Fatalf("SetStatus() error = %v", err)
 	}
+
+	// Re-registering (e.g. the same PR reopened, or just re-running register)
+	// must resume active watching regardless of whatever terminal status it
+	// was previously left in.
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() (re-register) error = %v", err)
+	}
+
 	got, err := s.List(ctx)
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if len(got) != 0 {
-		t.Errorf("List() len = %d, want 0 after Remove", len(got))
+	if len(got) != 1 || got[0].Status != StatusWatching {
+		t.Errorf("List() = %+v, want a single row back to status %q", got, StatusWatching)
 	}
 }
 
@@ -102,11 +114,18 @@ func TestDueBefore(t *testing.T) {
 
 	early := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "a", Provider: "github", NextDueAt: base.Add(-time.Hour), CreatedAt: base}
 	late := Registration{PRURL: "https://github.com/o/r/pull/2", SessionID: "b", Provider: "github", NextDueAt: base.Add(time.Hour), CreatedAt: base}
+	mergedButDue := Registration{PRURL: "https://github.com/o/r/pull/3", SessionID: "c", Provider: "github", NextDueAt: base.Add(-time.Hour), CreatedAt: base}
 	if err := s.Add(ctx, early); err != nil {
 		t.Fatalf("Add(early) error = %v", err)
 	}
 	if err := s.Add(ctx, late); err != nil {
 		t.Fatalf("Add(late) error = %v", err)
+	}
+	if err := s.Add(ctx, mergedButDue); err != nil {
+		t.Fatalf("Add(mergedButDue) error = %v", err)
+	}
+	if err := s.SetStatus(ctx, mergedButDue.PRURL, StatusMerged); err != nil {
+		t.Fatalf("SetStatus() error = %v", err)
 	}
 
 	due, err := s.DueBefore(ctx, base)
@@ -114,7 +133,7 @@ func TestDueBefore(t *testing.T) {
 		t.Fatalf("DueBefore() error = %v", err)
 	}
 	if len(due) != 1 || due[0].PRURL != early.PRURL {
-		t.Errorf("DueBefore(%v) = %+v, want only %q", base, due, early.PRURL)
+		t.Errorf("DueBefore(%v) = %+v, want only %q (a merged row must never be picked up again even if its old next_due_at has passed)", base, due, early.PRURL)
 	}
 }
 
@@ -142,6 +161,28 @@ func TestUpdateState(t *testing.T) {
 	r := got[0]
 	if r.ReviewCount != 3 || r.CIBucket != "failure" || r.Unresolved != 2 || r.LatestReviewState != "CHANGES_REQUESTED" || r.Title != "Fix the thing" || !r.NextDueAt.Equal(newDue) {
 		t.Errorf("after UpdateState, got %+v", r)
+	}
+}
+
+func TestSetStatus(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now()
+	reg := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "a", Provider: "github", NextDueAt: now, CreatedAt: now}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+
+	if err := s.SetStatus(ctx, reg.PRURL, StatusClosed); err != nil {
+		t.Fatalf("SetStatus() error = %v", err)
+	}
+
+	got, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(got) != 1 || got[0].Status != StatusClosed {
+		t.Errorf("List() = %+v, want status %q (the row must survive, not be deleted)", got, StatusClosed)
 	}
 }
 
@@ -266,6 +307,72 @@ CREATE TABLE IF NOT EXISTS registrations (
 	s2.Close()
 }
 
+func TestOpenMigratesSchemaMissingStatus(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "old.db")
+
+	// The realistic upgrade path: a database with latest_review_state and
+	// title (the two previous migrations) but predating status, from back
+	// when a registration's only lifecycle was "exists" or "deleted".
+	oldSchema := `
+CREATE TABLE IF NOT EXISTS registrations (
+	pr_url TEXT PRIMARY KEY,
+	session_id TEXT NOT NULL,
+	provider TEXT NOT NULL,
+	review_count INTEGER NOT NULL DEFAULT 0,
+	ci_bucket TEXT NOT NULL DEFAULT 'none',
+	unresolved INTEGER NOT NULL DEFAULT 0,
+	latest_review_state TEXT NOT NULL DEFAULT '',
+	title TEXT NOT NULL DEFAULT '',
+	next_due_at INTEGER NOT NULL,
+	archived INTEGER NOT NULL DEFAULT 0,
+	created_at INTEGER NOT NULL
+);
+`
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	if _, err := db.Exec(oldSchema); err != nil {
+		t.Fatalf("apply old schema: %v", err)
+	}
+	now := time.Now().Truncate(time.Second)
+	if _, err := db.Exec(`INSERT INTO registrations (pr_url, session_id, provider, next_due_at, created_at) VALUES (?, ?, ?, ?, ?)`,
+		"https://github.com/o/r/pull/1", "sess1", "github", now.Unix(), now.Unix()); err != nil {
+		t.Fatalf("insert pre-migration row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close pre-migration db: %v", err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() on pre-migration db, error = %v", err)
+	}
+	defer s.Close()
+
+	got, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("List() len = %d, want 1 (pre-existing row must survive migration)", len(got))
+	}
+	// Every row that existed before status was introduced was, by
+	// definition, still actively being watched (the old schema deleted
+	// terminal rows outright), so the column default must resolve it to
+	// StatusWatching, never an empty/unset value.
+	if got[0].Status != StatusWatching {
+		t.Errorf("Status = %q, want %q for a row migrated from before status existed", got[0].Status, StatusWatching)
+	}
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second Open() on already-migrated db, error = %v", err)
+	}
+	s2.Close()
+}
+
 func TestCountByProvider(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
@@ -274,11 +381,15 @@ func TestCountByProvider(t *testing.T) {
 		{PRURL: "https://github.com/o/r/pull/1", SessionID: "a", Provider: "github", NextDueAt: now, CreatedAt: now},
 		{PRURL: "https://github.com/o/r/pull/2", SessionID: "b", Provider: "github", NextDueAt: now, CreatedAt: now},
 		{PRURL: "https://gitlab.example.com/g/p/-/merge_requests/1", SessionID: "c", Provider: "gitlab", NextDueAt: now, CreatedAt: now},
+		{PRURL: "https://github.com/o/r/pull/3", SessionID: "d", Provider: "github", NextDueAt: now, CreatedAt: now},
 	}
 	for _, r := range regs {
 		if err := s.Add(ctx, r); err != nil {
 			t.Fatalf("Add() error = %v", err)
 		}
+	}
+	if err := s.SetStatus(ctx, "https://github.com/o/r/pull/3", StatusMerged); err != nil {
+		t.Fatalf("SetStatus() error = %v", err)
 	}
 
 	got, err := s.CountByProvider(ctx)
@@ -286,7 +397,7 @@ func TestCountByProvider(t *testing.T) {
 		t.Fatalf("CountByProvider() error = %v", err)
 	}
 	if got["github"] != 2 || got["gitlab"] != 1 {
-		t.Errorf("CountByProvider() = %v, want {github:2, gitlab:1}", got)
+		t.Errorf("CountByProvider() = %v, want {github:2, gitlab:1} (the merged row must not count toward the rate-limit budget spread)", got)
 	}
 }
 
@@ -310,7 +421,7 @@ func TestSetArchived(t *testing.T) {
 	}
 }
 
-func TestRemoveOwnedByMatchingSession(t *testing.T) {
+func TestSetStatusOwnedByMatchingSession(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
 	now := time.Now()
@@ -319,23 +430,23 @@ func TestRemoveOwnedByMatchingSession(t *testing.T) {
 		t.Fatalf("Add() error = %v", err)
 	}
 
-	removed, err := s.RemoveOwnedBy(ctx, reg.PRURL, "owner")
+	ok, err := s.SetStatusOwnedBy(ctx, reg.PRURL, "owner", StatusStopped)
 	if err != nil {
-		t.Fatalf("RemoveOwnedBy() error = %v", err)
+		t.Fatalf("SetStatusOwnedBy() error = %v", err)
 	}
-	if !removed {
-		t.Error("RemoveOwnedBy() = false, want true for the owning session")
+	if !ok {
+		t.Error("SetStatusOwnedBy() = false, want true for the owning session")
 	}
 	got, err := s.List(ctx)
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if len(got) != 0 {
-		t.Errorf("List() len = %d, want 0 after RemoveOwnedBy by the owner", len(got))
+	if len(got) != 1 || got[0].Status != StatusStopped {
+		t.Errorf("List() = %+v, want status %q (the row must survive, not be deleted)", got, StatusStopped)
 	}
 }
 
-func TestRemoveOwnedByWrongSessionLeavesItAlone(t *testing.T) {
+func TestSetStatusOwnedByWrongSessionLeavesItAlone(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
 	now := time.Now()
@@ -344,31 +455,31 @@ func TestRemoveOwnedByWrongSessionLeavesItAlone(t *testing.T) {
 		t.Fatalf("Add() error = %v", err)
 	}
 
-	removed, err := s.RemoveOwnedBy(ctx, reg.PRURL, "someone-else")
+	ok, err := s.SetStatusOwnedBy(ctx, reg.PRURL, "someone-else", StatusStopped)
 	if err != nil {
-		t.Fatalf("RemoveOwnedBy() error = %v", err)
+		t.Fatalf("SetStatusOwnedBy() error = %v", err)
 	}
-	if removed {
-		t.Error("RemoveOwnedBy() = true, want false for a non-owning session")
+	if ok {
+		t.Error("SetStatusOwnedBy() = true, want false for a non-owning session")
 	}
 	got, err := s.List(ctx)
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if len(got) != 1 || got[0].SessionID != "owner" {
-		t.Errorf("List() = %+v, want the owner's registration untouched", got)
+	if len(got) != 1 || got[0].Status != StatusWatching {
+		t.Errorf("List() = %+v, want the owner's registration untouched at %q", got, StatusWatching)
 	}
 }
 
-func TestRemoveOwnedByUnknownURL(t *testing.T) {
+func TestSetStatusOwnedByUnknownURL(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
 
-	removed, err := s.RemoveOwnedBy(ctx, "https://github.com/o/r/pull/404", "anyone")
+	ok, err := s.SetStatusOwnedBy(ctx, "https://github.com/o/r/pull/404", "anyone", StatusStopped)
 	if err != nil {
-		t.Fatalf("RemoveOwnedBy() error = %v", err)
+		t.Fatalf("SetStatusOwnedBy() error = %v", err)
 	}
-	if removed {
-		t.Error("RemoveOwnedBy() on an unregistered URL = true, want false")
+	if ok {
+		t.Error("SetStatusOwnedBy() on an unregistered URL = true, want false")
 	}
 }

@@ -59,22 +59,29 @@ type noteBlock struct {
 }
 
 // buildHomePanePayload renders the currently-watched registrations as a
-// home-pane payload: one section listing every registration, each as a
-// PR/MR link paired with its owning session's link. Visual only (provider,
-// CI bucket, and review-state badges) — there's no search/filter block kind
-// in the pane vocabulary to make this interactively filterable, so rows are
-// just sorted failures-first to keep the most actionable ones on top.
-// titleOf resolves a session id to its display title (aoeclient.Client's
-// Title method); an empty result falls back to the raw session id.
-// dashboardBaseURL, from resolveDashboardBaseURL, is required to make the
-// session row a real link at all: the pane renderer only ever turns an
-// absolute http(s) href into a clickable link (a hardcoded XSS allowlist
-// with no exception for relative paths), so an empty dashboardBaseURL
-// degrades the session row to plain, unlinked text rather than shipping a
-// href the renderer would silently drop anyway.
+// home-pane payload: one section listing every actively-watched
+// registration, each as a PR/MR link paired with its owning session's link.
+// Registrations that reached a terminal status (merged/closed/stopped) are
+// excluded — the dashboard is meant to show what's actively being watched
+// right now, not a permanent history (that's what the row-badge is for).
+// Visual only (provider, CI bucket, and review-state badges) — there's no
+// search/filter block kind in the pane vocabulary to make this interactively
+// filterable, so rows are just sorted failures-first to keep the most
+// actionable ones on top. titleOf resolves a session id to its display
+// title (aoeclient.Client's Title method); an empty result falls back to
+// the raw session id. dashboardBaseURL, from resolveDashboardBaseURL, is
+// required to make the session row a real link at all: the pane renderer
+// only ever turns an absolute http(s) href into a clickable link (a
+// hardcoded XSS allowlist with no exception for relative paths), so an
+// empty dashboardBaseURL degrades the session row to plain, unlinked text
+// rather than shipping a href the renderer would silently drop anyway.
 func buildHomePanePayload(regs []registry.Registration, titleOf func(sessionID string) string, dashboardBaseURL string) panePayload {
-	sorted := make([]registry.Registration, len(regs))
-	copy(sorted, regs)
+	var sorted []registry.Registration
+	for _, r := range regs {
+		if r.Status == registry.StatusWatching {
+			sorted = append(sorted, r)
+		}
+	}
 	sort.SliceStable(sorted, func(i, j int) bool {
 		return ciSeverity(sorted[i].CIBucket) < ciSeverity(sorted[j].CIBucket)
 	})

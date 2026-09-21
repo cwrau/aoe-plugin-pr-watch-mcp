@@ -109,7 +109,7 @@ func TestTickSkipsNotDueRegistrations(t *testing.T) {
 	}
 }
 
-func TestTickDeregistersOnMerged(t *testing.T) {
+func TestTickMarksMergedInsteadOfDeregistering(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	now := time.Now()
@@ -132,8 +132,11 @@ func TestTickDeregistersOnMerged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if len(remaining) != 0 {
-		t.Errorf("List() len = %d, want 0 after MERGED", len(remaining))
+	if len(remaining) != 1 {
+		t.Fatalf("List() len = %d, want 1 (registrations are never deleted, just marked terminal)", len(remaining))
+	}
+	if remaining[0].Status != registry.StatusMerged {
+		t.Errorf("Status = %q, want %q after MERGED", remaining[0].Status, registry.StatusMerged)
 	}
 	if len(notify.sent) != 1 || notify.sent[0] != "sess1: MERGED" {
 		t.Errorf("notify.sent = %v, want a single MERGED message", notify.sent)
@@ -170,7 +173,7 @@ func TestTickSkipsSendForArchivedSession(t *testing.T) {
 	}
 }
 
-func TestTickDropsRegistrationForGoneSession(t *testing.T) {
+func TestTickStopsRegistrationForGoneSession(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	now := time.Now()
@@ -194,8 +197,11 @@ func TestTickDropsRegistrationForGoneSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if len(remaining) != 0 {
-		t.Errorf("List() len = %d, want 0 (gone session's registration must be dropped)", len(remaining))
+	if len(remaining) != 1 {
+		t.Fatalf("List() len = %d, want 1 (registrations are never deleted, just marked terminal)", len(remaining))
+	}
+	if remaining[0].Status != registry.StatusStopped {
+		t.Errorf("Status = %q, want %q for a gone session's registration", remaining[0].Status, registry.StatusStopped)
 	}
 }
 
