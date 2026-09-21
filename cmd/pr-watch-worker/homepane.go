@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/cwrau/aoe-pr-watch-mcp/internal/provider"
 	"github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
@@ -57,7 +58,13 @@ type noteBlock struct {
 // just sorted failures-first to keep the most actionable ones on top.
 // titleOf resolves a session id to its display title (aoeclient.Client's
 // Title method); an empty result falls back to the raw session id.
-func buildHomePanePayload(regs []registry.Registration, titleOf func(sessionID string) string) panePayload {
+// dashboardBaseURL, from resolveDashboardBaseURL, is required to make the
+// session row a real link at all: the pane renderer only ever turns an
+// absolute http(s) href into a clickable link (a hardcoded XSS allowlist
+// with no exception for relative paths), so an empty dashboardBaseURL
+// degrades the session row to plain, unlinked text rather than shipping a
+// href the renderer would silently drop anyway.
+func buildHomePanePayload(regs []registry.Registration, titleOf func(sessionID string) string, dashboardBaseURL string) panePayload {
 	sorted := make([]registry.Registration, len(regs))
 	copy(sorted, regs)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -69,7 +76,7 @@ func buildHomePanePayload(regs []registry.Registration, titleOf func(sessionID s
 		children = []any{noteBlock{Kind: "note", Text: "No PRs/MRs currently being watched."}}
 	} else {
 		for _, reg := range sorted {
-			children = append(children, registrationColumns(reg, titleOf))
+			children = append(children, registrationColumns(reg, titleOf, dashboardBaseURL))
 		}
 	}
 
@@ -86,10 +93,15 @@ func buildHomePanePayload(regs []registry.Registration, titleOf func(sessionID s
 	}
 }
 
-func registrationColumns(reg registry.Registration, titleOf func(string) string) columnsBlock {
+func registrationColumns(reg registry.Registration, titleOf func(string) string, dashboardBaseURL string) columnsBlock {
 	sessionLabel := titleOf(reg.SessionID)
 	if sessionLabel == "" {
 		sessionLabel = reg.SessionID
+	}
+
+	var sessionHref string
+	if dashboardBaseURL != "" {
+		sessionHref = strings.TrimRight(dashboardBaseURL, "/") + "/session/" + reg.SessionID
 	}
 
 	return columnsBlock{
@@ -108,7 +120,7 @@ func registrationColumns(reg registry.Registration, titleOf func(string) string)
 			rowBlock{
 				Kind:  "row",
 				Label: sessionLabel,
-				Href:  "/session/" + reg.SessionID,
+				Href:  sessionHref,
 			},
 		},
 	}
