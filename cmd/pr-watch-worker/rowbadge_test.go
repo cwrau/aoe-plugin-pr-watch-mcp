@@ -19,11 +19,11 @@ func TestBuildRowBadgePayloadsGroupsBySession(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("buildRowBadgePayloads() len = %d, want 2 sessions", len(got))
 	}
-	if len(got["sess1"].Items) != 2 {
-		t.Errorf("sess1 items = %d, want 2 (two registrations)", len(got["sess1"].Items))
+	if len(got["sess1"].Items) != 6 {
+		t.Errorf("sess1 items = %d, want 6 (two registrations, three chips each: eye/CI/review)", len(got["sess1"].Items))
 	}
-	if len(got["sess2"].Items) != 1 {
-		t.Errorf("sess2 items = %d, want 1", len(got["sess2"].Items))
+	if len(got["sess2"].Items) != 3 {
+		t.Errorf("sess2 items = %d, want 3 (one registration, three chips)", len(got["sess2"].Items))
 	}
 }
 
@@ -33,22 +33,34 @@ func TestBuildRowBadgePayloadsChipFields(t *testing.T) {
 	}
 
 	got := buildRowBadgePayloads(regs)
-	chip := got["sess1"].Items[0]
+	items := got["sess1"].Items
+	if len(items) != 3 {
+		t.Fatalf("items len = %d, want 3 (eye, CI, review)", len(items))
+	}
+	eye, ci, review := items[0], items[1], items[2]
 
-	if chip.Icon != "eye" {
-		t.Errorf("chip.Icon = %q, want %q", chip.Icon, "eye")
+	if eye.Icon != "eye" || eye.Tone != "neutral" {
+		t.Errorf("eye chip = {Icon:%q Tone:%q}, want {eye neutral} (a pure identity marker now that CI/review are their own chips)", eye.Icon, eye.Tone)
 	}
-	if chip.Tone != "danger" {
-		t.Errorf("chip.Tone = %q, want %q (failure CI should drive the chip tone)", chip.Tone, "danger")
+	if eye.Href != regs[0].PRURL {
+		t.Errorf("eye.Href = %q, want %q", eye.Href, regs[0].PRURL)
 	}
-	if chip.Href != regs[0].PRURL {
-		t.Errorf("chip.Href = %q, want %q", chip.Href, regs[0].PRURL)
+	if !strings.Contains(eye.Tooltip, "Fix the widget rendering bug") || !strings.Contains(eye.Tooltip, "cwrau/aoe-pr-watch-mcp#42") {
+		t.Errorf("eye.Tooltip = %q, want it to include both the title and the short ref", eye.Tooltip)
 	}
-	if !strings.Contains(chip.Tooltip, "Fix the widget rendering bug") {
-		t.Errorf("chip.Tooltip = %q, want it to include the PR title", chip.Tooltip)
+
+	if ci.Text != "failure" || ci.Tone != "danger" {
+		t.Errorf("ci chip = {Text:%q Tone:%q}, want {failure danger}", ci.Text, ci.Tone)
 	}
-	if !strings.Contains(chip.Tooltip, "cwrau/aoe-pr-watch-mcp#42") {
-		t.Errorf("chip.Tooltip = %q, want it to still include the short ref too", chip.Tooltip)
+	if !strings.Contains(ci.Tooltip, "CI failure") {
+		t.Errorf("ci.Tooltip = %q, want it to mention CI failure", ci.Tooltip)
+	}
+
+	if review.Text != "CHANGES_REQUESTED" || review.Tone != "danger" {
+		t.Errorf("review chip = {Text:%q Tone:%q}, want {CHANGES_REQUESTED danger}", review.Text, review.Tone)
+	}
+	if !strings.Contains(review.Tooltip, "review CHANGES_REQUESTED") {
+		t.Errorf("review.Tooltip = %q, want it to mention the review state", review.Tooltip)
 	}
 }
 
@@ -58,10 +70,10 @@ func TestBuildRowBadgePayloadsChipTooltipFallsBackWithoutTitle(t *testing.T) {
 	}
 
 	got := buildRowBadgePayloads(regs)
-	chip := got["sess1"].Items[0]
+	eye := got["sess1"].Items[0]
 
-	if !strings.Contains(chip.Tooltip, "cwrau/aoe-pr-watch-mcp#42") {
-		t.Errorf("chip.Tooltip = %q, want the short ref when no title has been fetched yet", chip.Tooltip)
+	if !strings.Contains(eye.Tooltip, "cwrau/aoe-pr-watch-mcp#42") {
+		t.Errorf("eye.Tooltip = %q, want the short ref when no title has been fetched yet", eye.Tooltip)
 	}
 }
 
@@ -111,8 +123,8 @@ func TestBuildRowBadgePayloadsExcludesStoppedRegistrations(t *testing.T) {
 	}
 
 	got := buildRowBadgePayloads(regs)
-	if len(got["sess1"].Items) != 1 {
-		t.Fatalf("sess1 items = %d, want 1 (the stopped registration must not contribute a chip)", len(got["sess1"].Items))
+	if len(got["sess1"].Items) != 3 {
+		t.Fatalf("sess1 items = %d, want 3 (the stopped registration must not contribute chips, only the watching one's eye/CI/review)", len(got["sess1"].Items))
 	}
 	if got["sess1"].Items[0].Href != "https://github.com/o/r/pull/2" {
 		t.Errorf("sess1 chip href = %q, want the still-watching registration's URL", got["sess1"].Items[0].Href)
