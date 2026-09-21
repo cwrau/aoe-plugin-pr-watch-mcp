@@ -2,9 +2,12 @@ package registry
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 func openTestStore(t *testing.T) *Store {
@@ -125,7 +128,7 @@ func TestUpdateState(t *testing.T) {
 	}
 
 	newDue := now.Add(5 * time.Minute)
-	if err := s.UpdateState(ctx, reg.PRURL, 3, "failure", 2, newDue); err != nil {
+	if err := s.UpdateState(ctx, reg.PRURL, 3, "failure", 2, "CHANGES_REQUESTED", newDue); err != nil {
 		t.Fatalf("UpdateState() error = %v", err)
 	}
 
@@ -137,9 +140,70 @@ func TestUpdateState(t *testing.T) {
 		t.Fatalf("List() len = %d, want 1", len(got))
 	}
 	r := got[0]
-	if r.ReviewCount != 3 || r.CIBucket != "failure" || r.Unresolved != 2 || !r.NextDueAt.Equal(newDue) {
+	if r.ReviewCount != 3 || r.CIBucket != "failure" || r.Unresolved != 2 || r.LatestReviewState != "CHANGES_REQUESTED" || !r.NextDueAt.Equal(newDue) {
 		t.Errorf("after UpdateState, got %+v", r)
 	}
+}
+
+func TestOpenMigratesOldSchemaMissingLatestReviewState(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "old.db")
+
+	// Simulate a database created before latest_review_state existed:
+	// open with the pre-migration schema directly, bypassing Open's own
+	// (already-migrated) CREATE TABLE.
+	oldSchema := `
+CREATE TABLE IF NOT EXISTS registrations (
+	pr_url TEXT PRIMARY KEY,
+	session_id TEXT NOT NULL,
+	provider TEXT NOT NULL,
+	review_count INTEGER NOT NULL DEFAULT 0,
+	ci_bucket TEXT NOT NULL DEFAULT 'none',
+	unresolved INTEGER NOT NULL DEFAULT 0,
+	next_due_at INTEGER NOT NULL,
+	archived INTEGER NOT NULL DEFAULT 0,
+	created_at INTEGER NOT NULL
+);
+`
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	if _, err := db.Exec(oldSchema); err != nil {
+		t.Fatalf("apply old schema: %v", err)
+	}
+	now := time.Now().Truncate(time.Second)
+	if _, err := db.Exec(`INSERT INTO registrations (pr_url, session_id, provider, next_due_at, created_at) VALUES (?, ?, ?, ?, ?)`,
+		"https://github.com/o/r/pull/1", "sess1", "github", now.Unix(), now.Unix()); err != nil {
+		t.Fatalf("insert pre-migration row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close pre-migration db: %v", err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() on pre-migration db, error = %v", err)
+	}
+	defer s.Close()
+
+	got, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("List() len = %d, want 1 (pre-existing row must survive migration)", len(got))
+	}
+	if got[0].LatestReviewState != "" {
+		t.Errorf("LatestReviewState = %q, want empty default for a migrated pre-existing row", got[0].LatestReviewState)
+	}
+
+	// Opening a second time (column already present) must not error.
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second Open() on already-migrated db, error = %v", err)
+	}
+	s2.Close()
 }
 
 func TestCountByProvider(t *testing.T) {

@@ -32,6 +32,7 @@ type Client struct {
 	AoeBinary string // defaults to "aoe" resolved on PATH; overridable for tests
 
 	classes map[string]SessionClass
+	titles  map[string]string
 }
 
 // New returns a ready-to-use Client. Call RefreshSessionSets before the
@@ -50,6 +51,7 @@ func (c *Client) binary() string {
 type sessionRow struct {
 	ID    string `json:"id"`
 	State string `json:"state"`
+	Title string `json:"title"`
 }
 
 // RefreshSessionSets runs `aoe list --json --all` once (one call per
@@ -81,6 +83,7 @@ func (c *Client) RefreshSessionSets(ctx context.Context) error {
 	}
 
 	classes := make(map[string]SessionClass, len(rows))
+	titles := make(map[string]string, len(rows))
 	for _, r := range rows {
 		switch r.State {
 		case "live":
@@ -88,9 +91,19 @@ func (c *Client) RefreshSessionSets(ctx context.Context) error {
 		case "archived":
 			classes[r.ID] = SessionArchived
 		}
+		if r.Title != "" {
+			titles[r.ID] = r.Title
+		}
 	}
 	c.classes = classes
+	c.titles = titles
 	return nil
+}
+
+// Title returns a session's title as of the last RefreshSessionSets call,
+// or "" if the id is unknown or has no title.
+func (c *Client) Title(id string) string {
+	return c.titles[id]
 }
 
 // Classify reports a session's lifecycle state as of the last

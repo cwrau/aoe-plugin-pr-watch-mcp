@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -12,15 +13,16 @@ import (
 // Registration is one watched PR/MR: which session to wake, where its
 // last-seen state sits, and when the scheduler should check it next.
 type Registration struct {
-	PRURL       string
-	SessionID   string
-	Provider    string // "github" | "gitlab"
-	ReviewCount int
-	CIBucket    string
-	Unresolved  int
-	NextDueAt   time.Time
-	Archived    bool
-	CreatedAt   time.Time
+	PRURL             string
+	SessionID         string
+	Provider          string // "github" | "gitlab"
+	ReviewCount       int
+	CIBucket          string
+	Unresolved        int
+	LatestReviewState string // e.g. "APPROVED", "CHANGES_REQUESTED", "COMMENTED"; empty if no review yet
+	NextDueAt         time.Time
+	Archived          bool
+	CreatedAt         time.Time
 }
 
 type Store struct {
@@ -35,6 +37,7 @@ CREATE TABLE IF NOT EXISTS registrations (
 	review_count INTEGER NOT NULL DEFAULT 0,
 	ci_bucket TEXT NOT NULL DEFAULT 'none',
 	unresolved INTEGER NOT NULL DEFAULT 0,
+	latest_review_state TEXT NOT NULL DEFAULT '',
 	next_due_at INTEGER NOT NULL,
 	archived INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL
@@ -55,7 +58,26 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if err := migrateLatestReviewState(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// migrateLatestReviewState adds the latest_review_state column to a
+// database created before it existed. CREATE TABLE IF NOT EXISTS only
+// applies the current schema to a brand-new file; an already-existing
+// table from an older version of this program needs an explicit ALTER.
+// SQLite has no ADD COLUMN IF NOT EXISTS, so the idiomatic pattern is to
+// attempt it and ignore the "duplicate column name" error a table that
+// already has it returns.
+func migrateLatestReviewState(db *sql.DB) error {
+	_, err := db.Exec(`ALTER TABLE registrations ADD COLUMN latest_review_state TEXT NOT NULL DEFAULT ''`)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -67,10 +89,10 @@ func (s *Store) Close() error { return s.db.Close() }
 // register tool, which rejects a cross-session reassignment outright.
 func (s *Store) Add(ctx context.Context, r Registration) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, unresolved, next_due_at, archived, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, unresolved, latest_review_state, next_due_at, archived, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(pr_url) DO UPDATE SET session_id = excluded.session_id, next_due_at = excluded.next_due_at
-	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.Unresolved, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix())
+	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.Unresolved, r.LatestReviewState, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix())
 	if err != nil {
 		return fmt.Errorf("add registration: %w", err)
 	}
@@ -91,12 +113,12 @@ func (s *Store) Remove(ctx context.Context, prURL string) error {
 // callers that need to distinguish "not registered" from a real query
 // failure (e.g. unregister's ownership check).
 func (s *Store) Get(ctx context.Context, prURL string) (Registration, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, next_due_at, archived, created_at FROM registrations WHERE pr_url = ?`, prURL)
+	row := s.db.QueryRowContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, latest_review_state, next_due_at, archived, created_at FROM registrations WHERE pr_url = ?`, prURL)
 
 	var r Registration
 	var nextDue, created int64
 	var archived int
-	if err := row.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.Unresolved, &nextDue, &archived, &created); err != nil {
+	if err := row.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.Unresolved, &r.LatestReviewState, &nextDue, &archived, &created); err != nil {
 		if err == sql.ErrNoRows {
 			return Registration{}, false, nil
 		}
@@ -127,7 +149,7 @@ func (s *Store) RemoveOwnedBy(ctx context.Context, prURL, sessionID string) (boo
 }
 
 func (s *Store) List(ctx context.Context) ([]Registration, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, next_due_at, archived, created_at FROM registrations ORDER BY next_due_at ASC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, latest_review_state, next_due_at, archived, created_at FROM registrations ORDER BY next_due_at ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query registrations: %w", err)
 	}
@@ -142,7 +164,7 @@ func (s *Store) List(ctx context.Context) ([]Registration, error) {
 // DueBefore returns every registration whose next_due_at has passed,
 // earliest first, so the scheduler processes the most-overdue check first.
 func (s *Store) DueBefore(ctx context.Context, t time.Time) ([]Registration, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, next_due_at, archived, created_at FROM registrations WHERE next_due_at <= ? ORDER BY next_due_at ASC`, t.Unix())
+	rows, err := s.db.QueryContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, latest_review_state, next_due_at, archived, created_at FROM registrations WHERE next_due_at <= ? ORDER BY next_due_at ASC`, t.Unix())
 	if err != nil {
 		return nil, fmt.Errorf("query due registrations: %w", err)
 	}
@@ -154,8 +176,8 @@ func (s *Store) DueBefore(ctx context.Context, t time.Time) ([]Registration, err
 	return regs, nil
 }
 
-func (s *Store) UpdateState(ctx context.Context, prURL string, reviewCount int, ciBucket string, unresolved int, nextDueAt time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE registrations SET review_count = ?, ci_bucket = ?, unresolved = ?, next_due_at = ? WHERE pr_url = ?`, reviewCount, ciBucket, unresolved, nextDueAt.Unix(), prURL)
+func (s *Store) UpdateState(ctx context.Context, prURL string, reviewCount int, ciBucket string, unresolved int, latestReviewState string, nextDueAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE registrations SET review_count = ?, ci_bucket = ?, unresolved = ?, latest_review_state = ?, next_due_at = ? WHERE pr_url = ?`, reviewCount, ciBucket, unresolved, latestReviewState, nextDueAt.Unix(), prURL)
 	if err != nil {
 		return fmt.Errorf("update state: %w", err)
 	}
@@ -198,7 +220,7 @@ func scanAll(rows *sql.Rows) ([]Registration, error) {
 		var r Registration
 		var nextDue, created int64
 		var archived int
-		if err := rows.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.Unresolved, &nextDue, &archived, &created); err != nil {
+		if err := rows.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.Unresolved, &r.LatestReviewState, &nextDue, &archived, &created); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
 		r.NextDueAt = time.Unix(nextDue, 0)

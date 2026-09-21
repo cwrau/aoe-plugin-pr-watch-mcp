@@ -102,7 +102,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go runSchedulerLoop(ctx, sched, logger)
+	rpc := newHostRPC(os.Stdout)
+
+	go runSchedulerLoop(ctx, sched, store, aoe, rpc, logger)
 	go runHTTPServer(ctx, store, logger)
 
 	// The ndjson stdio channel is how the AoE daemon supervises this
@@ -117,7 +119,14 @@ func main() {
 	logger.Info("stdin closed, shutting down")
 }
 
-func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, logger *slog.Logger) {
+func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, store *registry.Store, aoe *aoeclient.Client, rpc *hostRPC, logger *slog.Logger) {
+	// Push once at startup so the home-pane isn't blank until the first
+	// tick completes (up to tickInterval later). Session titles may still
+	// be unresolved at this point (RefreshSessionSets hasn't run yet), so
+	// rows briefly fall back to raw session ids until the first tick fills
+	// them in.
+	pushHomePane(ctx, store, aoe, rpc, logger)
+
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 	for {
@@ -134,7 +143,24 @@ func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, logger *s
 			if err != nil {
 				logger.Error("scheduler tick", "error", err)
 			}
+			pushHomePane(ctx, store, aoe, rpc, logger)
 		}
+	}
+}
+
+// pushHomePane renders the current registrations as a home-pane payload
+// and pushes it via ui.state.set. Best-effort: a failure here (a listing
+// error, a write error on the stdio channel) is logged and left for the
+// next tick's push rather than treated as fatal — the pane is a dashboard
+// convenience, not load-bearing for polling or notifications.
+func pushHomePane(ctx context.Context, store *registry.Store, aoe *aoeclient.Client, rpc *hostRPC, logger *slog.Logger) {
+	regs, err := store.List(ctx)
+	if err != nil {
+		logger.Warn("list registrations for home pane", "error", err)
+		return
+	}
+	if err := rpc.pushHomePane(buildHomePanePayload(regs, aoe.Title)); err != nil {
+		logger.Warn("push home pane", "error", err)
 	}
 }
 
