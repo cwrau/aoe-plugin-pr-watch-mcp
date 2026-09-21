@@ -15,6 +15,10 @@ description = "Persistent GitHub PR / GitLab MR watcher: register once, get woke
 #                   an outbound/listening socket from the worker's own code,
 #                   not delegated to a spawned subprocess).
 # runtime.worker  - required for any Tier 1 worker.
+# browser_open    - required for the "open watched PR" command's
+#                   open-ui-link action below. Client-executed (opens the
+#                   row-badge's own href straight from the browser), no
+#                   worker round-trip.
 #
 # No process.spawn declared: the worker shells to `aoe`/`gh`/`glab` as an
 # ordinary child process (the NoSandbox worker model already permits this,
@@ -24,7 +28,22 @@ description = "Persistent GitHub PR / GitLab MR watcher: register once, get woke
 # host's sense — it serves every session equally over its own MCP-over-HTTP
 # listener, and resolves session identity from the caller's own
 # $AOE_ARTIFACT_DIR, not via a host RPC.
-capabilities = ["net", "runtime.worker"]
+capabilities = ["net", "runtime.worker", "browser_open"]
+
+# Desktop-friendly alternative to the small row-badge chip: opens the
+# active session's watched PR/MR straight from the command palette (or a
+# keybind), reusing the row-badge entry's own hrefs — no worker round-trip.
+# With more than one watched PR/MR for the session it shows a picker
+# instead of guessing which one you meant.
+[[commands]]
+id = "open_pr"
+title = "PR Watch: Open watched PR"
+description = "Open the PR/MR this session is watching."
+
+[commands.action]
+kind = "open-ui-link"
+slot = "row-badge"
+id = "watched_badge"
 
 # Host-wide dashboard panel listing every currently-watched PR/MR and its
 # owning session, pushed via ui.state.set (requires api_version >= 13).
