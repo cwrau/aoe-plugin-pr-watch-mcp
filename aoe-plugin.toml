@@ -45,6 +45,10 @@ kind = "open-ui-link"
 slot = "row-badge"
 id = "watched_badge"
 
+[[keybinds]]
+command = "open_pr"
+key = "Ctrl+Shift+O"
+
 # Host-wide dashboard panel listing every currently-watched PR/MR and its
 # owning session, pushed via ui.state.set (requires api_version >= 13).
 [[ui]]
