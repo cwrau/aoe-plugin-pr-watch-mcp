@@ -190,7 +190,7 @@ func (c *GitLabChecker) getJSON(ctx context.Context, token, url string, out any)
 	if err != nil {
 		return nil, RateBudget{}, fmt.Errorf("gitlab request to %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	budget := parseGitLabRateHeaders(resp)
 

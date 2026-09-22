@@ -51,7 +51,7 @@ func openTestStore(t *testing.T) *registry.Store {
 	if err != nil {
 		t.Fatalf("registry.Open() error = %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 

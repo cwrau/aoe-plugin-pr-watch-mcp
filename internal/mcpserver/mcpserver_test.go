@@ -16,7 +16,7 @@ func openTestStore(t *testing.T) *registry.Store {
 	if err != nil {
 		t.Fatalf("registry.Open() error = %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
@@ -32,7 +32,7 @@ func callTool(t *testing.T, srv *httptest.Server, name string, args map[string]a
 	if err != nil {
 		t.Fatalf("client.Connect() error = %v", err)
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
 	if err != nil {
@@ -57,7 +57,7 @@ func callToolExpectError(t *testing.T, srv *httptest.Server, name string, args m
 	if err != nil {
 		t.Fatalf("client.Connect() error = %v", err)
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
 	if err != nil {

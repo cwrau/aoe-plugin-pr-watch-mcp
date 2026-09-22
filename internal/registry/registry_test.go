@@ -17,7 +17,7 @@ func openTestStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
@@ -226,7 +226,7 @@ CREATE TABLE IF NOT EXISTS registrations (
 	if err != nil {
 		t.Fatalf("Open() on pre-migration db, error = %v", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	got, err := s.List(ctx)
 	if err != nil {
@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS registrations (
 	if err != nil {
 		t.Fatalf("second Open() on already-migrated db, error = %v", err)
 	}
-	s2.Close()
+	_ = s2.Close()
 }
 
 func TestOpenMigratesSchemaMissingTitle(t *testing.T) {
@@ -287,7 +287,7 @@ CREATE TABLE IF NOT EXISTS registrations (
 	if err != nil {
 		t.Fatalf("Open() on pre-migration db, error = %v", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	got, err := s.List(ctx)
 	if err != nil {
@@ -304,7 +304,7 @@ CREATE TABLE IF NOT EXISTS registrations (
 	if err != nil {
 		t.Fatalf("second Open() on already-migrated db, error = %v", err)
 	}
-	s2.Close()
+	_ = s2.Close()
 }
 
 func TestOpenMigratesSchemaMissingStatus(t *testing.T) {
@@ -349,7 +349,7 @@ CREATE TABLE IF NOT EXISTS registrations (
 	if err != nil {
 		t.Fatalf("Open() on pre-migration db, error = %v", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	got, err := s.List(ctx)
 	if err != nil {
@@ -370,7 +370,7 @@ CREATE TABLE IF NOT EXISTS registrations (
 	if err != nil {
 		t.Fatalf("second Open() on already-migrated db, error = %v", err)
 	}
-	s2.Close()
+	_ = s2.Close()
 }
 
 func TestOpenMigratesSchemaMissingDescription(t *testing.T) {
@@ -415,7 +415,7 @@ CREATE TABLE IF NOT EXISTS registrations (
 	if err != nil {
 		t.Fatalf("Open() on pre-migration db, error = %v", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	got, err := s.List(ctx)
 	if err != nil {
@@ -432,7 +432,7 @@ CREATE TABLE IF NOT EXISTS registrations (
 	if err != nil {
 		t.Fatalf("second Open() on already-migrated db, error = %v", err)
 	}
-	s2.Close()
+	_ = s2.Close()
 }
 
 func TestCountByProvider(t *testing.T) {
