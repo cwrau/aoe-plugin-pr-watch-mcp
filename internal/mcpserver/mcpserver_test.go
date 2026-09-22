@@ -285,3 +285,59 @@ func TestRegisterIsIdempotentForSameSession(t *testing.T) {
 		t.Fatalf("store.List() = %+v, want exactly one sess1 registration", regs)
 	}
 }
+
+// TestRegisterStopsSessionsOldMergedRegistration: a session that moves on to
+// watching a new PR shouldn't keep an old merged one's badge cluttering its
+// row/pane forever.
+func TestRegisterStopsSessionsOldMergedRegistration(t *testing.T) {
+	store := openTestStore(t)
+	srv := httptest.NewServer(NewHandler(store))
+	defer srv.Close()
+	ctx := context.Background()
+
+	callTool(t, srv, "register", map[string]any{"pr_url": "https://github.com/o/r/pull/1", "session_id": "sess1"})
+	if err := store.SetStatus(ctx, "https://github.com/o/r/pull/1", registry.StatusMerged); err != nil {
+		t.Fatalf("SetStatus() error = %v", err)
+	}
+
+	callTool(t, srv, "register", map[string]any{"pr_url": "https://github.com/o/r/pull/2", "session_id": "sess1"})
+
+	regs, err := store.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	byURL := map[string]registry.Registration{}
+	for _, r := range regs {
+		byURL[r.PRURL] = r
+	}
+	if got := byURL["https://github.com/o/r/pull/1"].Status; got != registry.StatusStopped {
+		t.Errorf("old merged PR status = %q, want %q", got, registry.StatusStopped)
+	}
+	if got := byURL["https://github.com/o/r/pull/2"].Status; got != registry.StatusWatching {
+		t.Errorf("new PR status = %q, want %q", got, registry.StatusWatching)
+	}
+}
+
+// TestRegisterDoesNotStopAnotherSessionsMergedRegistration guards the same
+// cleanup against reaching outside the registering session's own rows.
+func TestRegisterDoesNotStopAnotherSessionsMergedRegistration(t *testing.T) {
+	store := openTestStore(t)
+	srv := httptest.NewServer(NewHandler(store))
+	defer srv.Close()
+	ctx := context.Background()
+
+	callTool(t, srv, "register", map[string]any{"pr_url": "https://github.com/o/r/pull/1", "session_id": "sess1"})
+	if err := store.SetStatus(ctx, "https://github.com/o/r/pull/1", registry.StatusMerged); err != nil {
+		t.Fatalf("SetStatus() error = %v", err)
+	}
+
+	callTool(t, srv, "register", map[string]any{"pr_url": "https://github.com/o/r/pull/2", "session_id": "sess2"})
+
+	reg, ok, err := store.Get(ctx, "https://github.com/o/r/pull/1")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if !ok || reg.Status != registry.StatusMerged {
+		t.Errorf("sess1's merged PR = %+v, want status %q untouched by sess2's register", reg, registry.StatusMerged)
+	}
+}
