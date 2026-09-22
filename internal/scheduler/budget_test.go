@@ -18,7 +18,7 @@ func TestComputeIntervalZeroBudgetUsesFallback(t *testing.T) {
 func TestComputeIntervalNeverBelowFloor(t *testing.T) {
 	now := time.Now()
 	// Huge headroom, tiny window, one registration: naive math would want a
-	// sub-second interval. The 30s floor must still win.
+	// sub-second interval. The MinPollInterval floor must still win.
 	budget := provider.RateBudget{Limit: 5000, Remaining: 4999, ResetAt: now.Add(time.Second)}
 	got := ComputeInterval(budget, 1, now)
 	if got < MinPollInterval {
@@ -36,14 +36,18 @@ func TestComputeIntervalNearFloorWaitsForReset(t *testing.T) {
 	}
 }
 
-func TestComputeIntervalNoHeadroomShortWindowRespectsCeiling(t *testing.T) {
+func TestComputeIntervalNoHeadroomShortWindowUsesFallback(t *testing.T) {
 	now := time.Now()
-	// No usable headroom (Remaining=500 is exactly the floor), and window is only 5s.
-	// Even though there's no headroom to use, we must not return an interval below MinPollInterval (30s).
+	// No usable headroom (Remaining=500 is exactly the floor), and window is
+	// only 5s. MinPollInterval must NOT apply here: it's a ceiling on how
+	// fast we may check when there IS headroom to spend, not a safe wait
+	// for "we just burned through the whole budget" — that gets the longer
+	// FallbackInterval instead, same as when there's no rate-limit signal
+	// at all.
 	budget := provider.RateBudget{Limit: 5000, Remaining: 500, ResetAt: now.Add(5 * time.Second)}
 	got := ComputeInterval(budget, 1, now)
-	if got < MinPollInterval {
-		t.Errorf("ComputeInterval() with short window and no headroom = %v, want >= floor %v", got, MinPollInterval)
+	if got != FallbackInterval {
+		t.Errorf("ComputeInterval() with short window and no headroom = %v, want fallback %v", got, FallbackInterval)
 	}
 }
 
