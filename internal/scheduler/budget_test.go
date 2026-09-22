@@ -58,25 +58,51 @@ func TestComputeIntervalResetInThePastUsesFallback(t *testing.T) {
 
 func TestComputeIntervalScalesWithActiveRegistrations(t *testing.T) {
 	now := time.Now()
-	budget := provider.RateBudget{Limit: 5000, Remaining: 550, ResetAt: now.Add(time.Hour)}
+	// Remaining is set low enough (relative to Limit and the 40-minute
+	// window) that usable headroom is tiny (5) and the 1-registration
+	// interval already clears MinPollInterval on its own — otherwise both
+	// the 1- and 10-registration cases would clamp to the same floor and
+	// be indistinguishable, which would make this test pass regardless of
+	// whether ComputeInterval uses the real count at all. floorRate here
+	// (10/min * 40min = 400) stays under floorFrac (10% of 5000 = 500), so
+	// the fraction-based floor is what's actually in effect.
+	budget := provider.RateBudget{Limit: 5000, Remaining: 505, ResetAt: now.Add(40 * time.Minute)}
 	one := ComputeInterval(budget, 1, now)
 	ten := ComputeInterval(budget, 10, now)
+	if one <= MinPollInterval {
+		t.Fatalf("ComputeInterval(1) = %v, want it to clear MinPollInterval (%v) on its own so scaling is actually observable", one, MinPollInterval)
+	}
 	if ten <= one {
 		t.Errorf("ComputeInterval() with 10 active registrations (%v) should be longer than with 1 (%v) — same pool, more consumers, less-frequent-per-registration checks", ten, one)
 	}
 }
 
-func TestComputeIntervalNeverPlansToExceedNinetyPercentCeiling(t *testing.T) {
+func TestComputeIntervalNeverExceedsReservedFloorCeiling(t *testing.T) {
 	now := time.Now()
 	budget := provider.RateBudget{Limit: 1000, Remaining: 900, ResetAt: now.Add(time.Hour)}
 	activeRegistrations := 20
 	interval := ComputeInterval(budget, activeRegistrations, now)
 
 	// Over the remaining window, the pool-wide call rate this interval
-	// implies must not exceed the usable (90%-ceiling) budget.
+	// implies must not exceed the usable budget under the reserved floor —
+	// whichever of the fraction- or rate-based reservation is larger.
 	checksInWindow := time.Hour / interval * time.Duration(activeRegistrations)
-	usable := int(float64(budget.Limit) * (1 - RateLimitFloorFrac))
+	floorFrac := int(float64(budget.Limit) * RateLimitFloorFrac)
+	floorRate := int(ReservedCallsPerMinute * time.Hour.Minutes())
+	usable := budget.Limit - max(floorFrac, floorRate)
 	if int(checksInWindow) > usable {
 		t.Errorf("interval %v implies %d calls over the window, want <= usable budget %d", interval, checksInWindow, usable)
+	}
+}
+
+func TestComputeIntervalReservedRateFloorDominatesSmallPool(t *testing.T) {
+	now := time.Now()
+	// A small pool with a long window left: 10% of the limit (5) is much
+	// smaller than what 10 calls/min sustained for 30 minutes demands
+	// (300), so the rate-based floor must win and starve out all headroom.
+	budget := provider.RateBudget{Limit: 50, Remaining: 45, ResetAt: now.Add(30 * time.Minute)}
+	got := ComputeInterval(budget, 1, now)
+	if got < 30*time.Minute {
+		t.Errorf("ComputeInterval() = %v, want >= the time until reset (%v): the rate-based floor should leave no usable headroom here", got, 30*time.Minute)
 	}
 }

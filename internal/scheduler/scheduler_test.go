@@ -218,18 +218,19 @@ func TestTickUsesRealActiveCountsNotPlaceholder(t *testing.T) {
 		}
 	}
 
-	// Remaining is set low enough (relative to Limit) that the per-
-	// registration interval clears the MinPollInterval floor for both
-	// activeCount=1 and activeCount=2, so the two are actually
-	// distinguishable — at Remaining:4500/Limit:5000 (used elsewhere in this
-	// package) both clamp to the same 30s floor regardless of activeCount,
-	// which would make this test pass or fail independent of whether Tick
-	// uses the real count at all.
+	// Remaining/window are set so the usable headroom (5, after the
+	// reserved floor) is small enough that the per-registration interval
+	// clears the MinPollInterval floor for both activeCount=1 and
+	// activeCount=2, so the two are actually distinguishable — too much
+	// headroom (or too little, tipping into the no-headroom branch) would
+	// clamp both to the same value regardless of activeCount, which would
+	// make this test pass or fail independent of whether Tick uses the
+	// real count at all.
 	gh := &fakeGitHubChecker{
 		result: provider.CheckResult{State: "open", CIBucket: "success"},
 		budgets: provider.GitHubBudgets{
-			GraphQL: provider.RateBudget{Limit: 5000, Remaining: 550, ResetAt: now.Add(time.Hour)},
-			REST:    provider.RateBudget{Limit: 5000, Remaining: 550, ResetAt: now.Add(time.Hour)},
+			GraphQL: provider.RateBudget{Limit: 5000, Remaining: 505, ResetAt: now.Add(40 * time.Minute)},
+			REST:    provider.RateBudget{Limit: 5000, Remaining: 505, ResetAt: now.Add(40 * time.Minute)},
 		},
 	}
 	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{}}
