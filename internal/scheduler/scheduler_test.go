@@ -135,7 +135,8 @@ func TestTickMarksMergedInsteadOfDeregistering(t *testing.T) {
 		t.Fatalf("Add() error = %v", err)
 	}
 
-	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "merged"}}
+	mergedAt := now.Add(-time.Minute).Truncate(time.Second)
+	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "merged", MergedAt: mergedAt}}
 	notify := &fakeNotifier{}
 	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: notify}
 	if err := sched.Tick(ctx); err != nil {
@@ -151,6 +152,9 @@ func TestTickMarksMergedInsteadOfDeregistering(t *testing.T) {
 	}
 	if remaining[0].Status != registry.StatusMerged {
 		t.Errorf("Status = %q, want %q after MERGED", remaining[0].Status, registry.StatusMerged)
+	}
+	if !remaining[0].MergedAt.Equal(mergedAt) {
+		t.Errorf("MergedAt = %v, want %v", remaining[0].MergedAt, mergedAt)
 	}
 	if len(notify.sent) != 1 || notify.sent[0] != "sess1: MERGED" {
 		t.Errorf("notify.sent = %v, want a single MERGED message", notify.sent)

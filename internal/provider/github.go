@@ -67,8 +67,9 @@ const githubPullRequestFieldsQuery = `      state
       title
       body
       headRefOid
+      mergedAt
       reviewCount: reviews { totalCount }
-      latestReview: reviews(last: 1) { nodes { author { login } state } }
+      latestReview: reviews(last: 1) { nodes { author { login } state submittedAt } }
       commits(last: 1) {
         nodes { commit { statusCheckRollup { state } } }
       }`
@@ -80,6 +81,7 @@ type githubPullRequestFields struct {
 	Title       string `json:"title"`
 	Body        string `json:"body"`
 	HeadRefOid  string `json:"headRefOid"`
+	MergedAt    string `json:"mergedAt"`
 	ReviewCount struct {
 		TotalCount int `json:"totalCount"`
 	} `json:"reviewCount"`
@@ -88,7 +90,8 @@ type githubPullRequestFields struct {
 			Author struct {
 				Login string `json:"login"`
 			} `json:"author"`
-			State string `json:"state"`
+			State       string `json:"state"`
+			SubmittedAt string `json:"submittedAt"`
 		} `json:"nodes"`
 	} `json:"latestReview"`
 	Commits struct {
@@ -163,6 +166,10 @@ func buildCheckResult(pr githubPullRequestFields) CheckResult {
 	if len(pr.LatestReview.Nodes) > 0 {
 		result.LatestReviewer = pr.LatestReview.Nodes[0].Author.Login
 		result.LatestReviewState = pr.LatestReview.Nodes[0].State
+		result.LatestReviewAt = parseRFC3339OrZero(pr.LatestReview.Nodes[0].SubmittedAt)
+	}
+	if pr.State == "MERGED" {
+		result.MergedAt = parseRFC3339OrZero(pr.MergedAt)
 	}
 	if len(pr.Commits.Nodes) > 0 && pr.Commits.Nodes[0].Commit.StatusCheckRollup != nil {
 		result.CIBucket = mapGitHubRollupState(pr.Commits.Nodes[0].Commit.StatusCheckRollup.State)
@@ -326,13 +333,16 @@ func (c *GitHubChecker) CheckBatch(ctx context.Context, urls []string) (map[stri
 	for url, entry := range entries {
 		result := entry.result
 		if result.State != "merged" && result.State != "closed" {
-			budget, actionRequired, err := c.checkActionRequired(ctx, entry.owner, entry.repo, entry.headRefOid)
+			budget, runs, err := c.checkActionRequired(ctx, entry.owner, entry.repo, entry.headRefOid)
 			if err != nil {
 				return nil, GitHubBudgets{}, err
 			}
 			restBudget = budget
-			if actionRequired && result.CIBucket != "failure" {
+			if runs.actionRequired && result.CIBucket != "failure" {
 				result.CIBucket = "action_required"
+			}
+			if result.CIBucket == "failure" || result.CIBucket == "action_required" {
+				result.CIDetail = runs.failingRunName
 			}
 		}
 		results[url] = result
@@ -383,13 +393,36 @@ func (c *GitHubChecker) queryBatchGraphQL(ctx context.Context, bq githubBatchQue
 
 type githubActionsRunsResponse struct {
 	WorkflowRuns []struct {
+		Name       string `json:"name"`
 		Conclusion string `json:"conclusion"`
 	} `json:"workflow_runs"`
 }
 
-func (c *GitHubChecker) checkActionRequired(ctx context.Context, owner, repo, headSHA string) (RateBudget, bool, error) {
+// actionsRunsResult is what checkActionRequired learns from one PR's
+// Actions runs page: whether a run is stuck on the fork-PR
+// maintainer-approval gate, and (best-effort) the name of the first run
+// that didn't succeed, for CIDetail — the same page already fetched for the
+// action_required cross-check, so surfacing this costs no extra call.
+type actionsRunsResult struct {
+	actionRequired bool
+	failingRunName string
+}
+
+// failingRunConclusions are workflow_runs[].conclusion values that mean the
+// run didn't succeed and are worth naming in CIDetail. "skipped" and
+// "neutral" are deliberately excluded: neither indicates a problem worth
+// surfacing as the reason CI looks red.
+var failingRunConclusions = map[string]bool{
+	"failure":         true,
+	"timed_out":       true,
+	"cancelled":       true,
+	"startup_failure": true,
+	"action_required": true,
+}
+
+func (c *GitHubChecker) checkActionRequired(ctx context.Context, owner, repo, headSHA string) (RateBudget, actionsRunsResult, error) {
 	if headSHA == "" {
-		return RateBudget{}, false, nil
+		return RateBudget{}, actionsRunsResult{}, nil
 	}
 	// Escape every interpolated component: an owner/repo containing "?" or
 	// "#" would otherwise retarget the request path. per_page=100 raises the
@@ -401,32 +434,36 @@ func (c *GitHubChecker) checkActionRequired(ctx context.Context, owner, repo, he
 		c.baseURL(), neturl.PathEscape(owner), neturl.PathEscape(repo), query.Encode())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return RateBudget{}, false, err
+		return RateBudget{}, actionsRunsResult{}, err
 	}
 	req.Header.Set("Authorization", "bearer "+c.Token)
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return RateBudget{}, false, fmt.Errorf("github actions runs request: %w", err)
+		return RateBudget{}, actionsRunsResult{}, fmt.Errorf("github actions runs request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	budget := parseGitHubRESTRateHeaders(resp)
 
 	if err := checkHTTPStatus(resp); err != nil {
-		return budget, false, fmt.Errorf("github actions runs: %w", err)
+		return budget, actionsRunsResult{}, fmt.Errorf("github actions runs: %w", err)
 	}
 
 	var out githubActionsRunsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return budget, false, fmt.Errorf("decode github actions runs response: %w", err)
+		return budget, actionsRunsResult{}, fmt.Errorf("decode github actions runs response: %w", err)
 	}
+	var result actionsRunsResult
 	for _, run := range out.WorkflowRuns {
 		if run.Conclusion == "action_required" {
-			return budget, true, nil
+			result.actionRequired = true
+		}
+		if result.failingRunName == "" && failingRunConclusions[run.Conclusion] {
+			result.failingRunName = run.Name
 		}
 	}
-	return budget, false, nil
+	return budget, result, nil
 }
 
 // maxHTTPErrorBodyBytes caps how much of a non-2xx response body is read

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
 )
@@ -83,7 +84,7 @@ func badgeChipsFor(r registry.Registration) []badgeChip {
 		return []badgeChip{{
 			Icon:    "check-circle",
 			Tone:    "success",
-			Tooltip: fmt.Sprintf("%s — merged", subject),
+			Tooltip: fmt.Sprintf("%s — merged%s", subject, atSuffix(r.MergedAt)),
 			Href:    r.PRURL,
 		}}
 	case registry.StatusClosed:
@@ -106,15 +107,50 @@ func badgeChipsFor(r registry.Registration) []badgeChip {
 			{
 				Text:    ci.Text,
 				Tone:    ci.Tone,
-				Tooltip: fmt.Sprintf("%s — CI %s", subject, ci.Text),
+				Tooltip: ciTooltip(ci.Text, r.CIDetail),
 				Href:    r.PRURL,
 			},
 			{
 				Text:    review.Text,
 				Tone:    review.Tone,
-				Tooltip: fmt.Sprintf("%s — review %s", subject, review.Text),
+				Tooltip: reviewTooltip(review.Text, r.LatestReviewer, r.LatestReviewAt),
 				Href:    r.PRURL,
 			},
 		}
 	}
+}
+
+// ciTooltip appends the failing check/job name to the CI tooltip, when
+// known — e.g. "CI failure: build".
+func ciTooltip(bucketText, detail string) string {
+	if detail == "" {
+		return fmt.Sprintf("CI %s", bucketText)
+	}
+	return fmt.Sprintf("CI %s: %s", bucketText, detail)
+}
+
+// reviewTooltip appends who reviewed and when, when known — e.g. "review
+// APPROVED by alice, 2026-09-20 12:00 UTC". Either can be known without the
+// other (a reviewer without a timestamp, or vice versa), so each is
+// appended independently rather than requiring both.
+func reviewTooltip(stateText, reviewer string, at time.Time) string {
+	s := fmt.Sprintf("review %s", stateText)
+	if reviewer != "" {
+		s += " by " + reviewer
+	}
+	if suffix := atSuffix(at); suffix != "" {
+		if reviewer != "" {
+			s += ","
+		}
+		s += suffix
+	}
+	return s
+}
+
+// atSuffix renders a leading " at <timestamp>" clause, or "" if t is zero.
+func atSuffix(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return " at " + t.UTC().Format("2006-01-02 15:04 MST")
 }

@@ -18,8 +18,11 @@ type CheckResult struct {
 	ReviewCount       int
 	LatestReviewer    string
 	LatestReviewState string
-	CIBucket          string // "none" | "success" | "failure" | "pending" | "action_required"
+	LatestReviewAt    time.Time // zero if unknown or no review yet
+	CIBucket          string    // "none" | "success" | "failure" | "pending" | "action_required"
+	CIDetail          string    // e.g. the failing check/job name; empty if not applicable/unknown
 	Unresolved        int
+	MergedAt          time.Time // zero unless State == "merged"
 }
 
 type Event struct {

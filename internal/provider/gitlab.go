@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 var gitlabMRURLPattern = regexp.MustCompile(`^https?://([^/]+)/(.+)/-/merge_requests/(\d+)`)
@@ -27,9 +28,12 @@ func ParseGitLabMRURL(mrURL string) (host, projectPath string, iid int, err erro
 }
 
 // GitLabChecker polls a single MR's state, approval count, and unresolved
-// discussion count via three REST calls — same shape as the bash script's
-// poll_gitlab, ported to Go so the scheduler can read RateLimit-* response
-// headers directly instead of shelling to `glab`.
+// discussion count via REST — the original three calls of the bash script's
+// poll_gitlab (ported to Go so the scheduler can read RateLimit-* response
+// headers directly instead of shelling to `glab`), plus two conditional
+// calls added since: /notes (only once at least one approval exists) for
+// the latest approver's name and timestamp, and /pipelines/:id/jobs (only
+// on a failing pipeline) for the failing job's name.
 type GitLabChecker struct {
 	HTTPClient *http.Client
 
@@ -66,10 +70,13 @@ type gitlabMRResponse struct {
 	State       string `json:"state"`
 	Title       string `json:"title"`
 	Description string `json:"description"`
+	MergedAt    string `json:"merged_at"`
 	Pipeline    *struct {
+		ID     int    `json:"id"`
 		Status string `json:"status"`
 	} `json:"pipeline"`
 	HeadPipeline *struct {
+		ID     int    `json:"id"`
 		Status string `json:"status"`
 	} `json:"head_pipeline"`
 }
@@ -83,6 +90,29 @@ type gitlabDiscussion struct {
 		Resolvable bool `json:"resolvable"`
 		Resolved   bool `json:"resolved"`
 	} `json:"notes"`
+}
+
+// gitlabNote is one entry from the MR's /notes feed. A system note whose
+// Body is GitLab's fixed "approved this merge request" string is the only
+// durable source of an approval's timestamp and author: /approvals only
+// reports who currently holds an approval, not when they gave it.
+type gitlabNote struct {
+	System    bool   `json:"system"`
+	Body      string `json:"body"`
+	CreatedAt string `json:"created_at"`
+	Author    struct {
+		Username string `json:"username"`
+	} `json:"author"`
+}
+
+// gitlabApprovedNoteBody is the fixed system-note text GitLab writes when a
+// user approves an MR — not documented as a stable API contract, but it's
+// the same string GitLab's own web UI activity feed renders from, so a
+// wording change would be a user-visible break for GitLab itself too.
+const gitlabApprovedNoteBody = "approved this merge request"
+
+type gitlabJobsResponse []struct {
+	Name string `json:"name"`
 }
 
 func mapGitLabPipelineStatus(status string) string {
@@ -129,22 +159,53 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 
 	result := CheckResult{State: mapGitLabState(mrData.State), Title: mrData.Title, Description: mrData.Description}
 	if result.State == "merged" || result.State == "closed" {
+		if result.State == "merged" {
+			result.MergedAt = parseRFC3339OrZero(mrData.MergedAt)
+		}
 		return result, budget, nil
 	}
 
 	pipelineStatus := "none"
+	var pipelineID int
 	if mrData.Pipeline != nil && mrData.Pipeline.Status != "" {
 		pipelineStatus = mrData.Pipeline.Status
+		pipelineID = mrData.Pipeline.ID
 	} else if mrData.HeadPipeline != nil {
 		pipelineStatus = mrData.HeadPipeline.Status
+		pipelineID = mrData.HeadPipeline.ID
 	}
 	result.CIBucket = mapGitLabPipelineStatus(pipelineStatus)
+
+	if result.CIBucket == "failure" && pipelineID != 0 {
+		detail, _, err := c.getJSON(ctx, token, fmt.Sprintf("%s/api/v4/projects/%s/pipelines/%d/jobs?scope[]=failed&per_page=1", base, encodedPath, pipelineID), &gitlabJobsResponse{})
+		if err != nil {
+			return CheckResult{}, RateBudget{}, err
+		}
+		if jobs := *detail.(*gitlabJobsResponse); len(jobs) > 0 {
+			result.CIDetail = jobs[0].Name
+		}
+	}
 
 	approvalsRaw, _, err := c.getJSON(ctx, token, fmt.Sprintf("%s/api/v4/projects/%s/merge_requests/%d/approvals", base, encodedPath, iid), &gitlabApprovalsResponse{})
 	if err != nil {
 		return CheckResult{}, RateBudget{}, err
 	}
 	result.ReviewCount = len(approvalsRaw.(*gitlabApprovalsResponse).ApprovedBy)
+
+	if result.ReviewCount > 0 {
+		var notes []gitlabNote
+		if _, _, err := c.getJSON(ctx, token, fmt.Sprintf("%s/api/v4/projects/%s/merge_requests/%d/notes?sort=desc&order_by=created_at&per_page=20", base, encodedPath, iid), &notes); err != nil {
+			return CheckResult{}, RateBudget{}, err
+		}
+		for _, n := range notes {
+			if n.System && strings.Contains(n.Body, gitlabApprovedNoteBody) {
+				result.LatestReviewer = n.Author.Username
+				result.LatestReviewState = "APPROVED"
+				result.LatestReviewAt = parseRFC3339OrZero(n.CreatedAt)
+				break
+			}
+		}
+	}
 
 	var discussions []gitlabDiscussion
 	if _, _, err := c.getJSON(ctx, token, fmt.Sprintf("%s/api/v4/projects/%s/merge_requests/%d/discussions?per_page=100", base, encodedPath, iid), &discussions); err != nil {
