@@ -46,7 +46,7 @@ func TestPushUIStateRemovesBadgeForSessionThatDroppedOut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("registry.Open() error = %v", err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	now := time.Now()
 	if err := store.Add(t.Context(), registry.Registration{
@@ -130,7 +130,7 @@ func TestPushUIStateReconcilesStatelesslyOnFirstCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("registry.Open() error = %v", err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	now := time.Now()
 	if err := store.Add(t.Context(), registry.Registration{

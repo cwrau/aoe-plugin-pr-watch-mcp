@@ -38,7 +38,7 @@ func fakeGitLabServer(t *testing.T, mrState, pipelineStatus string, approvals, u
 	}
 	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
 		setRateHeaders(w)
-		json.NewEncoder(w).Encode(map[string]any{
+		_ = json.NewEncoder(w).Encode(map[string]any{
 			"state":         mrState,
 			"title":         "Fix the thing",
 			"description":   "This fixes the thing by doing the other thing.",
@@ -49,7 +49,7 @@ func fakeGitLabServer(t *testing.T, mrState, pipelineStatus string, approvals, u
 	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
 		setRateHeaders(w)
 		approvedBy := make([]map[string]any, approvals)
-		json.NewEncoder(w).Encode(map[string]any{"approved_by": approvedBy})
+		_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": approvedBy})
 	})
 	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
 		setRateHeaders(w)
@@ -59,7 +59,7 @@ func fakeGitLabServer(t *testing.T, mrState, pipelineStatus string, approvals, u
 				"notes": []map[string]any{{"resolvable": true, "resolved": false}},
 			})
 		}
-		json.NewEncoder(w).Encode(discussions)
+		_ = json.NewEncoder(w).Encode(discussions)
 	})
 	return httptest.NewServer(mux)
 }
@@ -129,7 +129,7 @@ func TestGitLabCheckerNonOKStatusErrors(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte(`{"message":"401 Unauthorized"}`))
+		_, _ = w.Write([]byte(`{"message":"401 Unauthorized"}`))
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -150,7 +150,7 @@ func TestGitLabCheckerServerErrorOnApprovals(t *testing.T) {
 		w.Header().Set("RateLimit-Limit", "2000")
 		w.Header().Set("RateLimit-Remaining", "1999")
 		w.Header().Set("RateLimit-Reset", "9999999999")
-		json.NewEncoder(w).Encode(map[string]any{
+		_ = json.NewEncoder(w).Encode(map[string]any{
 			"state":         "opened",
 			"pipeline":      map[string]any{"status": "success"},
 			"head_pipeline": nil,
@@ -158,7 +158,7 @@ func TestGitLabCheckerServerErrorOnApprovals(t *testing.T) {
 	})
 	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("internal error"))
+		_, _ = w.Write([]byte("internal error"))
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()

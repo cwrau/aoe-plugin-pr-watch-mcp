@@ -65,7 +65,7 @@ func main() {
 		logger.Error("open registry", "error", err)
 		os.Exit(1)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	aoe, err := aoeclient.New()
 	if err != nil {
@@ -123,6 +123,9 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		rpc.handleInboundLine(scanner.Bytes())
+	}
+	if err := scanner.Err(); err != nil {
+		logger.Error("read stdin", "error", err)
 	}
 	logger.Info("stdin closed, shutting down")
 }
@@ -220,7 +223,7 @@ func runHTTPServer(ctx context.Context, store *registry.Store, logger *slog.Logg
 	}
 	go func() {
 		<-ctx.Done()
-		srv.Close()
+		_ = srv.Close()
 	}()
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Error("mcp http server", "error", err)

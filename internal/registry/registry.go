@@ -206,7 +206,7 @@ func (s *Store) List(ctx context.Context) ([]Registration, error) {
 	if err != nil {
 		return nil, fmt.Errorf("query registrations: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	regs, err := scanAll(rows)
 	if err != nil {
 		return nil, fmt.Errorf("scan registrations: %w", err)
@@ -223,7 +223,7 @@ func (s *Store) DueBefore(ctx context.Context, t time.Time) ([]Registration, err
 	if err != nil {
 		return nil, fmt.Errorf("query due registrations: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	regs, err := scanAll(rows)
 	if err != nil {
 		return nil, fmt.Errorf("scan due registrations: %w", err)
@@ -248,7 +248,7 @@ func (s *Store) CountByProvider(ctx context.Context) (map[string]int, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	counts := make(map[string]int)
 	for rows.Next() {

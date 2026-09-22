@@ -34,7 +34,7 @@ func fakeGitHubServer(t *testing.T, graphqlBody string, actionRequiredCount int)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(graphqlBody))
+		_, _ = w.Write([]byte(graphqlBody))
 	})
 	mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-RateLimit-Limit", "5000")
@@ -48,7 +48,7 @@ func fakeGitHubServer(t *testing.T, graphqlBody string, actionRequiredCount int)
 			}
 			runs["workflow_runs"] = runList
 		}
-		json.NewEncoder(w).Encode(runs)
+		_ = json.NewEncoder(w).Encode(runs)
 	})
 	return httptest.NewServer(mux)
 }
@@ -145,7 +145,7 @@ func TestGitHubCheckerActionRequiredDoesNotOverrideFailure(t *testing.T) {
 func TestGitHubCheckerErrorsOnNon2xxGraphQLStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte(`{"message":"Bad credentials"}`))
+		_, _ = w.Write([]byte(`{"message":"Bad credentials"}`))
 	}))
 	defer srv.Close()
 
@@ -160,11 +160,11 @@ func TestGitHubCheckerErrorsOnNon2xxActionsRunsStatus(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(graphqlOpenSuccessBody))
+		_, _ = w.Write([]byte(graphqlOpenSuccessBody))
 	})
 	mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`internal server error`))
+		_, _ = w.Write([]byte(`internal server error`))
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -240,11 +240,11 @@ func TestGitHubCheckerActionRequiredQueryIsEscapedAndPaginated(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(graphqlOpenSuccessBody))
+		_, _ = w.Write([]byte(graphqlOpenSuccessBody))
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		gotPath, gotQuery = r.URL.EscapedPath(), r.URL.Query().Encode()
-		json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]any{}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]any{}})
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()

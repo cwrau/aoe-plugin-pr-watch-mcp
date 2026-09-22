@@ -229,7 +229,7 @@ func (c *GitHubChecker) queryGraphQL(ctx context.Context, owner, repo string, nu
 	if err != nil {
 		return nil, fmt.Errorf("github graphql request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if err := checkHTTPStatus(resp); err != nil {
 		return nil, fmt.Errorf("github graphql: %w", err)
@@ -277,7 +277,7 @@ func (c *GitHubChecker) checkActionRequired(ctx context.Context, owner, repo, he
 	if err != nil {
 		return RateBudget{}, false, fmt.Errorf("github actions runs request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	budget := parseGitHubRESTRateHeaders(resp)
 
