@@ -54,10 +54,7 @@ func ComputeInterval(budget provider.RateBudget, activeRegistrations int, now ti
 		return FallbackInterval
 	}
 
-	floorFrac := int(float64(budget.Limit) * RateLimitFloorFrac)
-	floorRate := int(ReservedCallsPerMinute * window.Minutes())
-	floor := max(floorFrac, floorRate)
-	usable := budget.Remaining - floor
+	usable := usableHeadroom(budget, window)
 	if usable <= 0 {
 		// No headroom left this window: don't check again until reset.
 		// MinPollInterval is deliberately NOT the floor here — it caps how
@@ -82,4 +79,34 @@ func ComputeInterval(budget provider.RateBudget, activeRegistrations int, now ti
 		return MinPollInterval
 	}
 	return perRegistration
+}
+
+// usableHeadroom is how many calls remain above the reserved floor (the
+// larger of RateLimitFloorFrac of the limit or ReservedCallsPerMinute
+// sustained for the rest of window) — shared by ComputeInterval and
+// HasHeadroom so the two never disagree about what "exhausted" means.
+func usableHeadroom(budget provider.RateBudget, window time.Duration) int {
+	floorFrac := int(float64(budget.Limit) * RateLimitFloorFrac)
+	floorRate := int(ReservedCallsPerMinute * window.Minutes())
+	floor := max(floorFrac, floorRate)
+	return budget.Remaining - floor
+}
+
+// HasHeadroom reports whether a previously-observed budget still has any
+// usable headroom above the reserved floor, as of now. A budget with no
+// signal yet (zero Limit/ResetAt) or whose window has already elapsed
+// reports true: there's nothing stale to distrust, so the only way to find
+// out is to actually make the call. Lets a caller sharing a rate-limit pool
+// across many registrations skip a real API call it already knows would
+// either fail or eat further into the reserved floor, instead of
+// discovering that the expensive way on every one of them.
+func HasHeadroom(budget provider.RateBudget, now time.Time) bool {
+	if budget.Limit == 0 || budget.ResetAt.IsZero() {
+		return true
+	}
+	window := budget.ResetAt.Sub(now)
+	if window <= 0 {
+		return true
+	}
+	return usableHeadroom(budget, window) > 0
 }

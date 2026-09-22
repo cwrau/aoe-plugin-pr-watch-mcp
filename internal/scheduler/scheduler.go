@@ -41,6 +41,17 @@ type Scheduler struct {
 	Sessions SessionClassifier
 	Notify   Sender
 	Log      *slog.Logger
+
+	// lastGitHubBudgets/lastGitLabBudgets cache the most recently observed
+	// budget for each pool (GitLab keyed by host — each host has its own
+	// separate pool). Several registrations can share one pool, so once
+	// any of them reveals it's exhausted there's no point spending (or
+	// failing) a real API call to rediscover that for every other due
+	// registration in the same pool this tick — skipForExhaustedBudget
+	// checks this cache first. Tick/processOne run strictly sequentially
+	// (one scheduler loop goroutine), so no locking is needed.
+	lastGitHubBudgets provider.GitHubBudgets
+	lastGitLabBudgets map[string]provider.RateBudget
 }
 
 func (s *Scheduler) log() *slog.Logger {
@@ -94,6 +105,23 @@ func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration, c
 		return
 	}
 
+	now := time.Now()
+	if skip, resumeAt := s.skipForExhaustedBudget(reg, now); skip {
+		// We already know from a previous check this tick (or an earlier
+		// one still within its window) that this pool's reserved floor is
+		// exhausted — spending a real call here would either fail outright
+		// or eat further into headroom we're deliberately not touching, to
+		// find out something we already know. Reschedule using the same
+		// no-headroom pacing ComputeInterval would apply, without ever
+		// hitting the network.
+		wait := max(resumeAt.Sub(now), FallbackInterval)
+		s.log().Debug("skipping check, cached pool budget already exhausted", "pr_url", reg.PRURL, "resume_at", resumeAt)
+		if err := s.Store.UpdateState(ctx, reg.PRURL, reg.ReviewCount, reg.CIBucket, reg.Unresolved, reg.LatestReviewState, reg.Title, reg.Description, now.Add(wait)); err != nil {
+			s.log().Error("reschedule budget-exhausted registration", "pr_url", reg.PRURL, "error", err)
+		}
+		return
+	}
+
 	prev := provider.PrevState{ReviewCount: reg.ReviewCount, CIBucket: reg.CIBucket, Unresolved: reg.Unresolved}
 	activeCount := counts[reg.Provider]
 
@@ -106,6 +134,9 @@ func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration, c
 	case "github":
 		var budgets provider.GitHubBudgets
 		result, budgets, checkErr = s.GitHub.Check(ctx, reg.PRURL)
+		if checkErr == nil {
+			s.lastGitHubBudgets = budgets
+		}
 		// Whichever pool has less relative headroom governs the interval:
 		// both calls happened, both must stay under budget.
 		interval = minInterval(
@@ -115,6 +146,14 @@ func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration, c
 	case "gitlab":
 		var budget provider.RateBudget
 		result, budget, checkErr = s.GitLab.Check(ctx, reg.PRURL)
+		if checkErr == nil {
+			if host, _, _, err := provider.ParseGitLabMRURL(reg.PRURL); err == nil {
+				if s.lastGitLabBudgets == nil {
+					s.lastGitLabBudgets = make(map[string]provider.RateBudget)
+				}
+				s.lastGitLabBudgets[host] = budget
+			}
+		}
 		interval = ComputeInterval(budget, activeCount, time.Now())
 	default:
 		s.log().Error("unknown provider", "pr_url", reg.PRURL, "provider", reg.Provider)
@@ -170,6 +209,47 @@ func minInterval(a, b time.Duration) time.Duration {
 		return a
 	}
 	return b
+}
+
+// skipForExhaustedBudget reports whether reg's pool is already known, from
+// a cached prior observation still within its own window, to have no
+// headroom left above the reserved floor — and if so, when it's worth
+// trying again (the later of any exhausted budget's own ResetAt). A cache
+// miss, or one past its window, always reports false: there's nothing
+// stale to distrust, so the only way to find out is a real call.
+func (s *Scheduler) skipForExhaustedBudget(reg registry.Registration, now time.Time) (bool, time.Time) {
+	switch reg.Provider {
+	case "github":
+		skip := false
+		var resumeAt time.Time
+		for _, b := range []provider.RateBudget{s.lastGitHubBudgets.GraphQL, s.lastGitHubBudgets.REST} {
+			if budgetFresh(b, now) && !HasHeadroom(b, now) {
+				skip = true
+				if b.ResetAt.After(resumeAt) {
+					resumeAt = b.ResetAt
+				}
+			}
+		}
+		return skip, resumeAt
+	case "gitlab":
+		host, _, _, err := provider.ParseGitLabMRURL(reg.PRURL)
+		if err != nil {
+			return false, time.Time{}
+		}
+		b, ok := s.lastGitLabBudgets[host]
+		if ok && budgetFresh(b, now) && !HasHeadroom(b, now) {
+			return true, b.ResetAt
+		}
+	}
+	return false, time.Time{}
+}
+
+// budgetFresh reports whether b carries a real signal whose window hasn't
+// elapsed yet — the same "is this worth trusting at all" gate HasHeadroom
+// applies internally, exposed here so skipForExhaustedBudget can tell "no
+// headroom" apart from "no (usable) signal" before deciding to skip.
+func budgetFresh(b provider.RateBudget, now time.Time) bool {
+	return b.Limit > 0 && !b.ResetAt.IsZero() && b.ResetAt.After(now)
 }
 
 // eventMessage renders a provider.Event as the text sent to the session.
