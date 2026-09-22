@@ -12,15 +12,29 @@ import (
 )
 
 type fakeGitHubChecker struct {
-	result  provider.CheckResult
+	result provider.CheckResult // applied to every url when results is nil
+	// results, when set, is returned verbatim instead of applying result to
+	// every url — a url present in urls but absent here simulates "missing
+	// from the batch response" (e.g. PR/repo not found).
+	results map[string]provider.CheckResult
 	budgets provider.GitHubBudgets
 	err     error
-	calls   int
+	calls   int // counts CheckBatch invocations, not urls checked
 }
 
-func (f *fakeGitHubChecker) Check(ctx context.Context, url string) (provider.CheckResult, provider.GitHubBudgets, error) {
+func (f *fakeGitHubChecker) CheckBatch(ctx context.Context, urls []string) (map[string]provider.CheckResult, provider.GitHubBudgets, error) {
 	f.calls++
-	return f.result, f.budgets, f.err
+	if f.err != nil {
+		return nil, provider.GitHubBudgets{}, f.err
+	}
+	if f.results != nil {
+		return f.results, f.budgets, nil
+	}
+	out := make(map[string]provider.CheckResult, len(urls))
+	for _, u := range urls {
+		out[u] = f.result
+	}
+	return out, f.budgets, nil
 }
 
 type fakeGitLabChecker struct {
@@ -254,23 +268,24 @@ func TestTickUsesRealActiveCountsNotPlaceholder(t *testing.T) {
 	}
 }
 
-// TestTickSkipsCheckWhenGitHubPoolAlreadyKnownExhausted: reg1 (processed
-// first, earlier NextDueAt) reveals via its real check that the GraphQL
-// pool has no headroom left. reg2, due in the same tick and sharing that
-// same pool, must skip its own real check entirely rather than spend (or
-// fail) a call to rediscover what reg1's result already told the
-// scheduler.
+// TestTickSkipsCheckWhenGitHubPoolAlreadyKnownExhausted: tick 1 checks reg1
+// for real, revealing the GraphQL pool has no headroom left. reg2 becomes
+// due only after that (registered post-tick-1), so tick 2 must skip its
+// real check entirely — the cached exhaustion from tick 1's result is
+// still within its window — rather than spend (or fail) a call to
+// rediscover what's already known. Batching means every registration
+// ready in the *same* tick shares one call regardless of budget state
+// (there's nothing to learn mid-tick from a call that hasn't happened
+// yet); the cache only pays off *across* ticks, which is what this test
+// exercises.
 func TestTickSkipsCheckWhenGitHubPoolAlreadyKnownExhausted(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	now := time.Now()
 
 	reg1 := registry.Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", NextDueAt: now.Add(-2 * time.Second), CreatedAt: now}
-	reg2 := registry.Registration{PRURL: "https://github.com/o/r/pull/2", SessionID: "sess2", Provider: "github", NextDueAt: now.Add(-time.Second), CreatedAt: now}
-	for _, r := range []registry.Registration{reg1, reg2} {
-		if err := store.Add(ctx, r); err != nil {
-			t.Fatalf("Add() error = %v", err)
-		}
+	if err := store.Add(ctx, reg1); err != nil {
+		t.Fatalf("Add() error = %v", err)
 	}
 
 	gh := &fakeGitHubChecker{
@@ -283,11 +298,22 @@ func TestTickSkipsCheckWhenGitHubPoolAlreadyKnownExhausted(t *testing.T) {
 	}
 	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{}}
 	if err := sched.Tick(ctx); err != nil {
-		t.Fatalf("Tick() error = %v", err)
+		t.Fatalf("Tick() [1] error = %v", err)
+	}
+	if gh.calls != 1 {
+		t.Fatalf("GitHub checker calls after tick 1 = %d, want 1", gh.calls)
+	}
+
+	reg2 := registry.Registration{PRURL: "https://github.com/o/r/pull/2", SessionID: "sess2", Provider: "github", NextDueAt: now.Add(-time.Second), CreatedAt: now}
+	if err := store.Add(ctx, reg2); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() [2] error = %v", err)
 	}
 
 	if gh.calls != 1 {
-		t.Errorf("GitHub checker calls = %d, want 1 (reg2 should skip its real check once reg1's result reveals the pool is exhausted)", gh.calls)
+		t.Errorf("GitHub checker calls after tick 2 = %d, want still 1 (reg2 should skip its real check, the pool is already known exhausted)", gh.calls)
 	}
 
 	got2 := getReg(t, store, reg2.PRURL)
@@ -297,7 +323,9 @@ func TestTickSkipsCheckWhenGitHubPoolAlreadyKnownExhausted(t *testing.T) {
 }
 
 // TestTickDoesNotSkipWhenCachedGitHubBudgetHasHeadroom: the inverse of the
-// above — a cached-but-non-exhausted budget must never cause a skip.
+// above — a cached-but-non-exhausted budget must never cause a skip. Both
+// registrations are ready in the same tick, so they share one batched
+// call; what matters is that neither was skipped, not the call count.
 func TestTickDoesNotSkipWhenCachedGitHubBudgetHasHeadroom(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -323,8 +351,57 @@ func TestTickDoesNotSkipWhenCachedGitHubBudgetHasHeadroom(t *testing.T) {
 		t.Fatalf("Tick() error = %v", err)
 	}
 
-	if gh.calls != 2 {
-		t.Errorf("GitHub checker calls = %d, want 2 (plenty of headroom, neither registration should be skipped)", gh.calls)
+	if gh.calls != 1 {
+		t.Errorf("GitHub checker calls = %d, want 1 (one batched call covering both, since there's plenty of headroom to skip nothing)", gh.calls)
+	}
+	got1 := getReg(t, store, reg1.PRURL)
+	got2 := getReg(t, store, reg2.PRURL)
+	if got1.CIBucket != "success" || got2.CIBucket != "success" {
+		t.Errorf("both registrations should have been checked for real: got1.CIBucket=%q got2.CIBucket=%q", got1.CIBucket, got2.CIBucket)
+	}
+}
+
+// TestTickBacksOffOnlyTheRegistrationMissingFromABatchResponse: a batch
+// response that resolved some URLs but not others (e.g. one PR/repo not
+// found) must back off only the missing registration, leaving the
+// successfully-resolved ones to persist normally.
+func TestTickBacksOffOnlyTheRegistrationMissingFromABatchResponse(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+
+	reg1 := registry.Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", NextDueAt: now.Add(-2 * time.Second), CreatedAt: now}
+	reg2 := registry.Registration{PRURL: "https://github.com/o/r/pull/2", SessionID: "sess2", Provider: "github", NextDueAt: now.Add(-time.Second), CreatedAt: now}
+	for _, r := range []registry.Registration{reg1, reg2} {
+		if err := store.Add(ctx, r); err != nil {
+			t.Fatalf("Add() error = %v", err)
+		}
+	}
+
+	gh := &fakeGitHubChecker{
+		// Only reg1's URL is present in the response — reg2's is simply
+		// missing, as if its repository/PR came back null.
+		results: map[string]provider.CheckResult{
+			reg1.PRURL: {State: "open", CIBucket: "success"},
+		},
+		budgets: provider.GitHubBudgets{
+			GraphQL: provider.RateBudget{Limit: 5000, Remaining: 4999, ResetAt: now.Add(time.Hour)},
+			REST:    provider.RateBudget{Limit: 5000, Remaining: 4999, ResetAt: now.Add(time.Hour)},
+		},
+	}
+	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{}}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	got1 := getReg(t, store, reg1.PRURL)
+	if got1.CIBucket != "success" {
+		t.Errorf("reg1.CIBucket = %q, want %q (present in the batch response)", got1.CIBucket, "success")
+	}
+	got2 := getReg(t, store, reg2.PRURL)
+	wantAtLeast := now.Truncate(time.Second).Add(MinPollInterval)
+	if got2.NextDueAt.Before(wantAtLeast) {
+		t.Errorf("reg2.NextDueAt = %v, want at least %v (backed off like any other failed check, missing from the batch response)", got2.NextDueAt, wantAtLeast)
 	}
 }
 

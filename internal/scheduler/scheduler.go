@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 // / provider.GitLabChecker, so the scheduler can be tested against fakes
 // without a real HTTP round trip.
 type GitHubChecker interface {
-	Check(ctx context.Context, url string) (provider.CheckResult, provider.GitHubBudgets, error)
+	CheckBatch(ctx context.Context, urls []string) (map[string]provider.CheckResult, provider.GitHubBudgets, error)
 }
 
 type GitLabChecker interface {
@@ -62,11 +63,17 @@ func (s *Scheduler) log() *slog.Logger {
 }
 
 // Tick processes every registration currently due for a check: classifies
-// its session first (skip-and-keep on archived, drop on gone), runs the
-// matching provider's Check, diffs against the last-seen state, sends any
-// resulting events, and persists the new state plus the next due time. A
-// single registration's failure (network blip, provider error) is logged
-// and left for the next Tick rather than aborting the whole batch.
+// its session first (skip-and-keep on archived, drop on gone), then either
+// collects it for GitHub's single batched call (see processGitHubBatch) or,
+// for GitLab, preflights and checks it immediately in the same pass —
+// sequential and interleaved, so reg2's preflight still sees the cache
+// update from reg1's check earlier in this same tick, exactly as a single
+// registration always would. GitHub registrations are only ever
+// preflighted here; their real check is deferred to the one batched call
+// after this loop, since there's nothing to learn from a check that hasn't
+// happened yet. A single registration's failure (network blip, provider
+// error) is logged and left for the next Tick rather than aborting the
+// whole pass.
 func (s *Scheduler) Tick(ctx context.Context) error {
 	if err := s.Sessions.RefreshSessionSets(ctx); err != nil {
 		return err
@@ -82,30 +89,48 @@ func (s *Scheduler) Tick(ctx context.Context) error {
 		return err
 	}
 
+	now := time.Now()
+	var githubReady []registry.Registration
 	for _, reg := range due {
-		s.processOne(ctx, reg, counts)
+		switch reg.Provider {
+		case "github":
+			if s.preflight(ctx, reg, now) {
+				githubReady = append(githubReady, reg)
+			}
+		case "gitlab":
+			if s.preflight(ctx, reg, now) {
+				s.processGitLabOne(ctx, reg, counts)
+			}
+		default:
+			s.log().Error("unknown provider", "pr_url", reg.PRURL, "provider", reg.Provider)
+		}
 	}
+
+	s.processGitHubBatch(ctx, githubReady, counts)
 	return nil
 }
 
-func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration, counts map[string]int) {
+// preflight handles the two things that end a registration's processing
+// for this tick before any provider call: a gone session's session drops
+// the registration to stopped, an archived one just reschedules. Reports
+// whether reg still needs a real check this tick.
+func (s *Scheduler) preflight(ctx context.Context, reg registry.Registration, now time.Time) bool {
 	switch s.Sessions.Classify(reg.SessionID) {
 	case aoeclient.SessionGone:
 		if err := s.Store.SetStatus(ctx, reg.PRURL, registry.StatusStopped); err != nil {
 			s.log().Error("stop registration for gone session", "pr_url", reg.PRURL, "error", err)
 		}
-		return
+		return false
 	case aoeclient.SessionArchived:
 		// Skip the send, but still push next_due_at out using the fallback
 		// interval so an archived registration doesn't spin the due-heap
 		// every tick while archived.
-		if err := s.Store.UpdateState(ctx, reg.PRURL, reg.ReviewCount, reg.CIBucket, reg.Unresolved, reg.LatestReviewState, reg.Title, reg.Description, time.Now().Add(FallbackInterval)); err != nil {
+		if err := s.Store.UpdateState(ctx, reg.PRURL, reg.ReviewCount, reg.CIBucket, reg.Unresolved, reg.LatestReviewState, reg.Title, reg.Description, now.Add(FallbackInterval)); err != nil {
 			s.log().Error("reschedule archived registration", "pr_url", reg.PRURL, "error", err)
 		}
-		return
+		return false
 	}
 
-	now := time.Now()
 	if skip, resumeAt := s.skipForExhaustedBudget(reg, now); skip {
 		// We already know from a previous check this tick (or an earlier
 		// one still within its window) that this pool's reserved floor is
@@ -119,61 +144,93 @@ func (s *Scheduler) processOne(ctx context.Context, reg registry.Registration, c
 		if err := s.Store.UpdateState(ctx, reg.PRURL, reg.ReviewCount, reg.CIBucket, reg.Unresolved, reg.LatestReviewState, reg.Title, reg.Description, now.Add(wait)); err != nil {
 			s.log().Error("reschedule budget-exhausted registration", "pr_url", reg.PRURL, "error", err)
 		}
+		return false
+	}
+	return true
+}
+
+// processGitHubBatch resolves every ready GitHub registration in one
+// GraphQL call (GitHub's GraphQL API supports aliasing many lookups into
+// one request; see provider.GitHubChecker.CheckBatch), then runs each
+// result through the same diff/notify/persist tail a single check always
+// has. A whole-batch failure (network error, auth failure, top-level
+// GraphQL error) backs off every registration in it exactly like an
+// individual check failure always has — there's no partial data to save in
+// that case. A registration whose URL is simply missing from a successful
+// batch response (PR/repo not found) is backed off the same way,
+// individually, without affecting the rest of the batch.
+func (s *Scheduler) processGitHubBatch(ctx context.Context, regs []registry.Registration, counts map[string]int) {
+	if len(regs) == 0 {
 		return
 	}
+	urls := make([]string, len(regs))
+	for i, reg := range regs {
+		urls[i] = reg.PRURL
+	}
 
-	prev := provider.PrevState{ReviewCount: reg.ReviewCount, CIBucket: reg.CIBucket, Unresolved: reg.Unresolved}
-	activeCount := counts[reg.Provider]
+	results, budgets, err := s.GitHub.CheckBatch(ctx, urls)
+	if err != nil {
+		s.log().Warn("github batch check failed, retrying after the poll floor", "count", len(regs), "error", err)
+		for _, reg := range regs {
+			s.finishError(ctx, reg, err)
+		}
+		return
+	}
+	s.lastGitHubBudgets = budgets
 
-	var (
-		result   provider.CheckResult
-		interval time.Duration
-		checkErr error
+	activeCount := counts["github"]
+	// Whichever pool has less relative headroom governs the interval: both
+	// calls happened (for every non-terminal result in the batch), both
+	// must stay under budget.
+	interval := minInterval(
+		ComputeInterval(budgets.GraphQL, activeCount, time.Now()),
+		ComputeInterval(budgets.REST, activeCount, time.Now()),
 	)
-	switch reg.Provider {
-	case "github":
-		var budgets provider.GitHubBudgets
-		result, budgets, checkErr = s.GitHub.Check(ctx, reg.PRURL)
-		if checkErr == nil {
-			s.lastGitHubBudgets = budgets
-		}
-		// Whichever pool has less relative headroom governs the interval:
-		// both calls happened, both must stay under budget.
-		interval = minInterval(
-			ComputeInterval(budgets.GraphQL, activeCount, time.Now()),
-			ComputeInterval(budgets.REST, activeCount, time.Now()),
-		)
-	case "gitlab":
-		var budget provider.RateBudget
-		result, budget, checkErr = s.GitLab.Check(ctx, reg.PRURL)
-		if checkErr == nil {
-			if host, _, _, err := provider.ParseGitLabMRURL(reg.PRURL); err == nil {
-				if s.lastGitLabBudgets == nil {
-					s.lastGitLabBudgets = make(map[string]provider.RateBudget)
-				}
-				s.lastGitLabBudgets[host] = budget
-			}
-		}
-		interval = ComputeInterval(budget, activeCount, time.Now())
-	default:
-		s.log().Error("unknown provider", "pr_url", reg.PRURL, "provider", reg.Provider)
-		return
-	}
 
-	if checkErr != nil {
-		// Push next_due_at out by the poll floor before giving up on this
-		// registration: a permanently-broken one (revoked token, deleted
-		// repo) would otherwise be retried on every scheduler tick forever,
-		// far below MinPollInterval and outside the rate-limit budget math.
-		// The stored state is written back unchanged — only the due time
-		// moves — so the next successful check still diffs against the real
-		// last-seen state.
-		s.log().Warn("check failed, retrying after the poll floor", "pr_url", reg.PRURL, "retry_in", MinPollInterval, "error", checkErr)
-		if err := s.Store.UpdateState(ctx, reg.PRURL, reg.ReviewCount, reg.CIBucket, reg.Unresolved, reg.LatestReviewState, reg.Title, reg.Description, time.Now().Add(MinPollInterval)); err != nil {
-			s.log().Error("back off failed check", "pr_url", reg.PRURL, "error", err)
+	for _, reg := range regs {
+		result, ok := results[reg.PRURL]
+		if !ok {
+			s.finishError(ctx, reg, fmt.Errorf("no result for %s in batch response", reg.PRURL))
+			continue
 		}
+		s.finish(ctx, reg, result, interval)
+	}
+}
+
+func (s *Scheduler) processGitLabOne(ctx context.Context, reg registry.Registration, counts map[string]int) {
+	result, budget, checkErr := s.GitLab.Check(ctx, reg.PRURL)
+	if checkErr != nil {
+		s.finishError(ctx, reg, checkErr)
 		return
 	}
+	if host, _, _, err := provider.ParseGitLabMRURL(reg.PRURL); err == nil {
+		if s.lastGitLabBudgets == nil {
+			s.lastGitLabBudgets = make(map[string]provider.RateBudget)
+		}
+		s.lastGitLabBudgets[host] = budget
+	}
+	interval := ComputeInterval(budget, counts["gitlab"], time.Now())
+	s.finish(ctx, reg, result, interval)
+}
+
+// finishError is the shared backoff path a failed check (or a batch
+// response missing that registration's URL) always takes: push next_due_at
+// out by the poll floor rather than retrying on every scheduler tick
+// forever, leaving the stored state untouched so the next successful check
+// still diffs against the real last-seen state.
+func (s *Scheduler) finishError(ctx context.Context, reg registry.Registration, checkErr error) {
+	s.log().Warn("check failed, retrying after the poll floor", "pr_url", reg.PRURL, "retry_in", MinPollInterval, "error", checkErr)
+	if err := s.Store.UpdateState(ctx, reg.PRURL, reg.ReviewCount, reg.CIBucket, reg.Unresolved, reg.LatestReviewState, reg.Title, reg.Description, time.Now().Add(MinPollInterval)); err != nil {
+		s.log().Error("back off failed check", "pr_url", reg.PRURL, "error", err)
+	}
+}
+
+// finish is the shared tail every successful check (single or batched)
+// runs: diff against the last-seen state, send any resulting events
+// best-effort, then either mark a terminal PR resolved or persist the new
+// state and next due time.
+func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, result provider.CheckResult, interval time.Duration) {
+	prev := provider.PrevState{ReviewCount: reg.ReviewCount, CIBucket: reg.CIBucket, Unresolved: reg.Unresolved}
 
 	// Best-effort only: a session whose Sender can never deliver (e.g. an
 	// ACP-mode AoE session, which has no tmux pane for `aoe send` to write
