@@ -72,11 +72,11 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
-		db.Close()
+		_ = db.Close() // best-effort cleanup; the schema error is what we report
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
 	if err := migrateAddedColumns(db); err != nil {
-		db.Close()
+		_ = db.Close() // best-effort cleanup; the migration error is what we report
 		return nil, fmt.Errorf("migrate schema: %w", err)
 	}
 	return &Store{db: db}, nil
