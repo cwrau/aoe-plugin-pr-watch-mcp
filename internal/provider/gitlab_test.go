@@ -54,7 +54,7 @@ func fakeGitLabServer(t *testing.T, mrState, pipelineStatus string, approvals, u
 	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
 		setRateHeaders(w)
 		var discussions []map[string]any
-		for i := 0; i < unresolved; i++ {
+		for range unresolved {
 			discussions = append(discussions, map[string]any{
 				"notes": []map[string]any{{"resolvable": true, "resolved": false}},
 			})
