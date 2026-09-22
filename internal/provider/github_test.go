@@ -28,7 +28,11 @@ func TestParseGitHubPRURLRejectsNonPR(t *testing.T) {
 
 // fakeGitHubServer serves a GraphQL response for POST /graphql and a REST
 // actions/runs response for GET .../actions/runs, with configurable
-// rate-limit signal on each.
+// rate-limit signal on each. graphqlBody is returned verbatim, so callers
+// write it in the batch shape buildGitHubBatchQuery produces for their
+// input — for a single URL that's always aliased "repo0"/"pr0"
+// (buildGitHubBatchQuery aliases the first-seen repo/PR that way
+// deterministically), which every single-PR test here relies on.
 func fakeGitHubServer(t *testing.T, graphqlBody string, actionRequiredCount int) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -55,7 +59,7 @@ func fakeGitHubServer(t *testing.T, graphqlBody string, actionRequiredCount int)
 
 const graphqlOpenSuccessBody = `{
   "data": {
-    "repository": { "pullRequest": {
+    "repo0": { "pr0": {
       "state": "OPEN",
       "title": "Fix the thing",
       "body": "This fixes the thing by doing the other thing.",
@@ -73,20 +77,25 @@ func TestGitHubCheckerOpenSuccess(t *testing.T) {
 	defer srv.Close()
 
 	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
-	result, budgets, err := c.Check(t.Context(), "https://github.com/o/r/pull/1")
+	url := "https://github.com/o/r/pull/1"
+	results, budgets, err := c.CheckBatch(t.Context(), []string{url})
 	if err != nil {
-		t.Fatalf("Check() error = %v", err)
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	result, ok := results[url]
+	if !ok {
+		t.Fatalf("CheckBatch() results = %+v, want an entry for %q", results, url)
 	}
 	if result.State != "open" || result.Title != "Fix the thing" || result.Description != "This fixes the thing by doing the other thing." || result.ReviewCount != 2 || result.LatestReviewer != "alice" || result.LatestReviewState != "APPROVED" || result.CIBucket != "success" {
-		t.Errorf("Check() result = %+v", result)
+		t.Errorf("CheckBatch() result = %+v", result)
 	}
 	if budgets.GraphQL.Remaining != 4998 || budgets.REST.Remaining != 4999 {
-		t.Errorf("Check() budgets = %+v", budgets)
+		t.Errorf("CheckBatch() budgets = %+v", budgets)
 	}
 }
 
 const graphqlMergedBody = `{
-  "data": { "repository": { "pullRequest": { "state": "MERGED", "headRefOid": "x", "reviewCount": {"totalCount":0}, "latestReview": {"nodes":[]}, "commits": {"nodes":[]} } } },
+  "data": { "repo0": { "pr0": { "state": "MERGED", "headRefOid": "x", "reviewCount": {"totalCount":0}, "latestReview": {"nodes":[]}, "commits": {"nodes":[]} } } },
   "rateLimit": { "limit": 5000, "remaining": 4997, "resetAt": "2026-09-20T23:00:00Z" }
 }`
 
@@ -95,17 +104,18 @@ func TestGitHubCheckerMerged(t *testing.T) {
 	defer srv.Close()
 
 	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
-	result, _, err := c.Check(t.Context(), "https://github.com/o/r/pull/1")
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
 	if err != nil {
-		t.Fatalf("Check() error = %v", err)
+		t.Fatalf("CheckBatch() error = %v", err)
 	}
-	if result.State != "merged" {
-		t.Errorf("Check().State = %q, want merged", result.State)
+	if results[url].State != "merged" {
+		t.Errorf("CheckBatch() result.State = %q, want merged", results[url].State)
 	}
 }
 
 const graphqlPendingRollupBody = `{
-  "data": { "repository": { "pullRequest": {
+  "data": { "repo0": { "pr0": {
     "state": "OPEN", "headRefOid": "deadbeef",
     "reviewCount": {"totalCount":0}, "latestReview": {"nodes":[]},
     "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "PENDING" } } }] }
@@ -118,12 +128,13 @@ func TestGitHubCheckerActionRequiredOverridesPending(t *testing.T) {
 	defer srv.Close()
 
 	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
-	result, _, err := c.Check(t.Context(), "https://github.com/o/r/pull/1")
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
 	if err != nil {
-		t.Fatalf("Check() error = %v", err)
+		t.Fatalf("CheckBatch() error = %v", err)
 	}
-	if result.CIBucket != "action_required" {
-		t.Errorf("Check().CIBucket = %q, want action_required (a stuck approval-gated run must override a plain pending rollup)", result.CIBucket)
+	if results[url].CIBucket != "action_required" {
+		t.Errorf("CheckBatch() result.CIBucket = %q, want action_required (a stuck approval-gated run must override a plain pending rollup)", results[url].CIBucket)
 	}
 }
 
@@ -133,12 +144,13 @@ func TestGitHubCheckerActionRequiredDoesNotOverrideFailure(t *testing.T) {
 	defer srv.Close()
 
 	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
-	result, _, err := c.Check(t.Context(), "https://github.com/o/r/pull/1")
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
 	if err != nil {
-		t.Fatalf("Check() error = %v", err)
+		t.Fatalf("CheckBatch() error = %v", err)
 	}
-	if result.CIBucket != "failure" {
-		t.Errorf("Check().CIBucket = %q, want failure (a real failure must win over action_required)", result.CIBucket)
+	if results[url].CIBucket != "failure" {
+		t.Errorf("CheckBatch() result.CIBucket = %q, want failure (a real failure must win over action_required)", results[url].CIBucket)
 	}
 }
 
@@ -150,9 +162,9 @@ func TestGitHubCheckerErrorsOnNon2xxGraphQLStatus(t *testing.T) {
 	defer srv.Close()
 
 	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "bad-token", BaseURL: srv.URL}
-	result, _, err := c.Check(t.Context(), "https://github.com/o/r/pull/1")
+	results, _, err := c.CheckBatch(t.Context(), []string{"https://github.com/o/r/pull/1"})
 	if err == nil {
-		t.Fatalf("Check() with a 401 graphql response, want error, got result = %+v", result)
+		t.Fatalf("CheckBatch() with a 401 graphql response, want error, got results = %+v", results)
 	}
 }
 
@@ -170,9 +182,9 @@ func TestGitHubCheckerErrorsOnNon2xxActionsRunsStatus(t *testing.T) {
 	defer srv.Close()
 
 	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
-	result, _, err := c.Check(t.Context(), "https://github.com/o/r/pull/1")
+	results, _, err := c.CheckBatch(t.Context(), []string{"https://github.com/o/r/pull/1"})
 	if err == nil {
-		t.Fatalf("Check() with a 500 actions/runs response, want error, got result = %+v", result)
+		t.Fatalf("CheckBatch() with a 500 actions/runs response, want error, got results = %+v", results)
 	}
 }
 
@@ -186,49 +198,55 @@ func TestGitHubCheckerRespectsContextTimeout(t *testing.T) {
 	defer cancel()
 
 	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
-	if _, _, err := c.Check(ctx, "https://github.com/o/r/pull/1"); err == nil {
-		t.Error("Check() with an expired context, want error")
+	if _, _, err := c.CheckBatch(ctx, []string{"https://github.com/o/r/pull/1"}); err == nil {
+		t.Error("CheckBatch() with an expired context, want error")
 	}
 }
 
 // GitHub answers GraphQL-level failures (rate limiting, NOT_FOUND, field
 // errors) with HTTP 200 and a body-level `errors` array. Such a response
-// must be a hard error: decoded as data it becomes a zero-value "open PR,
-// no reviews, no CI" that gets persisted as PrevState and makes the next
-// successful poll re-fire every event as if it were new.
+// must fail the whole batch: there's no per-PR data to attribute it to
+// without parsing the error's `path`, which CheckBatch deliberately
+// doesn't do.
 func TestGitHubCheckerRejectsGraphQLErrors(t *testing.T) {
 	const body = `{
-	  "data": { "repository": null },
+	  "data": {},
 	  "errors": [{ "message": "API rate limit exceeded" }]
 	}`
 	srv := fakeGitHubServer(t, body, 0)
 	defer srv.Close()
 
 	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
-	result, _, err := c.Check(t.Context(), "https://github.com/o/r/pull/1")
+	results, _, err := c.CheckBatch(t.Context(), []string{"https://github.com/o/r/pull/1"})
 	if err == nil {
-		t.Fatalf("Check() on a GraphQL errors response, want error, got result = %+v", result)
+		t.Fatalf("CheckBatch() on a GraphQL errors response, want error, got results = %+v", results)
 	}
 	if !strings.Contains(err.Error(), "API rate limit exceeded") {
-		t.Errorf("Check() error = %v, want it to carry the GraphQL error message", err)
+		t.Errorf("CheckBatch() error = %v, want it to carry the GraphQL error message", err)
 	}
 }
 
 // A null pullRequest (e.g. the PR number doesn't exist) arrives without any
-// `errors` array at all, so it needs its own guard: mapGitHubState("")
-// would otherwise report it as an open PR.
-func TestGitHubCheckerRejectsNullPullRequest(t *testing.T) {
+// top-level `errors` array — since this is scoped to one PR within a
+// batch, not a whole-request failure, CheckBatch itself must still
+// succeed; the affected URL is simply omitted from the results map for the
+// caller to treat as its own per-registration failure.
+func TestGitHubCheckerOmitsNullPullRequestFromResults(t *testing.T) {
 	const body = `{
-	  "data": { "repository": { "pullRequest": null } },
+	  "data": { "repo0": { "pr0": null } },
 	  "rateLimit": { "limit": 5000, "remaining": 4999, "resetAt": "2026-09-20T23:00:00Z" }
 	}`
 	srv := fakeGitHubServer(t, body, 0)
 	defer srv.Close()
 
 	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
-	result, _, err := c.Check(t.Context(), "https://github.com/o/r/pull/1")
-	if err == nil {
-		t.Fatalf("Check() on a null pullRequest, want error, got result = %+v", result)
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v, want a null pullRequest to be a soft per-URL miss, not a batch error", err)
+	}
+	if _, ok := results[url]; ok {
+		t.Errorf("results[%q] present, want it omitted for a null pullRequest", url)
 	}
 }
 
@@ -250,8 +268,8 @@ func TestGitHubCheckerActionRequiredQueryIsEscapedAndPaginated(t *testing.T) {
 	defer srv.Close()
 
 	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
-	if _, _, err := c.Check(t.Context(), "https://github.com/o/r/pull/1"); err != nil {
-		t.Fatalf("Check() error = %v", err)
+	if _, _, err := c.CheckBatch(t.Context(), []string{"https://github.com/o/r/pull/1"}); err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
 	}
 	if gotPath != "/repos/o/r/actions/runs" {
 		t.Errorf("actions/runs path = %q, want /repos/o/r/actions/runs", gotPath)
@@ -261,5 +279,68 @@ func TestGitHubCheckerActionRequiredQueryIsEscapedAndPaginated(t *testing.T) {
 	}
 	if !strings.Contains(gotQuery, "head_sha=deadbeef") {
 		t.Errorf("actions/runs query = %q, want head_sha=deadbeef", gotQuery)
+	}
+}
+
+// TestGitHubCheckerBatchesMultiplePRsIntoOneGraphQLRequest is the actual
+// point of CheckBatch: N due PRs — including two sharing one repo — must
+// resolve in exactly one GraphQL round trip, not N.
+func TestGitHubCheckerBatchesMultiplePRsIntoOneGraphQLRequest(t *testing.T) {
+	// buildGitHubBatchQuery aliases repos/PRs in first-seen order, so for
+	// this input: repo0 = o/r (pr0 = #1, pr1 = #2), repo1 = x/y (pr0 = #5).
+	const batchBody = `{
+	  "data": {
+	    "repo0": {
+	      "pr0": { "state": "OPEN", "title": "PR one", "headRefOid": "sha1", "reviewCount": {"totalCount":0}, "latestReview": {"nodes":[]}, "commits": {"nodes":[]} },
+	      "pr1": { "state": "OPEN", "title": "PR two", "headRefOid": "sha2", "reviewCount": {"totalCount":0}, "latestReview": {"nodes":[]}, "commits": {"nodes":[]} }
+	    },
+	    "repo1": {
+	      "pr0": { "state": "OPEN", "title": "PR five", "headRefOid": "sha5", "reviewCount": {"totalCount":0}, "latestReview": {"nodes":[]}, "commits": {"nodes":[]} }
+	    }
+	  },
+	  "rateLimit": { "limit": 5000, "remaining": 4995, "resetAt": "2026-09-20T23:00:00Z" }
+	}`
+
+	var graphqlCalls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		graphqlCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(batchBody))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]any{}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	urls := []string{
+		"https://github.com/o/r/pull/1",
+		"https://github.com/o/r/pull/2",
+		"https://github.com/x/y/pull/5",
+	}
+	results, _, err := c.CheckBatch(t.Context(), urls)
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+
+	if graphqlCalls != 1 {
+		t.Errorf("graphql requests = %d, want 1 (one batched call for all 3 PRs)", graphqlCalls)
+	}
+	want := map[string]string{
+		"https://github.com/o/r/pull/1": "PR one",
+		"https://github.com/o/r/pull/2": "PR two",
+		"https://github.com/x/y/pull/5": "PR five",
+	}
+	for url, wantTitle := range want {
+		got, ok := results[url]
+		if !ok {
+			t.Errorf("results[%q] missing", url)
+			continue
+		}
+		if got.Title != wantTitle {
+			t.Errorf("results[%q].Title = %q, want %q", url, got.Title, wantTitle)
+		}
 	}
 }
