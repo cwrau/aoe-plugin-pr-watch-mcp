@@ -254,6 +254,109 @@ func TestTickUsesRealActiveCountsNotPlaceholder(t *testing.T) {
 	}
 }
 
+// TestTickSkipsCheckWhenGitHubPoolAlreadyKnownExhausted: reg1 (processed
+// first, earlier NextDueAt) reveals via its real check that the GraphQL
+// pool has no headroom left. reg2, due in the same tick and sharing that
+// same pool, must skip its own real check entirely rather than spend (or
+// fail) a call to rediscover what reg1's result already told the
+// scheduler.
+func TestTickSkipsCheckWhenGitHubPoolAlreadyKnownExhausted(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+
+	reg1 := registry.Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", NextDueAt: now.Add(-2 * time.Second), CreatedAt: now}
+	reg2 := registry.Registration{PRURL: "https://github.com/o/r/pull/2", SessionID: "sess2", Provider: "github", NextDueAt: now.Add(-time.Second), CreatedAt: now}
+	for _, r := range []registry.Registration{reg1, reg2} {
+		if err := store.Add(ctx, r); err != nil {
+			t.Fatalf("Add() error = %v", err)
+		}
+	}
+
+	gh := &fakeGitHubChecker{
+		result: provider.CheckResult{State: "open", CIBucket: "success"},
+		budgets: provider.GitHubBudgets{
+			// Remaining exactly at the 10% floor: no headroom.
+			GraphQL: provider.RateBudget{Limit: 5000, Remaining: 500, ResetAt: now.Add(10 * time.Minute)},
+			REST:    provider.RateBudget{Limit: 5000, Remaining: 4999, ResetAt: now.Add(10 * time.Minute)},
+		},
+	}
+	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{}}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	if gh.calls != 1 {
+		t.Errorf("GitHub checker calls = %d, want 1 (reg2 should skip its real check once reg1's result reveals the pool is exhausted)", gh.calls)
+	}
+
+	got2 := getReg(t, store, reg2.PRURL)
+	if !got2.NextDueAt.After(now) {
+		t.Errorf("reg2 NextDueAt = %v, want it rescheduled forward even though its check was skipped", got2.NextDueAt)
+	}
+}
+
+// TestTickDoesNotSkipWhenCachedGitHubBudgetHasHeadroom: the inverse of the
+// above — a cached-but-non-exhausted budget must never cause a skip.
+func TestTickDoesNotSkipWhenCachedGitHubBudgetHasHeadroom(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+
+	reg1 := registry.Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", NextDueAt: now.Add(-2 * time.Second), CreatedAt: now}
+	reg2 := registry.Registration{PRURL: "https://github.com/o/r/pull/2", SessionID: "sess2", Provider: "github", NextDueAt: now.Add(-time.Second), CreatedAt: now}
+	for _, r := range []registry.Registration{reg1, reg2} {
+		if err := store.Add(ctx, r); err != nil {
+			t.Fatalf("Add() error = %v", err)
+		}
+	}
+
+	gh := &fakeGitHubChecker{
+		result: provider.CheckResult{State: "open", CIBucket: "success"},
+		budgets: provider.GitHubBudgets{
+			GraphQL: provider.RateBudget{Limit: 5000, Remaining: 4999, ResetAt: now.Add(time.Hour)},
+			REST:    provider.RateBudget{Limit: 5000, Remaining: 4999, ResetAt: now.Add(time.Hour)},
+		},
+	}
+	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{}}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	if gh.calls != 2 {
+		t.Errorf("GitHub checker calls = %d, want 2 (plenty of headroom, neither registration should be skipped)", gh.calls)
+	}
+}
+
+// TestTickSkipsCheckWhenGitLabHostPoolAlreadyKnownExhausted mirrors the
+// GitHub case for GitLab's per-host cache.
+func TestTickSkipsCheckWhenGitLabHostPoolAlreadyKnownExhausted(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+
+	reg1 := registry.Registration{PRURL: "https://gitlab.corp.example/team/project/-/merge_requests/1", SessionID: "sess1", Provider: "gitlab", NextDueAt: now.Add(-2 * time.Second), CreatedAt: now}
+	reg2 := registry.Registration{PRURL: "https://gitlab.corp.example/team/project/-/merge_requests/2", SessionID: "sess2", Provider: "gitlab", NextDueAt: now.Add(-time.Second), CreatedAt: now}
+	for _, r := range []registry.Registration{reg1, reg2} {
+		if err := store.Add(ctx, r); err != nil {
+			t.Fatalf("Add() error = %v", err)
+		}
+	}
+
+	gl := &fakeGitLabChecker{
+		result: provider.CheckResult{State: "open", CIBucket: "success"},
+		budget: provider.RateBudget{Limit: 2000, Remaining: 200, ResetAt: now.Add(10 * time.Minute)},
+	}
+	sched := &Scheduler{Store: store, GitLab: gl, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{}}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	if gl.calls != 1 {
+		t.Errorf("GitLab checker calls = %d, want 1 (reg2 should skip its real check once reg1's result reveals the host pool is exhausted)", gl.calls)
+	}
+}
+
 // getReg fetches the single registration the test registered, failing the
 // test if it's gone.
 func getReg(t *testing.T, store *registry.Store, prURL string) registry.Registration {

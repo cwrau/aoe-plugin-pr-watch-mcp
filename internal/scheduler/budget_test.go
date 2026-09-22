@@ -110,3 +110,33 @@ func TestComputeIntervalReservedRateFloorDominatesSmallPool(t *testing.T) {
 		t.Errorf("ComputeInterval() = %v, want >= the time until reset (%v): the rate-based floor should leave no usable headroom here", got, 30*time.Minute)
 	}
 }
+
+func TestHasHeadroomTrueWithNoSignalYet(t *testing.T) {
+	if !HasHeadroom(provider.RateBudget{}, time.Now()) {
+		t.Error("HasHeadroom(zero budget) = false, want true (nothing stale to distrust, only a real call can tell us)")
+	}
+}
+
+func TestHasHeadroomTrueOnceWindowElapsed(t *testing.T) {
+	now := time.Now()
+	budget := provider.RateBudget{Limit: 5000, Remaining: 100, ResetAt: now.Add(-time.Minute)}
+	if !HasHeadroom(budget, now) {
+		t.Error("HasHeadroom(elapsed window) = false, want true: a stale reading past its own reset must not block a fresh call")
+	}
+}
+
+func TestHasHeadroomFalseWhenReservedFloorExhausted(t *testing.T) {
+	now := time.Now()
+	budget := provider.RateBudget{Limit: 5000, Remaining: 500, ResetAt: now.Add(10 * time.Minute)}
+	if HasHeadroom(budget, now) {
+		t.Error("HasHeadroom() = true, want false: Remaining is already at the reserved floor")
+	}
+}
+
+func TestHasHeadroomTrueAboveReservedFloor(t *testing.T) {
+	now := time.Now()
+	budget := provider.RateBudget{Limit: 5000, Remaining: 4000, ResetAt: now.Add(10 * time.Minute)}
+	if !HasHeadroom(budget, now) {
+		t.Error("HasHeadroom() = false, want true: well above the reserved floor")
+	}
+}
