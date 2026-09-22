@@ -184,6 +184,23 @@ func (s *Store) SetStatusOwnedBy(ctx context.Context, prURL, sessionID, status s
 	return affected > 0, nil
 }
 
+// StopOtherMerged moves every StatusMerged registration owned by sessionID
+// to StatusStopped, except keepPRURL (the registration just (re-)registered,
+// so a re-register of an already-merged PR/MR doesn't immediately stop
+// itself). Called from the register handler so a session that moves on to a
+// new PR/MR doesn't keep an old merged badge cluttering its row/pane
+// forever — the old registration is never deleted, just excluded from
+// display the same way an explicit unregister excludes it.
+func (s *Store) StopOtherMerged(ctx context.Context, sessionID, keepPRURL string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE registrations SET status = ? WHERE session_id = ? AND status = ? AND pr_url != ?`,
+		StatusStopped, sessionID, StatusMerged, keepPRURL)
+	if err != nil {
+		return fmt.Errorf("stop other merged registrations: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) List(ctx context.Context) ([]Registration, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT pr_url, session_id, provider, review_count, ci_bucket, unresolved, latest_review_state, title, description, status, next_due_at, archived, created_at FROM registrations ORDER BY next_due_at ASC`)
 	if err != nil {

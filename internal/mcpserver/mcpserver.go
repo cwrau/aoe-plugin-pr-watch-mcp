@@ -100,6 +100,12 @@ func NewHandler(store *registry.Store) http.Handler {
 			if err := store.Add(ctx, reg); err != nil {
 				return nil, registerOutput{}, err
 			}
+			// Best-effort: a session that moves on to a new PR/MR shouldn't
+			// keep an old merged badge cluttering its row/pane forever. This
+			// registration already succeeded above, so a failure here
+			// doesn't fail the call — it just leaves the old badge to be
+			// cleaned up on a later register instead.
+			_ = store.StopOtherMerged(ctx, in.SessionID, in.PRURL)
 			return nil, registerOutput{Registered: true}, nil
 		})
 
