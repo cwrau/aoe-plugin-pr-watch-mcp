@@ -147,7 +147,20 @@ func TestUpdateState(t *testing.T) {
 	}
 
 	newDue := now.Add(5 * time.Minute)
-	if err := s.UpdateState(ctx, reg.PRURL, 3, "failure", 2, "CHANGES_REQUESTED", "Fix the thing", "Fixes the widget rendering bug.", newDue); err != nil {
+	reviewAt := now.Add(-time.Hour)
+	update := StateUpdate{
+		ReviewCount:       3,
+		CIBucket:          "failure",
+		CIDetail:          "build",
+		Unresolved:        2,
+		LatestReviewState: "CHANGES_REQUESTED",
+		LatestReviewer:    "bob",
+		LatestReviewAt:    reviewAt,
+		Title:             "Fix the thing",
+		Description:       "Fixes the widget rendering bug.",
+		NextDueAt:         newDue,
+	}
+	if err := s.UpdateState(ctx, reg.PRURL, update); err != nil {
 		t.Fatalf("UpdateState() error = %v", err)
 	}
 
@@ -159,7 +172,7 @@ func TestUpdateState(t *testing.T) {
 		t.Fatalf("List() len = %d, want 1", len(got))
 	}
 	r := got[0]
-	if r.ReviewCount != 3 || r.CIBucket != "failure" || r.Unresolved != 2 || r.LatestReviewState != "CHANGES_REQUESTED" || r.Title != "Fix the thing" || r.Description != "Fixes the widget rendering bug." || !r.NextDueAt.Equal(newDue) {
+	if r.ReviewCount != 3 || r.CIBucket != "failure" || r.CIDetail != "build" || r.Unresolved != 2 || r.LatestReviewState != "CHANGES_REQUESTED" || r.LatestReviewer != "bob" || !r.LatestReviewAt.Equal(reviewAt) || r.Title != "Fix the thing" || r.Description != "Fixes the widget rendering bug." || !r.NextDueAt.Equal(newDue) {
 		t.Errorf("after UpdateState, got %+v", r)
 	}
 }
@@ -183,6 +196,29 @@ func TestSetStatus(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Status != StatusClosed {
 		t.Errorf("List() = %+v, want status %q (the row must survive, not be deleted)", got, StatusClosed)
+	}
+}
+
+func TestSetMerged(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now()
+	reg := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "a", Provider: "github", NextDueAt: now, CreatedAt: now}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+
+	mergedAt := now.Truncate(time.Second)
+	if err := s.SetMerged(ctx, reg.PRURL, mergedAt); err != nil {
+		t.Fatalf("SetMerged() error = %v", err)
+	}
+
+	got, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(got) != 1 || got[0].Status != StatusMerged || !got[0].MergedAt.Equal(mergedAt) {
+		t.Errorf("List() = %+v, want status %q and MergedAt %v", got, StatusMerged, mergedAt)
 	}
 }
 

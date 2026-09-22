@@ -61,6 +61,14 @@ func fakeGitLabServer(t *testing.T, mrState, pipelineStatus string, approvals, u
 		}
 		_ = json.NewEncoder(w).Encode(discussions)
 	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/notes", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/pipelines/", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
 	return httptest.NewServer(mux)
 }
 
@@ -194,6 +202,154 @@ func TestGitLabCheckerNoTokenForHostMakesNoRequest(t *testing.T) {
 	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
 	if err == nil {
 		t.Fatalf("Check() error = nil, want error when no token is configured for the host; result = %+v", result)
+	}
+}
+
+// TestGitLabCheckerLatestReviewerAndTimestamp verifies the reviewer name and
+// approval timestamp are sourced from the system note GitLab writes on
+// approval, not from /approvals (which has no per-approval timestamp).
+func TestGitLabCheckerLatestReviewerAndTimestamp(t *testing.T) {
+	mux := http.NewServeMux()
+	setRateHeaders := func(w http.ResponseWriter) {
+		w.Header().Set("RateLimit-Limit", "2000")
+		w.Header().Set("RateLimit-Remaining", "1999")
+		w.Header().Set("RateLimit-Reset", "9999999999")
+	}
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"state": "opened", "pipeline": nil, "head_pipeline": nil})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": []map[string]any{{}}})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/notes", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"system": true, "body": "approved this merge request", "created_at": "2026-09-20T12:00:00Z", "author": map[string]any{"username": "alice"}},
+		})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if result.LatestReviewer != "alice" || result.LatestReviewState != "APPROVED" || result.LatestReviewAt.IsZero() {
+		t.Errorf("Check() result = %+v, want reviewer alice, state APPROVED, non-zero LatestReviewAt", result)
+	}
+}
+
+// TestGitLabCheckerNoNotesFetchWithoutApprovals verifies the /notes call is
+// skipped entirely when nobody has approved yet — no point paying for a
+// fourth request to learn a reviewer that can't exist.
+func TestGitLabCheckerNoNotesFetchWithoutApprovals(t *testing.T) {
+	mux := http.NewServeMux()
+	setRateHeaders := func(w http.ResponseWriter) {
+		w.Header().Set("RateLimit-Limit", "2000")
+		w.Header().Set("RateLimit-Remaining", "1999")
+		w.Header().Set("RateLimit-Reset", "9999999999")
+	}
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"state": "opened", "pipeline": nil, "head_pipeline": nil})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": []map[string]any{}})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	var notesHit bool
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/notes", func(w http.ResponseWriter, r *http.Request) {
+		notesHit = true
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	if _, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17"); err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if notesHit {
+		t.Error("Check() hit /notes with zero approvals, want it skipped")
+	}
+}
+
+// TestGitLabCheckerFailingJobName verifies CIDetail is populated from
+// /pipelines/:id/jobs when the pipeline bucket is a failure.
+func TestGitLabCheckerFailingJobName(t *testing.T) {
+	mux := http.NewServeMux()
+	setRateHeaders := func(w http.ResponseWriter) {
+		w.Header().Set("RateLimit-Limit", "2000")
+		w.Header().Set("RateLimit-Remaining", "1999")
+		w.Header().Set("RateLimit-Reset", "9999999999")
+	}
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"state":         "opened",
+			"pipeline":      map[string]any{"id": 99, "status": "failed"},
+			"head_pipeline": nil,
+		})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/pipelines/99/jobs", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		if got := r.URL.Query().Get("scope[]"); got != "failed" {
+			t.Errorf("jobs query scope[] = %q, want failed", got)
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"name": "test:unit"}})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": []map[string]any{}})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if result.CIBucket != "failure" || result.CIDetail != "test:unit" {
+		t.Errorf("Check() result = %+v, want CIBucket failure, CIDetail test:unit", result)
+	}
+}
+
+// TestGitLabCheckerMergedAt verifies merged_at from the MR-details response
+// is surfaced on a merged result.
+func TestGitLabCheckerMergedAt(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("RateLimit-Limit", "2000")
+		w.Header().Set("RateLimit-Remaining", "1999")
+		w.Header().Set("RateLimit-Reset", "9999999999")
+		_ = json.NewEncoder(w).Encode(map[string]any{"state": "merged", "merged_at": "2026-09-21T08:30:00Z"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if result.MergedAt.IsZero() {
+		t.Error("Check() result.MergedAt is zero, want the parsed merged_at")
 	}
 }
 

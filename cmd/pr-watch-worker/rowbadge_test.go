@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
 )
@@ -61,6 +62,47 @@ func TestBuildRowBadgePayloadsChipFields(t *testing.T) {
 	}
 	if !strings.Contains(review.Tooltip, "review CHANGES_REQUESTED") {
 		t.Errorf("review.Tooltip = %q, want it to mention the review state", review.Tooltip)
+	}
+}
+
+func TestBuildRowBadgePayloadsReviewTooltipIncludesReviewerAndTimestamp(t *testing.T) {
+	at := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", LatestReviewState: "APPROVED", LatestReviewer: "alice", LatestReviewAt: at},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	review := got["sess1"].Items[2]
+
+	if !strings.Contains(review.Tooltip, "alice") || !strings.Contains(review.Tooltip, "2026-09-20 12:00") {
+		t.Errorf("review.Tooltip = %q, want it to include reviewer alice and the timestamp", review.Tooltip)
+	}
+}
+
+func TestBuildRowBadgePayloadsCITooltipIncludesDetail(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", CIBucket: "failure", CIDetail: "build"},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	ci := got["sess1"].Items[1]
+
+	if !strings.Contains(ci.Tooltip, "build") {
+		t.Errorf("ci.Tooltip = %q, want it to include the failing check name", ci.Tooltip)
+	}
+}
+
+func TestBuildRowBadgePayloadsMergedTooltipIncludesTimestamp(t *testing.T) {
+	at := time.Date(2026, 9, 21, 8, 30, 0, 0, time.UTC)
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", Status: registry.StatusMerged, MergedAt: at},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	chip := got["sess1"].Items[0]
+
+	if !strings.Contains(chip.Tooltip, "2026-09-21 08:30") {
+		t.Errorf("chip.Tooltip = %q, want it to include the merge timestamp", chip.Tooltip)
 	}
 }
 

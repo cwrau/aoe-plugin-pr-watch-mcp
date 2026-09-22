@@ -95,7 +95,7 @@ func TestGitHubCheckerOpenSuccess(t *testing.T) {
 }
 
 const graphqlMergedBody = `{
-  "data": { "repo0": { "pr0": { "state": "MERGED", "headRefOid": "x", "reviewCount": {"totalCount":0}, "latestReview": {"nodes":[]}, "commits": {"nodes":[]} } } },
+  "data": { "repo0": { "pr0": { "state": "MERGED", "headRefOid": "x", "mergedAt": "2026-09-21T08:30:00Z", "reviewCount": {"totalCount":0}, "latestReview": {"nodes":[]}, "commits": {"nodes":[]} } } },
   "rateLimit": { "limit": 5000, "remaining": 4997, "resetAt": "2026-09-20T23:00:00Z" }
 }`
 
@@ -111,6 +111,59 @@ func TestGitHubCheckerMerged(t *testing.T) {
 	}
 	if results[url].State != "merged" {
 		t.Errorf("CheckBatch() result.State = %q, want merged", results[url].State)
+	}
+	if results[url].MergedAt.IsZero() {
+		t.Error("CheckBatch() result.MergedAt is zero, want the parsed mergedAt")
+	}
+}
+
+func TestGitHubCheckerReviewTimestamp(t *testing.T) {
+	body := strings.Replace(graphqlOpenSuccessBody,
+		`"author": { "login": "alice" }, "state": "APPROVED"`,
+		`"author": { "login": "alice" }, "state": "APPROVED", "submittedAt": "2026-09-20T12:00:00Z"`,
+		1)
+	srv := fakeGitHubServer(t, body, 0)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	if results[url].LatestReviewAt.IsZero() {
+		t.Error("CheckBatch() result.LatestReviewAt is zero, want the parsed submittedAt")
+	}
+}
+
+func TestGitHubCheckerCIDetailFromFailingRun(t *testing.T) {
+	body := strings.Replace(graphqlPendingRollupBody, `"state": "PENDING"`, `"state": "FAILURE"`, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	})
+	mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "4999")
+		w.Header().Set("X-RateLimit-Reset", "9999999999")
+		runs := map[string]any{"workflow_runs": []map[string]any{
+			{"name": "test", "conclusion": "success"},
+			{"name": "build", "conclusion": "failure"},
+		}}
+		_ = json.NewEncoder(w).Encode(runs)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	if results[url].CIBucket != "failure" || results[url].CIDetail != "build" {
+		t.Errorf("CheckBatch() result = %+v, want CIBucket failure, CIDetail build", results[url])
 	}
 }
 

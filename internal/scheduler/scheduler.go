@@ -125,7 +125,7 @@ func (s *Scheduler) preflight(ctx context.Context, reg registry.Registration, no
 		// Skip the send, but still push next_due_at out using the fallback
 		// interval so an archived registration doesn't spin the due-heap
 		// every tick while archived.
-		if err := s.Store.UpdateState(ctx, reg.PRURL, reg.ReviewCount, reg.CIBucket, reg.Unresolved, reg.LatestReviewState, reg.Title, reg.Description, now.Add(FallbackInterval)); err != nil {
+		if err := s.Store.UpdateState(ctx, reg.PRURL, stateUpdateFromReg(reg, now.Add(FallbackInterval))); err != nil {
 			s.log().Error("reschedule archived registration", "pr_url", reg.PRURL, "error", err)
 		}
 		return false
@@ -141,7 +141,7 @@ func (s *Scheduler) preflight(ctx context.Context, reg registry.Registration, no
 		// hitting the network.
 		wait := max(resumeAt.Sub(now), FallbackInterval)
 		s.log().Debug("skipping check, cached pool budget already exhausted", "pr_url", reg.PRURL, "resume_at", resumeAt)
-		if err := s.Store.UpdateState(ctx, reg.PRURL, reg.ReviewCount, reg.CIBucket, reg.Unresolved, reg.LatestReviewState, reg.Title, reg.Description, now.Add(wait)); err != nil {
+		if err := s.Store.UpdateState(ctx, reg.PRURL, stateUpdateFromReg(reg, now.Add(wait))); err != nil {
 			s.log().Error("reschedule budget-exhausted registration", "pr_url", reg.PRURL, "error", err)
 		}
 		return false
@@ -220,8 +220,27 @@ func (s *Scheduler) processGitLabOne(ctx context.Context, reg registry.Registrat
 // still diffs against the real last-seen state.
 func (s *Scheduler) finishError(ctx context.Context, reg registry.Registration, checkErr error) {
 	s.log().Warn("check failed, retrying after the poll floor", "pr_url", reg.PRURL, "retry_in", MinPollInterval, "error", checkErr)
-	if err := s.Store.UpdateState(ctx, reg.PRURL, reg.ReviewCount, reg.CIBucket, reg.Unresolved, reg.LatestReviewState, reg.Title, reg.Description, time.Now().Add(MinPollInterval)); err != nil {
+	if err := s.Store.UpdateState(ctx, reg.PRURL, stateUpdateFromReg(reg, time.Now().Add(MinPollInterval))); err != nil {
 		s.log().Error("back off failed check", "pr_url", reg.PRURL, "error", err)
+	}
+}
+
+// stateUpdateFromReg builds a registry.StateUpdate carrying reg's own
+// already-persisted fields unchanged, for the reschedule-only paths
+// (archived, budget-exhausted, failed check) that push next_due_at out
+// without learning anything new from a real check.
+func stateUpdateFromReg(reg registry.Registration, nextDueAt time.Time) registry.StateUpdate {
+	return registry.StateUpdate{
+		ReviewCount:       reg.ReviewCount,
+		CIBucket:          reg.CIBucket,
+		CIDetail:          reg.CIDetail,
+		Unresolved:        reg.Unresolved,
+		LatestReviewState: reg.LatestReviewState,
+		LatestReviewer:    reg.LatestReviewer,
+		LatestReviewAt:    reg.LatestReviewAt,
+		Title:             reg.Title,
+		Description:       reg.Description,
+		NextDueAt:         nextDueAt,
 	}
 }
 
@@ -249,14 +268,32 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 		}
 	}
 
-	if result.State == registry.StatusMerged || result.State == registry.StatusClosed {
+	if result.State == registry.StatusMerged {
+		if err := s.Store.SetMerged(ctx, reg.PRURL, result.MergedAt); err != nil {
+			s.log().Error("mark merged registration", "pr_url", reg.PRURL, "error", err)
+		}
+		return
+	}
+	if result.State == registry.StatusClosed {
 		if err := s.Store.SetStatus(ctx, reg.PRURL, result.State); err != nil {
 			s.log().Error("mark resolved registration", "pr_url", reg.PRURL, "error", err)
 		}
 		return
 	}
 
-	if err := s.Store.UpdateState(ctx, reg.PRURL, result.ReviewCount, result.CIBucket, result.Unresolved, result.LatestReviewState, result.Title, result.Description, time.Now().Add(interval)); err != nil {
+	update := registry.StateUpdate{
+		ReviewCount:       result.ReviewCount,
+		CIBucket:          result.CIBucket,
+		CIDetail:          result.CIDetail,
+		Unresolved:        result.Unresolved,
+		LatestReviewState: result.LatestReviewState,
+		LatestReviewer:    result.LatestReviewer,
+		LatestReviewAt:    result.LatestReviewAt,
+		Title:             result.Title,
+		Description:       result.Description,
+		NextDueAt:         time.Now().Add(interval),
+	}
+	if err := s.Store.UpdateState(ctx, reg.PRURL, update); err != nil {
 		s.log().Error("persist new state", "pr_url", reg.PRURL, "error", err)
 	}
 }
