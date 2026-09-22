@@ -43,7 +43,7 @@ func fakeGitHubServer(t *testing.T, graphqlBody string, actionRequiredCount int)
 		runs := map[string]any{"workflow_runs": []map[string]any{}}
 		if actionRequiredCount > 0 {
 			runList := []map[string]any{}
-			for i := 0; i < actionRequiredCount; i++ {
+			for range actionRequiredCount {
 				runList = append(runList, map[string]any{"conclusion": "action_required"})
 			}
 			runs["workflow_runs"] = runList
