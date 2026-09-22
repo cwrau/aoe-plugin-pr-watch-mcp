@@ -60,9 +60,18 @@ func ComputeInterval(budget provider.RateBudget, activeRegistrations int, now ti
 	usable := budget.Remaining - floor
 	if usable <= 0 {
 		// No headroom left this window: don't check again until reset.
-		// But still respect the MinPollInterval floor.
-		if window < MinPollInterval {
-			return MinPollInterval
+		// MinPollInterval is deliberately NOT the floor here — it caps how
+		// fast we may check when there's normal headroom to spend, which is
+		// the opposite situation from "we just burned through the reserved
+		// floor." Falling back to it would mean the zero-budget case can
+		// retry sooner than a merely-tight-but-nonzero-budget case above,
+		// which is backwards. If reset itself is sooner than a sane
+		// fallback wait (a very short window), use FallbackInterval
+		// instead — same "no good signal to plan around" reasoning as the
+		// no-rate-limit-data case above, and it's longer than
+		// MinPollInterval by construction.
+		if window < FallbackInterval {
+			return FallbackInterval
 		}
 		return window
 	}
