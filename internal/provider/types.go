@@ -35,6 +35,7 @@ type CheckResult struct {
 type Event struct {
 	Kind    string // "REVIEW" | "COMMENT" | "CI" | "MERGED" | "CLOSED" | "MERGE_QUEUE"
 	Message string
+	Href    string // link to the source of this event (comment, review, or CI job/run); empty if none applies
 }
 
 // RateBudget is a snapshot of a rate-limited pool's remaining headroom, as

@@ -25,16 +25,18 @@ func Diff(prev PrevState, cur CheckResult) []Event {
 		events = append(events, Event{
 			Kind:    "COMMENT",
 			Message: fmt.Sprintf("%d new unresolved thread(s), %d unresolved total", len(newIDs), len(cur.UnresolvedThreadIDs)),
+			Href:    cur.ReviewHref,
 		})
 	}
 	if cur.ReviewCount > prev.ReviewCount && cur.LatestReviewer != "" {
 		events = append(events, Event{
 			Kind:    "REVIEW",
 			Message: fmt.Sprintf("%s %s", cur.LatestReviewer, cur.LatestReviewState),
+			Href:    cur.ReviewHref,
 		})
 	}
 	if cur.CIBucket != prev.CIBucket && cur.CIBucket == "failure" {
-		events = append(events, Event{Kind: "CI", Message: cur.CIBucket})
+		events = append(events, Event{Kind: "CI", Message: cur.CIBucket, Href: cur.CIHref})
 	}
 	// A merge queue entry disappearing while the PR is still open (not
 	// merged — that path short-circuited above) means it got dequeued

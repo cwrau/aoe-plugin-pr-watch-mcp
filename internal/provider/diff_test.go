@@ -29,6 +29,15 @@ func TestDiffNewUnresolvedThreadFiresComment(t *testing.T) {
 	}
 }
 
+func TestDiffCommentEventCarriesReviewHref(t *testing.T) {
+	prev := PrevState{UnresolvedThreadIDs: []string{"t1"}}
+	cur := CheckResult{State: "open", UnresolvedThreadIDs: []string{"t1", "t2"}, ReviewHref: "https://github.com/o/r/pull/1#discussion_r1"}
+	got := Diff(prev, cur)
+	if len(got) != 1 || got[0].Href != "https://github.com/o/r/pull/1#discussion_r1" {
+		t.Fatalf("Diff() = %+v, want COMMENT event carrying ReviewHref", got)
+	}
+}
+
 func TestDiffOnlyResolvedThreadsFiresNothing(t *testing.T) {
 	prev := PrevState{UnresolvedThreadIDs: []string{"t1", "t2", "t3"}}
 	cur := CheckResult{State: "open", UnresolvedThreadIDs: []string{"t1"}}
@@ -61,12 +70,30 @@ func TestDiffReviewIncreaseFiresReview(t *testing.T) {
 	}
 }
 
+func TestDiffReviewEventCarriesReviewHref(t *testing.T) {
+	prev := PrevState{ReviewCount: 1}
+	cur := CheckResult{State: "open", ReviewCount: 2, LatestReviewer: "alice", LatestReviewState: "APPROVED", ReviewHref: "https://github.com/o/r/pull/1#pullrequestreview-1"}
+	got := Diff(prev, cur)
+	if len(got) != 1 || got[0].Href != "https://github.com/o/r/pull/1#pullrequestreview-1" {
+		t.Fatalf("Diff() = %+v, want REVIEW event carrying ReviewHref", got)
+	}
+}
+
 func TestDiffCIChangeFiresCI(t *testing.T) {
 	prev := PrevState{CIBucket: "pending"}
 	cur := CheckResult{State: "open", CIBucket: "failure"}
 	got := Diff(prev, cur)
 	if len(got) != 1 || got[0].Kind != "CI" || got[0].Message != "failure" {
 		t.Fatalf("Diff() = %+v, want single CI event", got)
+	}
+}
+
+func TestDiffCIEventCarriesCIHref(t *testing.T) {
+	prev := PrevState{CIBucket: "pending"}
+	cur := CheckResult{State: "open", CIBucket: "failure", CIHref: "https://github.com/o/r/actions/runs/1"}
+	got := Diff(prev, cur)
+	if len(got) != 1 || got[0].Href != "https://github.com/o/r/actions/runs/1" {
+		t.Fatalf("Diff() = %+v, want CI event carrying CIHref", got)
 	}
 }
 
