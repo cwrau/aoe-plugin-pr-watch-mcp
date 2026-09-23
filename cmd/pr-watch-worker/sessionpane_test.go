@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/registry"
 )
 
 func TestBuildSessionPanePayloadEmptyGivesNoPane(t *testing.T) {

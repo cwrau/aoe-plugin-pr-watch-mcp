@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/registry"
 )
 
 func TestBuildRowBadgePayloadsGroupsBySession(t *testing.T) {

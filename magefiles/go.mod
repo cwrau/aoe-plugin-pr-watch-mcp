@@ -1,4 +1,4 @@
-module github.com/cwrau/aoe-pr-watch-mcp/magefiles
+module github.com/cwrau/aoe-plugin-pr-watch-mcp/magefiles
 
 go 1.27.1
 

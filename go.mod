@@ -1,4 +1,4 @@
-module github.com/cwrau/aoe-pr-watch-mcp
+module github.com/cwrau/aoe-plugin-pr-watch-mcp
 
 go 1.27.1
 

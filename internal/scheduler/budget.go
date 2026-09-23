@@ -3,7 +3,7 @@ package scheduler
 import (
 	"time"
 
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/provider"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/provider"
 )
 
 const (

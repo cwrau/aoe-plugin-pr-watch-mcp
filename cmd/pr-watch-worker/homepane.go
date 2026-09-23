@@ -5,8 +5,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/provider"
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/provider"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/registry"
 )
 
 const homePaneSlot = "home-pane"

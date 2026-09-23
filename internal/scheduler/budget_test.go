@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/provider"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/provider"
 )
 
 func TestComputeIntervalZeroBudgetUsesFallback(t *testing.T) {

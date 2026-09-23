@@ -1,6 +1,6 @@
 package main
 
-import "github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
+import "github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/registry"
 
 const sessionPaneSlot = "pane"
 const sessionPaneID = "pr_pane"

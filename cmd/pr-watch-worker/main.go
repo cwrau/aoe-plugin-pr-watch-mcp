@@ -11,12 +11,12 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/aoeclient"
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/mcpserver"
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/notifier"
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/provider"
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/scheduler"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/aoeclient"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/mcpserver"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/notifier"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/provider"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/registry"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/scheduler"
 )
 
 const (
