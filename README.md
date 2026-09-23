@@ -17,7 +17,7 @@ One always-on process does three jobs:
    rate-limit signal off every real API response (GitHub's GraphQL
    `rateLimit` field and `X-RateLimit-*` headers, GitLab's `RateLimit-*`
    headers) and spreads the remaining budget across the live registrations,
-   never planning to use more than 90% of a pool. Checks are floored at 30s
+   never planning to use more than 90% of a pool. Checks are floored at 15s
    per registration and fall back to 5 minutes when a host reports no
    rate-limit signal at all. Each poll diffs the PR/MR's current review
    count, CI bucket and unresolved-thread count against the last-seen

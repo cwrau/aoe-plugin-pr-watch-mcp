@@ -7,16 +7,21 @@ import (
 )
 
 const (
-	// MinPollInterval matches the original pr-watch bash script's fixed
-	// POLL_INTERVAL: never check a single registration faster than this,
-	// even if the budget math would allow it.
-	MinPollInterval = 5 * time.Minute
+	// MinPollInterval floors how often a single registration is checked,
+	// even if the budget math would allow faster: never check a single
+	// registration faster than this. Deliberately not tied to the original
+	// pr-watch bash script's fixed 5-minute POLL_INTERVAL any more — actual
+	// GraphQL/REST usage observed live (see budget.go's callers) showed
+	// plenty of headroom under normal batch sizes, so this stays low enough
+	// for a responsive UI while ComputeInterval's own budget math is still
+	// what backs off when a pool is actually running low.
+	MinPollInterval = 15 * time.Second
 
 	// FallbackInterval is used when there's no rate-limit signal to budget
 	// against yet: before the first real call for a pool (bootstrap), or on
 	// a GitLab host that has throttling disabled and returns no
 	// RateLimit-* headers at all.
-	FallbackInterval = 10 * time.Minute
+	FallbackInterval = 5 * time.Minute
 
 	// RateLimitFloorFrac is the reserved fraction of a pool's limit that
 	// must never be spent: usage is paced to stay at or under
