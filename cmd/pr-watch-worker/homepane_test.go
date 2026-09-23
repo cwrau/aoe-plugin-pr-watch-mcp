@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/registry"
 )
 
 func TestBuildHomePanePayloadEmpty(t *testing.T) {
@@ -30,7 +30,7 @@ func TestBuildHomePanePayloadEmpty(t *testing.T) {
 
 func githubReg(ciBucket, reviewState string) registry.Registration {
 	return registry.Registration{
-		PRURL:             "https://github.com/cwrau/aoe-pr-watch-mcp/pull/42",
+		PRURL:             "https://github.com/cwrau/aoe-plugin-pr-watch-mcp/pull/42",
 		SessionID:         "sess1",
 		Provider:          "github",
 		CIBucket:          ciBucket,

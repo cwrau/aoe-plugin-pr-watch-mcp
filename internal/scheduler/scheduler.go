@@ -6,9 +6,9 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/aoeclient"
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/provider"
-	"github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/aoeclient"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/provider"
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/registry"
 )
 
 // GitHubChecker and GitLabChecker are narrow views of provider.GitHubChecker
