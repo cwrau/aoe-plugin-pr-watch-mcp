@@ -3,8 +3,10 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 )
 
@@ -54,8 +56,9 @@ func fakeGitLabServer(t *testing.T, mrState, pipelineStatus string, approvals, u
 	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
 		setRateHeaders(w)
 		var discussions []map[string]any
-		for range unresolved {
+		for i := range unresolved {
 			discussions = append(discussions, map[string]any{
+				"id":    fmt.Sprintf("d%d", i),
 				"notes": []map[string]any{{"resolvable": true, "resolved": false}},
 			})
 		}
@@ -81,7 +84,7 @@ func TestGitLabCheckerOpenWithApprovalsAndPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Check() error = %v", err)
 	}
-	if result.State != "open" || result.Title != "Fix the thing" || result.Description != "This fixes the thing by doing the other thing." || result.ReviewCount != 2 || result.CIBucket != "success" || result.Unresolved != 1 {
+	if result.State != "open" || result.Title != "Fix the thing" || result.Description != "This fixes the thing by doing the other thing." || result.ReviewCount != 2 || result.CIBucket != "success" || !slices.Equal(result.UnresolvedThreadIDs, []string{"d0"}) || result.HasConflict {
 		t.Errorf("Check() result = %+v", result)
 	}
 	if budget.Remaining != 1999 {
@@ -100,6 +103,211 @@ func TestGitLabCheckerMergedShortCircuits(t *testing.T) {
 	}
 	if result.State != "merged" {
 		t.Errorf("Check().State = %q, want merged", result.State)
+	}
+}
+
+func TestGitLabCheckerHasConflictsFromMRResponse(t *testing.T) {
+	mux := http.NewServeMux()
+	setRateHeaders := func(w http.ResponseWriter) {
+		w.Header().Set("RateLimit-Limit", "2000")
+		w.Header().Set("RateLimit-Remaining", "1999")
+		w.Header().Set("RateLimit-Reset", "9999999999")
+	}
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"state":         "opened",
+			"has_conflicts": true,
+			"pipeline":      nil,
+			"head_pipeline": nil,
+		})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": []map[string]any{}})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if !result.HasConflict {
+		t.Error("Check() result.HasConflict = false, want true when has_conflicts is true")
+	}
+}
+
+func TestGitLabCheckerBlockedFromDetailedMergeStatus(t *testing.T) {
+	mux := http.NewServeMux()
+	setRateHeaders := func(w http.ResponseWriter) {
+		w.Header().Set("RateLimit-Limit", "2000")
+		w.Header().Set("RateLimit-Remaining", "1999")
+		w.Header().Set("RateLimit-Reset", "9999999999")
+	}
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"state":                 "opened",
+			"detailed_merge_status": "merge_request_blocked",
+			"pipeline":              nil,
+			"head_pipeline":         nil,
+		})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": []map[string]any{}})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if !result.Blocked {
+		t.Error("Check() result.Blocked = false, want true when detailed_merge_status is merge_request_blocked")
+	}
+}
+
+func TestGitLabCheckerNotBlockedOnOtherDetailedMergeStatus(t *testing.T) {
+	srv := fakeGitLabServer(t, "opened", "success", 0, 0)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if result.Blocked {
+		t.Error("Check() result.Blocked = true, want false when detailed_merge_status is absent/not merge_request_blocked")
+	}
+}
+
+func TestGitLabCheckerCIHrefFromPipelineWebURL(t *testing.T) {
+	mux := http.NewServeMux()
+	setRateHeaders := func(w http.ResponseWriter) {
+		w.Header().Set("RateLimit-Limit", "2000")
+		w.Header().Set("RateLimit-Remaining", "1999")
+		w.Header().Set("RateLimit-Reset", "9999999999")
+	}
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"state":         "opened",
+			"pipeline":      map[string]any{"status": "success", "web_url": "https://gitlab.corp.example/team/project/-/pipelines/42"},
+			"head_pipeline": nil,
+		})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": []map[string]any{}})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if result.CIHref != "https://gitlab.corp.example/team/project/-/pipelines/42" {
+		t.Errorf("Check() result.CIHref = %q, want the pipeline's own web_url", result.CIHref)
+	}
+}
+
+func TestGitLabCheckerCIHrefPrefersFailingJobOverPipeline(t *testing.T) {
+	mux := http.NewServeMux()
+	setRateHeaders := func(w http.ResponseWriter) {
+		w.Header().Set("RateLimit-Limit", "2000")
+		w.Header().Set("RateLimit-Remaining", "1999")
+		w.Header().Set("RateLimit-Reset", "9999999999")
+	}
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"state":         "opened",
+			"pipeline":      map[string]any{"id": 42, "status": "failed", "web_url": "https://gitlab.corp.example/team/project/-/pipelines/42"},
+			"head_pipeline": nil,
+		})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/pipelines/42/jobs", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"name": "build", "web_url": "https://gitlab.corp.example/team/project/-/jobs/99"},
+		})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": []map[string]any{}})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if result.CIHref != "https://gitlab.corp.example/team/project/-/jobs/99" {
+		t.Errorf("Check() result.CIHref = %q, want the failing job's own web_url, not the pipeline's", result.CIHref)
+	}
+}
+
+func TestGitLabCheckerReviewHrefPointsAtApprovalNote(t *testing.T) {
+	mux := http.NewServeMux()
+	setRateHeaders := func(w http.ResponseWriter) {
+		w.Header().Set("RateLimit-Limit", "2000")
+		w.Header().Set("RateLimit-Remaining", "1999")
+		w.Header().Set("RateLimit-Reset", "9999999999")
+	}
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"state": "opened", "pipeline": nil, "head_pipeline": nil})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": []map[string]any{{"username": "alice"}}})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/notes", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"id": 555, "system": true, "body": "approved this merge request", "created_at": "2026-09-20T12:00:00Z", "author": map[string]any{"username": "alice"}},
+		})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	mrURL := "https://gitlab.corp.example/team/project/-/merge_requests/17"
+	result, _, err := c.Check(t.Context(), mrURL)
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if result.ReviewHref != mrURL+"#note_555" {
+		t.Errorf("Check() result.ReviewHref = %q, want %q", result.ReviewHref, mrURL+"#note_555")
 	}
 }
 

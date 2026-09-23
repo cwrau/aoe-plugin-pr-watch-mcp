@@ -16,10 +16,15 @@ func Diff(prev PrevState, cur CheckResult) []Event {
 	}
 
 	var events []Event
-	if cur.Unresolved > prev.Unresolved {
+	// Compared by thread identity, not just count: if one thread gets
+	// resolved while another new one appears in the same poll window, a
+	// plain count comparison nets to "no change" and silently swallows the
+	// new thread. newUnresolvedThreads catches it regardless of what else
+	// resolved in the same window.
+	if newIDs := newUnresolvedThreads(prev.UnresolvedThreadIDs, cur.UnresolvedThreadIDs); len(newIDs) > 0 {
 		events = append(events, Event{
 			Kind:    "COMMENT",
-			Message: fmt.Sprintf("unresolved threads: %d -> %d", prev.Unresolved, cur.Unresolved),
+			Message: fmt.Sprintf("%d new unresolved thread(s), %d unresolved total", len(newIDs), len(cur.UnresolvedThreadIDs)),
 		})
 	}
 	if cur.ReviewCount > prev.ReviewCount && cur.LatestReviewer != "" {
@@ -28,8 +33,35 @@ func Diff(prev PrevState, cur CheckResult) []Event {
 			Message: fmt.Sprintf("%s %s", cur.LatestReviewer, cur.LatestReviewState),
 		})
 	}
-	if cur.CIBucket != prev.CIBucket && cur.CIBucket != "none" {
+	if cur.CIBucket != prev.CIBucket && cur.CIBucket == "failure" {
 		events = append(events, Event{Kind: "CI", Message: cur.CIBucket})
 	}
+	// A merge queue entry disappearing while the PR is still open (not
+	// merged — that path short-circuited above) means it got dequeued
+	// without merging. GitHub doesn't say why once the entry is gone (CI
+	// failure in the merge group is the common case, but a manual removal
+	// or the PR going stale/unmergeable can do it too), so the message
+	// stays honest about what's actually known rather than guessing a
+	// specific cause.
+	if prev.MergeQueueState != "" && cur.MergeQueueState == "" {
+		events = append(events, Event{Kind: "MERGE_QUEUE", Message: "removed from merge queue"})
+	}
 	return events
+}
+
+// newUnresolvedThreads returns the ids present in cur but not in prev —
+// threads that are genuinely new since the last check, independent of how
+// many other threads got resolved in the same window.
+func newUnresolvedThreads(prev, cur []string) []string {
+	prevSet := make(map[string]bool, len(prev))
+	for _, id := range prev {
+		prevSet[id] = true
+	}
+	var newIDs []string
+	for _, id := range cur {
+		if !prevSet[id] {
+			newIDs = append(newIDs, id)
+		}
+	}
+	return newIDs
 }

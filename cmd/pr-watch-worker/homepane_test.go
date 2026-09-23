@@ -90,6 +90,40 @@ func TestBuildHomePanePayloadGitHubRow(t *testing.T) {
 	}
 }
 
+func TestBuildHomePanePayloadShowsConflictBadgeBeforeCI(t *testing.T) {
+	reg := githubReg("failure", "")
+	reg.HasConflict = true
+	payload := buildHomePanePayload([]registry.Registration{reg}, func(string) string { return "" }, "")
+
+	sec := payload.Blocks[0].(sectionBlock)
+	prRow := sec.Children[0].(columnsBlock).Children[0].(rowBlock)
+	if len(prRow.Badges) != 4 {
+		t.Fatalf("prRow.Badges len = %d, want 4 (provider, conflict, ci, review)", len(prRow.Badges))
+	}
+	if prRow.Badges[1].Text != "conflict" || prRow.Badges[1].Tone != "danger" {
+		t.Errorf("prRow.Badges[1] = %+v, want {conflict danger}", prRow.Badges[1])
+	}
+	if prRow.Badges[2].Text != "failure" {
+		t.Errorf("prRow.Badges[2].Text = %q, want the CI badge right after the conflict badge", prRow.Badges[2].Text)
+	}
+}
+
+func TestBuildHomePanePayloadOmitsConflictBadgeWhenNoConflict(t *testing.T) {
+	regs := []registry.Registration{githubReg("success", "")}
+	payload := buildHomePanePayload(regs, func(string) string { return "" }, "")
+
+	sec := payload.Blocks[0].(sectionBlock)
+	prRow := sec.Children[0].(columnsBlock).Children[0].(rowBlock)
+	if len(prRow.Badges) != 3 {
+		t.Fatalf("prRow.Badges len = %d, want 3 (provider, ci, review) when there's no conflict", len(prRow.Badges))
+	}
+	for _, b := range prRow.Badges {
+		if b.Text == "conflict" {
+			t.Error("prRow.Badges contains a conflict badge, want none when HasConflict is false")
+		}
+	}
+}
+
 func TestBuildHomePanePayloadOmitsSessionHrefWhenBaseURLUnavailable(t *testing.T) {
 	regs := []registry.Registration{githubReg("none", "")}
 	payload := buildHomePanePayload(regs, func(string) string { return "" }, "")
@@ -189,7 +223,20 @@ func TestBuildHomePanePayloadExcludesTerminalStatusRegistrations(t *testing.T) {
 	}
 }
 
-func TestBuildHomePanePayloadTruncatesLongTitleAndSessionLabel(t *testing.T) {
+// TestBuildHomePanePayloadDoesNotTruncateLongLabels used to assert a
+// server-side character cap here, back when the host's `columns` grid item
+// had no min-width: 0 and an unbroken long Label could overflow its 50%
+// track into the sibling column (confirmed live). That grid was patched
+// (aoe commit 343f1050) to stack to one column below the `sm` breakpoint;
+// verified live against a running dashboard at both the stacked (<sm) and
+// 2-column (>=sm) widths, using the exact production row markup with an
+// unbroken 120-character label, that its Label span now cleanly
+// CSS-ellipsis-clips with zero overflow at either width. The host's own
+// responsive clipping does a better job than any fixed character count
+// could (it adapts to the pane's actual current pixel width), so this
+// plugin no longer pre-truncates — it sends the real title/session label
+// untouched and lets the host render it.
+func TestBuildHomePanePayloadDoesNotTruncateLongLabels(t *testing.T) {
 	reg := githubReg("success", "APPROVED")
 	reg.Title = strings.Repeat("a very long PR title that keeps going ", 5)
 	longSessionTitle := strings.Repeat("a very long session title that keeps going ", 5)
@@ -201,14 +248,11 @@ func TestBuildHomePanePayloadTruncatesLongTitleAndSessionLabel(t *testing.T) {
 	prRow := cols.Children[0].(rowBlock)
 	sessionRow := cols.Children[1].(rowBlock)
 
-	if len([]rune(prRow.Label)) > maxRowLabelLen {
-		t.Errorf("prRow.Label len = %d, want at most %d (long titles must not overflow the host's rigid 2-column grid)", len([]rune(prRow.Label)), maxRowLabelLen)
+	if prRow.Label != reg.Title {
+		t.Errorf("prRow.Label = %q, want the real title untouched, %q", prRow.Label, reg.Title)
 	}
-	if !strings.HasSuffix(prRow.Label, "…") {
-		t.Errorf("prRow.Label = %q, want it truncated with an ellipsis", prRow.Label)
-	}
-	if len([]rune(sessionRow.Label)) > maxRowLabelLen {
-		t.Errorf("sessionRow.Label len = %d, want at most %d", len([]rune(sessionRow.Label)), maxRowLabelLen)
+	if sessionRow.Label != longSessionTitle {
+		t.Errorf("sessionRow.Label = %q, want the real session title untouched, %q", sessionRow.Label, longSessionTitle)
 	}
 }
 

@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -100,6 +101,7 @@ func NewHandler(store *registry.Store) http.Handler {
 			if err := store.Add(ctx, reg); err != nil {
 				return nil, registerOutput{}, err
 			}
+			slog.Default().Info("registered", "pr_url", in.PRURL, "session_id", in.SessionID, "provider", prov)
 			// Best-effort: a session that moves on to a new PR/MR shouldn't
 			// keep an old merged badge cluttering its row/pane forever. This
 			// registration already succeeded above, so a failure here
@@ -124,6 +126,9 @@ func NewHandler(store *registry.Store) http.Handler {
 			removed, err := store.SetStatusOwnedBy(ctx, in.PRURL, in.SessionID, registry.StatusStopped)
 			if err != nil {
 				return nil, unregisterOutput{}, err
+			}
+			if removed {
+				slog.Default().Info("unregistered", "pr_url", in.PRURL, "session_id", in.SessionID)
 			}
 			return nil, unregisterOutput{Removed: removed}, nil
 		})

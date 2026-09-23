@@ -91,6 +91,7 @@ func (s *Scheduler) Tick(ctx context.Context) error {
 
 	now := time.Now()
 	var githubReady []registry.Registration
+	gitlabChecked := make(map[string]int) // host -> number of MRs checked against it this tick
 	for _, reg := range due {
 		switch reg.Provider {
 		case "github":
@@ -99,11 +100,24 @@ func (s *Scheduler) Tick(ctx context.Context) error {
 			}
 		case "gitlab":
 			if s.preflight(ctx, reg, now) {
-				s.processGitLabOne(ctx, reg, counts)
+				if host := s.processGitLabOne(ctx, reg, counts); host != "" {
+					gitlabChecked[host]++
+				}
 			}
 		default:
 			s.log().Error("unknown provider", "pr_url", reg.PRURL, "provider", reg.Provider)
 		}
+	}
+	// One summary line per host touched this tick, not one per MR: GitLab
+	// has no batch API here (unlike GitHub's aliased GraphQL query), so
+	// each MR is still its own real HTTP call, but the log stays as terse
+	// as GitHub's single-line-per-tick shape by reporting each host's
+	// latest (i.e. most current) budget reading once, alongside how many
+	// of its MRs were checked this tick.
+	for host, count := range gitlabChecked {
+		budget := s.lastGitLabBudgets[host]
+		s.log().Info("gitlab rate limit", "host", host, "remaining", budget.Remaining, "limit", budget.Limit, "reset_at", budget.ResetAt,
+			"checked", count, "next_check_in", ComputeInterval(budget, counts["gitlab"], now))
 	}
 
 	s.processGitHubBatch(ctx, githubReady, counts)
@@ -186,6 +200,10 @@ func (s *Scheduler) processGitHubBatch(ctx context.Context, regs []registry.Regi
 		ComputeInterval(budgets.GraphQL, activeCount, time.Now()),
 		ComputeInterval(budgets.REST, activeCount, time.Now()),
 	)
+	s.log().Info("github rate limit",
+		"graphql_remaining", budgets.GraphQL.Remaining, "graphql_limit", budgets.GraphQL.Limit, "graphql_reset_at", budgets.GraphQL.ResetAt,
+		"rest_remaining", budgets.REST.Remaining, "rest_limit", budgets.REST.Limit, "rest_reset_at", budgets.REST.ResetAt,
+		"next_check_in", interval)
 
 	for _, reg := range regs {
 		result, ok := results[reg.PRURL]
@@ -197,20 +215,26 @@ func (s *Scheduler) processGitHubBatch(ctx context.Context, regs []registry.Regi
 	}
 }
 
-func (s *Scheduler) processGitLabOne(ctx context.Context, reg registry.Registration, counts map[string]int) {
+// processGitLabOne checks one GitLab MR and returns the host it belongs to
+// (so Tick can log one rate-limit summary per host per tick instead of one
+// per MR), or "" if the URL didn't parse or the check itself failed (in
+// either case there's no fresh budget reading to fold into that summary).
+func (s *Scheduler) processGitLabOne(ctx context.Context, reg registry.Registration, counts map[string]int) string {
 	result, budget, checkErr := s.GitLab.Check(ctx, reg.PRURL)
 	if checkErr != nil {
 		s.finishError(ctx, reg, checkErr)
-		return
+		return ""
 	}
-	if host, _, _, err := provider.ParseGitLabMRURL(reg.PRURL); err == nil {
+	interval := ComputeInterval(budget, counts["gitlab"], time.Now())
+	host, _, _, err := provider.ParseGitLabMRURL(reg.PRURL)
+	if err == nil {
 		if s.lastGitLabBudgets == nil {
 			s.lastGitLabBudgets = make(map[string]provider.RateBudget)
 		}
 		s.lastGitLabBudgets[host] = budget
 	}
-	interval := ComputeInterval(budget, counts["gitlab"], time.Now())
 	s.finish(ctx, reg, result, interval)
+	return host
 }
 
 // finishError is the shared backoff path a failed check (or a batch
@@ -231,16 +255,22 @@ func (s *Scheduler) finishError(ctx context.Context, reg registry.Registration, 
 // without learning anything new from a real check.
 func stateUpdateFromReg(reg registry.Registration, nextDueAt time.Time) registry.StateUpdate {
 	return registry.StateUpdate{
-		ReviewCount:       reg.ReviewCount,
-		CIBucket:          reg.CIBucket,
-		CIDetail:          reg.CIDetail,
-		Unresolved:        reg.Unresolved,
-		LatestReviewState: reg.LatestReviewState,
-		LatestReviewer:    reg.LatestReviewer,
-		LatestReviewAt:    reg.LatestReviewAt,
-		Title:             reg.Title,
-		Description:       reg.Description,
-		NextDueAt:         nextDueAt,
+		ReviewCount:         reg.ReviewCount,
+		CIBucket:            reg.CIBucket,
+		CIDetail:            reg.CIDetail,
+		CIHref:              reg.CIHref,
+		ReviewHref:          reg.ReviewHref,
+		UnresolvedThreadIDs: reg.UnresolvedThreadIDs,
+		LatestReviewState:   reg.LatestReviewState,
+		LatestReviewer:      reg.LatestReviewer,
+		LatestReviewAt:      reg.LatestReviewAt,
+		Title:               reg.Title,
+		Description:         reg.Description,
+		NextDueAt:           nextDueAt,
+		HasConflict:         reg.HasConflict,
+		MergeQueueState:     reg.MergeQueueState,
+		MergeQueuePosition:  reg.MergeQueuePosition,
+		Blocked:             reg.Blocked,
 	}
 }
 
@@ -249,7 +279,7 @@ func stateUpdateFromReg(reg registry.Registration, nextDueAt time.Time) registry
 // best-effort, then either mark a terminal PR resolved or persist the new
 // state and next due time.
 func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, result provider.CheckResult, interval time.Duration) {
-	prev := provider.PrevState{ReviewCount: reg.ReviewCount, CIBucket: reg.CIBucket, Unresolved: reg.Unresolved}
+	prev := provider.PrevState{ReviewCount: reg.ReviewCount, CIBucket: reg.CIBucket, UnresolvedThreadIDs: reg.UnresolvedThreadIDs, MergeQueueState: reg.MergeQueueState}
 
 	// Best-effort only: a session whose Sender can never deliver (e.g. an
 	// ACP-mode AoE session, which has no tmux pane for `aoe send` to write
@@ -263,6 +293,7 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 	// paced" — the right trade given delivery to a structurally incompatible
 	// session was never going to succeed on a later retry anyway.
 	for _, ev := range provider.Diff(prev, result) {
+		s.log().Info("event", "pr_url", reg.PRURL, "session_id", reg.SessionID, "kind", ev.Kind, "message", ev.Message)
 		if err := s.Notify.Send(ctx, reg.SessionID, eventMessage(ev)); err != nil {
 			s.log().Warn("notify failed", "pr_url", reg.PRURL, "session_id", reg.SessionID, "error", err)
 		}
@@ -282,16 +313,22 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 	}
 
 	update := registry.StateUpdate{
-		ReviewCount:       result.ReviewCount,
-		CIBucket:          result.CIBucket,
-		CIDetail:          result.CIDetail,
-		Unresolved:        result.Unresolved,
-		LatestReviewState: result.LatestReviewState,
-		LatestReviewer:    result.LatestReviewer,
-		LatestReviewAt:    result.LatestReviewAt,
-		Title:             result.Title,
-		Description:       result.Description,
-		NextDueAt:         time.Now().Add(interval),
+		ReviewCount:         result.ReviewCount,
+		CIBucket:            result.CIBucket,
+		CIDetail:            result.CIDetail,
+		CIHref:              result.CIHref,
+		ReviewHref:          result.ReviewHref,
+		UnresolvedThreadIDs: result.UnresolvedThreadIDs,
+		LatestReviewState:   result.LatestReviewState,
+		LatestReviewer:      result.LatestReviewer,
+		LatestReviewAt:      result.LatestReviewAt,
+		Title:               result.Title,
+		Description:         result.Description,
+		NextDueAt:           time.Now().Add(interval),
+		HasConflict:         result.HasConflict,
+		MergeQueueState:     result.MergeQueueState,
+		MergeQueuePosition:  result.MergeQueuePosition,
+		Blocked:             result.Blocked,
 	}
 	if err := s.Store.UpdateState(ctx, reg.PRURL, update); err != nil {
 		s.log().Error("persist new state", "pr_url", reg.PRURL, "error", err)

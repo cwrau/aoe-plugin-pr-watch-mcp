@@ -67,17 +67,21 @@ func (c *GitLabChecker) tokenHeader() string {
 }
 
 type gitlabMRResponse struct {
-	State       string `json:"state"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	MergedAt    string `json:"merged_at"`
-	Pipeline    *struct {
+	State               string `json:"state"`
+	Title               string `json:"title"`
+	Description         string `json:"description"`
+	MergedAt            string `json:"merged_at"`
+	HasConflicts        bool   `json:"has_conflicts"`
+	DetailedMergeStatus string `json:"detailed_merge_status"` // "merge_request_blocked" means blocked on an unmerged MR dependency (Premium/Ultimate feature; always some other value on Free)
+	Pipeline            *struct {
 		ID     int    `json:"id"`
 		Status string `json:"status"`
+		WebURL string `json:"web_url"`
 	} `json:"pipeline"`
 	HeadPipeline *struct {
 		ID     int    `json:"id"`
 		Status string `json:"status"`
+		WebURL string `json:"web_url"`
 	} `json:"head_pipeline"`
 }
 
@@ -86,6 +90,7 @@ type gitlabApprovalsResponse struct {
 }
 
 type gitlabDiscussion struct {
+	ID    string `json:"id"`
 	Notes []struct {
 		Resolvable bool `json:"resolvable"`
 		Resolved   bool `json:"resolved"`
@@ -97,6 +102,7 @@ type gitlabDiscussion struct {
 // durable source of an approval's timestamp and author: /approvals only
 // reports who currently holds an approval, not when they gave it.
 type gitlabNote struct {
+	ID        int    `json:"id"`
 	System    bool   `json:"system"`
 	Body      string `json:"body"`
 	CreatedAt string `json:"created_at"`
@@ -112,7 +118,8 @@ type gitlabNote struct {
 const gitlabApprovedNoteBody = "approved this merge request"
 
 type gitlabJobsResponse []struct {
-	Name string `json:"name"`
+	Name   string `json:"name"`
+	WebURL string `json:"web_url"`
 }
 
 func mapGitLabPipelineStatus(status string) string {
@@ -157,7 +164,7 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 	}
 	mrData := mr.(*gitlabMRResponse)
 
-	result := CheckResult{State: mapGitLabState(mrData.State), Title: mrData.Title, Description: mrData.Description}
+	result := CheckResult{State: mapGitLabState(mrData.State), Title: mrData.Title, Description: mrData.Description, HasConflict: mrData.HasConflicts, Blocked: mrData.DetailedMergeStatus == "merge_request_blocked"}
 	if result.State == "merged" || result.State == "closed" {
 		if result.State == "merged" {
 			result.MergedAt = parseRFC3339OrZero(mrData.MergedAt)
@@ -170,12 +177,17 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 	if mrData.Pipeline != nil && mrData.Pipeline.Status != "" {
 		pipelineStatus = mrData.Pipeline.Status
 		pipelineID = mrData.Pipeline.ID
+		result.CIHref = mrData.Pipeline.WebURL
 	} else if mrData.HeadPipeline != nil {
 		pipelineStatus = mrData.HeadPipeline.Status
 		pipelineID = mrData.HeadPipeline.ID
+		result.CIHref = mrData.HeadPipeline.WebURL
 	}
 	result.CIBucket = mapGitLabPipelineStatus(pipelineStatus)
 
+	// On a failing pipeline, prefer the specific failing job's own link over
+	// the pipeline's — same specificity buildCheckResult's CIDetail already
+	// aims for, just extended to the href.
 	if result.CIBucket == "failure" && pipelineID != 0 {
 		detail, _, err := c.getJSON(ctx, token, fmt.Sprintf("%s/api/v4/projects/%s/pipelines/%d/jobs?scope[]=failed&per_page=1", base, encodedPath, pipelineID), &gitlabJobsResponse{})
 		if err != nil {
@@ -183,6 +195,7 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 		}
 		if jobs := *detail.(*gitlabJobsResponse); len(jobs) > 0 {
 			result.CIDetail = jobs[0].Name
+			result.CIHref = jobs[0].WebURL
 		}
 	}
 
@@ -202,6 +215,7 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 				result.LatestReviewer = n.Author.Username
 				result.LatestReviewState = "APPROVED"
 				result.LatestReviewAt = parseRFC3339OrZero(n.CreatedAt)
+				result.ReviewHref = fmt.Sprintf("%s#note_%d", mrURL, n.ID)
 				break
 			}
 		}
@@ -214,7 +228,7 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 	for _, d := range discussions {
 		for _, n := range d.Notes {
 			if n.Resolvable && !n.Resolved {
-				result.Unresolved++
+				result.UnresolvedThreadIDs = append(result.UnresolvedThreadIDs, d.ID)
 				break
 			}
 		}

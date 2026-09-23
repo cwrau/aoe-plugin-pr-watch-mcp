@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -149,16 +150,22 @@ func TestUpdateState(t *testing.T) {
 	newDue := now.Add(5 * time.Minute)
 	reviewAt := now.Add(-time.Hour)
 	update := StateUpdate{
-		ReviewCount:       3,
-		CIBucket:          "failure",
-		CIDetail:          "build",
-		Unresolved:        2,
-		LatestReviewState: "CHANGES_REQUESTED",
-		LatestReviewer:    "bob",
-		LatestReviewAt:    reviewAt,
-		Title:             "Fix the thing",
-		Description:       "Fixes the widget rendering bug.",
-		NextDueAt:         newDue,
+		ReviewCount:         3,
+		CIBucket:            "failure",
+		CIDetail:            "build",
+		UnresolvedThreadIDs: []string{"t1", "t2"},
+		LatestReviewState:   "CHANGES_REQUESTED",
+		LatestReviewer:      "bob",
+		LatestReviewAt:      reviewAt,
+		Title:               "Fix the thing",
+		Description:         "Fixes the widget rendering bug.",
+		NextDueAt:           newDue,
+		HasConflict:         true,
+		CIHref:              "https://github.com/o/r/actions/runs/123",
+		ReviewHref:          "https://github.com/o/r/pull/1#pullrequestreview-999",
+		MergeQueueState:     "QUEUED",
+		MergeQueuePosition:  3,
+		Blocked:             true,
 	}
 	if err := s.UpdateState(ctx, reg.PRURL, update); err != nil {
 		t.Fatalf("UpdateState() error = %v", err)
@@ -172,8 +179,32 @@ func TestUpdateState(t *testing.T) {
 		t.Fatalf("List() len = %d, want 1", len(got))
 	}
 	r := got[0]
-	if r.ReviewCount != 3 || r.CIBucket != "failure" || r.CIDetail != "build" || r.Unresolved != 2 || r.LatestReviewState != "CHANGES_REQUESTED" || r.LatestReviewer != "bob" || !r.LatestReviewAt.Equal(reviewAt) || r.Title != "Fix the thing" || r.Description != "Fixes the widget rendering bug." || !r.NextDueAt.Equal(newDue) {
+	if r.ReviewCount != 3 || r.CIBucket != "failure" || r.CIDetail != "build" || !slices.Equal(r.UnresolvedThreadIDs, update.UnresolvedThreadIDs) || r.LatestReviewState != "CHANGES_REQUESTED" || r.LatestReviewer != "bob" || !r.LatestReviewAt.Equal(reviewAt) || r.Title != "Fix the thing" || r.Description != "Fixes the widget rendering bug." || !r.NextDueAt.Equal(newDue) || !r.HasConflict || r.CIHref != update.CIHref || r.ReviewHref != update.ReviewHref || r.MergeQueueState != update.MergeQueueState || r.MergeQueuePosition != update.MergeQueuePosition || !r.Blocked {
 		t.Errorf("after UpdateState, got %+v", r)
+	}
+}
+
+func TestUpdateStateClearsHasConflict(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now().Truncate(time.Second)
+	reg := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "a", Provider: "github", NextDueAt: now, CreatedAt: now}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	if err := s.UpdateState(ctx, reg.PRURL, StateUpdate{NextDueAt: now, HasConflict: true}); err != nil {
+		t.Fatalf("UpdateState() error = %v", err)
+	}
+	if err := s.UpdateState(ctx, reg.PRURL, StateUpdate{NextDueAt: now, HasConflict: false}); err != nil {
+		t.Fatalf("UpdateState() error = %v", err)
+	}
+
+	got, _, err := s.Get(ctx, reg.PRURL)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.HasConflict {
+		t.Error("Get().HasConflict = true, want false once a later check reports the conflict resolved")
 	}
 }
 
