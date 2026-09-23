@@ -1,4 +1,4 @@
-# io.cwrau.pr-watch
+# io.cwrau.pr-watch-mcp
 
 Persistent PR/MR watch service for Agent of Empires: an AoE Tier-1 plugin
 worker that polls registered GitHub PRs and GitLab MRs, paces itself
