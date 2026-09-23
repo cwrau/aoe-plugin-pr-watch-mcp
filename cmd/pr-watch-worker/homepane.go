@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"sort"
-	"strings"
 
 	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/provider"
 	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/registry"
@@ -13,10 +12,10 @@ const homePaneSlot = "home-pane"
 const homePaneID = "watched_prs"
 
 // dashboardBaseURLSettingKey must match the [[settings]] key declared in
-// aoe-plugin.toml. There's no way for the worker to know which of the
-// daemon's possibly-several externally-reachable URLs (loopback, LAN,
-// Tailscale, a reverse-proxied domain) the person viewing the dashboard is
-// actually using, so this is user-configured rather than inferred.
+// aoe-plugin.toml. Unused for session-href building now that the host
+// accepts a plain relative href (see registrationColumns) — kept, setting
+// and all, only so a revert back to absolute-URL building is a small diff
+// if the relative-href host support turns out not to work everywhere.
 const dashboardBaseURLSettingKey = "dashboard_base_url"
 
 // panePayload mirrors the shape ui.state.set expects for a pane-family
@@ -70,12 +69,8 @@ type noteBlock struct {
 // filterable, so rows are just sorted failures-first to keep the most
 // actionable ones on top. titleOf resolves a session id to its display
 // title (aoeclient.Client's Title method); an empty result falls back to
-// the raw session id. dashboardBaseURL, from resolveDashboardBaseURL, is
-// required to make the session row a real link at all: the pane renderer
-// only ever turns an absolute http(s) href into a clickable link (a
-// hardcoded XSS allowlist with no exception for relative paths), so an
-// empty dashboardBaseURL degrades the session row to plain, unlinked text
-// rather than shipping a href the renderer would silently drop anyway.
+// the raw session id. dashboardBaseURL is accepted but currently unused —
+// see registrationColumns.
 func buildHomePanePayload(regs []registry.Registration, titleOf func(sessionID string) string, dashboardBaseURL string) panePayload {
 	var sorted []registry.Registration
 	for _, r := range regs {
@@ -109,16 +104,19 @@ func buildHomePanePayload(regs []registry.Registration, titleOf func(sessionID s
 	}
 }
 
+// dashboardBaseURL is unused: the host's pane renderer now accepts a plain
+// relative href, so the session row always links to /session/<id> directly
+// rather than needing an absolute URL built from a user-configured base.
+// The parameter (and its setting, see dashboardBaseURLSettingKey) stays in
+// place only so reverting to absolute-URL building is a small diff if the
+// host's relative-href support doesn't pan out.
 func registrationColumns(reg registry.Registration, titleOf func(string) string, dashboardBaseURL string) columnsBlock {
 	sessionLabel := titleOf(reg.SessionID)
 	if sessionLabel == "" {
 		sessionLabel = reg.SessionID
 	}
 
-	var sessionHref string
-	if dashboardBaseURL != "" {
-		sessionHref = strings.TrimRight(dashboardBaseURL, "/") + "/session/" + reg.SessionID
-	}
+	sessionHref := "/session/" + reg.SessionID
 
 	// Prefer the PR/MR's real title once the first successful check has
 	// fetched it; before that (or if a fetch ever comes back empty), fall
