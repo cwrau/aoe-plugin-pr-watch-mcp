@@ -425,6 +425,188 @@ func (c *GitHubChecker) CheckBatch(ctx context.Context, urls []string) (map[stri
 	return results, budgets, nil
 }
 
+// ReviewLookup is one review resolved by FindReview, carrying just what
+// DismissReview/RequestReviewer need to act on it.
+type ReviewLookup struct {
+	PullRequestID string
+	ReviewID      string
+	State         string
+	AuthorLogin   string
+}
+
+const githubFindReviewQuery = `query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      id
+      reviews(first: 100) {
+        nodes { id url state author { login } }
+      }
+    }
+  }
+}`
+
+type githubFindReviewResponse struct {
+	Repository *struct {
+		PullRequest *struct {
+			ID      string `json:"id"`
+			Reviews struct {
+				Nodes []struct {
+					ID     string `json:"id"`
+					URL    string `json:"url"`
+					State  string `json:"state"`
+					Author struct {
+						Login string `json:"login"`
+					} `json:"author"`
+				} `json:"nodes"`
+			} `json:"reviews"`
+		} `json:"pullRequest"`
+	} `json:"repository"`
+}
+
+// FindReview resolves reviewURL to its GraphQL review id and current state,
+// by fetching every review on owner/repo#number (capped at 100, same
+// "good enough, not exhaustively paginated" precedent as reviewThreads/
+// latestReview elsewhere in this file) and matching by url — the only
+// review identifier CheckResult exposes as ReviewHref, so it's what
+// dismiss_review's caller already has in hand from a badge tooltip or the
+// list tool. found is false if no review's url matches (already resolved/
+// deleted, or a wrong url), distinct from a real request error.
+func (c *GitHubChecker) FindReview(ctx context.Context, owner, repo string, number int, reviewURL string) (ReviewLookup, bool, error) {
+	var resp githubFindReviewResponse
+	if err := c.doGraphQL(ctx, githubFindReviewQuery, map[string]any{
+		"owner": owner, "repo": repo, "number": number,
+	}, &resp); err != nil {
+		return ReviewLookup{}, false, err
+	}
+	if resp.Repository == nil || resp.Repository.PullRequest == nil {
+		return ReviewLookup{}, false, fmt.Errorf("pull request not found: %s/%s#%d", owner, repo, number)
+	}
+	pr := resp.Repository.PullRequest
+	for _, n := range pr.Reviews.Nodes {
+		if n.URL == reviewURL {
+			return ReviewLookup{
+				PullRequestID: pr.ID,
+				ReviewID:      n.ID,
+				State:         n.State,
+				AuthorLogin:   n.Author.Login,
+			}, true, nil
+		}
+	}
+	return ReviewLookup{}, false, nil
+}
+
+const githubDismissReviewMutation = `mutation($reviewId: ID!, $message: String!) {
+  dismissPullRequestReview(input: {pullRequestReviewId: $reviewId, message: $message}) {
+    clientMutationId
+  }
+}`
+
+// DismissReview dismisses reviewID via GitHub's dismissPullRequestReview
+// mutation. This requires write access to the repo (and, on a branch that
+// restricts review dismissal, admin/allowlisted access) and only accepts
+// APPROVED/CHANGES_REQUESTED reviews — the caller falls back to
+// RequestReviewer, then a local-only marker, when this fails.
+func (c *GitHubChecker) DismissReview(ctx context.Context, reviewID string) error {
+	return c.doGraphQL(ctx, githubDismissReviewMutation, map[string]any{
+		"reviewId": reviewID,
+		"message":  "Dismissed via pr-watch",
+	}, nil)
+}
+
+const githubUserIDQuery = `query($login: String!) { user(login: $login) { id } }`
+
+func (c *GitHubChecker) userID(ctx context.Context, login string) (string, error) {
+	var resp struct {
+		User *struct {
+			ID string `json:"id"`
+		} `json:"user"`
+	}
+	if err := c.doGraphQL(ctx, githubUserIDQuery, map[string]any{"login": login}, &resp); err != nil {
+		return "", err
+	}
+	if resp.User == nil {
+		return "", fmt.Errorf("github user not found: %s", login)
+	}
+	return resp.User.ID, nil
+}
+
+const githubRequestReviewsMutation = `mutation($prId: ID!, $userId: ID!) {
+  requestReviews(input: {pullRequestId: $prId, userIds: [$userId]}) {
+    clientMutationId
+  }
+}`
+
+// RequestReviewer re-requests a review from login on pullRequestID via
+// GitHub's requestReviews mutation — the middle fallback tier when a real
+// dismiss isn't possible, since it at least turns a red "changes requested"
+// into a pending re-review on GitHub's own PR page. It does not change the
+// original review's own state, so callers must still apply a local
+// suppression marker afterward or it resurfaces on the next poll.
+func (c *GitHubChecker) RequestReviewer(ctx context.Context, pullRequestID, login string) error {
+	userID, err := c.userID(ctx, login)
+	if err != nil {
+		return err
+	}
+	return c.doGraphQL(ctx, githubRequestReviewsMutation, map[string]any{
+		"prId":   pullRequestID,
+		"userId": userID,
+	}, nil)
+}
+
+// doGraphQL posts one query or mutation and decodes its `data` field into
+// data (skipped if nil, for mutations the caller only needs success/failure
+// from). Shared by FindReview/DismissReview/RequestReviewer/userID rather
+// than queryBatchGraphQL, which is tied to the batch endpoint's specific
+// per-alias response shape.
+func (c *GitHubChecker) doGraphQL(ctx context.Context, query string, variables map[string]any, data any) error {
+	payload, err := json.Marshal(map[string]any{
+		"query":     query,
+		"variables": variables,
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL()+"/graphql", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "bearer "+c.Token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("github graphql request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := checkHTTPStatus(resp); err != nil {
+		return fmt.Errorf("github graphql: %w", err)
+	}
+
+	var out struct {
+		Data   json.RawMessage `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return fmt.Errorf("decode github graphql response: %w", err)
+	}
+	if len(out.Errors) > 0 {
+		messages := make([]string, 0, len(out.Errors))
+		for _, e := range out.Errors {
+			messages = append(messages, e.Message)
+		}
+		return fmt.Errorf("github graphql returned %d error(s): %s", len(out.Errors), strings.Join(messages, "; "))
+	}
+	if data != nil && len(out.Data) > 0 {
+		if err := json.Unmarshal(out.Data, data); err != nil {
+			return fmt.Errorf("decode github graphql data: %w", err)
+		}
+	}
+	return nil
+}
+
 func (c *GitHubChecker) queryBatchGraphQL(ctx context.Context, bq githubBatchQuery) (*githubBatchGraphQLResponse, error) {
 	payload, err := json.Marshal(map[string]any{
 		"query":     bq.query,

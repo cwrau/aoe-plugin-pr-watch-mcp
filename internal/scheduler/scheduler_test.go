@@ -631,3 +631,112 @@ func (f fakeClassifier) Classify(id string) aoeclient.SessionClass    { return f
 func alwaysLiveSessions() SessionClassifier     { return fakeClassifier{aoeclient.SessionLive} }
 func alwaysArchivedSessions() SessionClassifier { return fakeClassifier{aoeclient.SessionArchived} }
 func alwaysGoneSessions() SessionClassifier     { return fakeClassifier{aoeclient.SessionGone} }
+
+func TestTickSuppressesDismissedReview(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+	reviewHref := "https://github.com/o/r/pull/1#pullrequestreview-1"
+	reg := registry.Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github",
+		ReviewCount: 1, NextDueAt: now.Add(-time.Minute), CreatedAt: now,
+	}
+	if err := store.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	if err := store.SetDismissedReview(ctx, reg.PRURL, reviewHref); err != nil {
+		t.Fatalf("SetDismissedReview() error = %v", err)
+	}
+
+	gh := &fakeGitHubChecker{result: provider.CheckResult{
+		State: "open", ReviewCount: 1, LatestReviewState: "COMMENTED", LatestReviewer: "bob", ReviewHref: reviewHref,
+	}}
+	notify := &fakeNotifier{}
+	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: notify}
+
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	got, ok, err := store.Get(ctx, reg.PRURL)
+	if err != nil || !ok {
+		t.Fatalf("Get() = (%+v, %v, %v)", got, ok, err)
+	}
+	if got.LatestReviewState != "" || got.LatestReviewer != "" || got.ReviewHref != "" {
+		t.Errorf("Get() = %+v, want the dismissed review still suppressed after a poll that reports the same href", got)
+	}
+	if len(notify.sent) != 0 {
+		t.Errorf("notify.sent = %v, want no REVIEW ping for a review already seen and dismissed", notify.sent)
+	}
+}
+
+func TestTickUnsuppressesOnNewReview(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+	oldHref := "https://github.com/o/r/pull/1#pullrequestreview-1"
+	newHref := "https://github.com/o/r/pull/1#pullrequestreview-2"
+	reg := registry.Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github",
+		ReviewCount: 1, NextDueAt: now.Add(-time.Minute), CreatedAt: now,
+	}
+	if err := store.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	if err := store.SetDismissedReview(ctx, reg.PRURL, oldHref); err != nil {
+		t.Fatalf("SetDismissedReview() error = %v", err)
+	}
+
+	gh := &fakeGitHubChecker{result: provider.CheckResult{
+		State: "open", ReviewCount: 2, LatestReviewState: "CHANGES_REQUESTED", LatestReviewer: "carol", ReviewHref: newHref,
+	}}
+	notify := &fakeNotifier{}
+	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: notify}
+
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	got, ok, err := store.Get(ctx, reg.PRURL)
+	if err != nil || !ok {
+		t.Fatalf("Get() = (%+v, %v, %v)", got, ok, err)
+	}
+	if got.LatestReviewState != "CHANGES_REQUESTED" || got.LatestReviewer != "carol" || got.ReviewHref != newHref {
+		t.Errorf("Get() = %+v, want the new review to flow through despite an unrelated dismissed marker", got)
+	}
+}
+
+// TestTickPingsAgainWhenFailureRunChangesButBucketDoesnt is scheduler.finish's
+// end-to-end guard for the same race diff_test.go covers at the Diff level:
+// a fix-push that fails again before the next Tick sees "failure" both
+// times, so the ping must key off the run's CIHref changing, not just the
+// bucket.
+func TestTickPingsAgainWhenFailureRunChangesButBucketDoesnt(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+	reg := registry.Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github",
+		CIBucket: "failure", CIHref: "https://github.com/o/r/actions/runs/1", NextDueAt: now.Add(-time.Minute), CreatedAt: now,
+	}
+	if err := store.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	if err := store.UpdateState(ctx, reg.PRURL, registry.StateUpdate{
+		CIBucket: "failure", CIHref: "https://github.com/o/r/actions/runs/1", NextDueAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("UpdateState() error = %v", err)
+	}
+
+	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "open", CIBucket: "failure", CIHref: "https://github.com/o/r/actions/runs/2"}}
+	notify := &fakeNotifier{}
+	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: notify}
+
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	if len(notify.sent) != 1 || notify.sent[0] != "sess1: [pr-watch] CI failure (https://github.com/o/r/actions/runs/2)" {
+		t.Errorf("notify.sent = %v, want a single ping for the new run despite an unchanged bucket", notify.sent)
+	}
+}

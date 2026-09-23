@@ -613,31 +613,161 @@ func TestSetStatusOwnedByUnknownURL(t *testing.T) {
 	}
 }
 
-func TestStopOtherMergedStopsOnlyMergedForThatSession(t *testing.T) {
+func TestClearReviewIfCurrentBlanksMatchingReview(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now()
+	reg := Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "a", Provider: "github",
+		NextDueAt: now, CreatedAt: now,
+	}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	reviewHref := "https://github.com/o/r/pull/1#pullrequestreview-1"
+	update := StateUpdate{LatestReviewState: "CHANGES_REQUESTED", LatestReviewer: "bob", ReviewHref: reviewHref, NextDueAt: now}
+	if err := s.UpdateState(ctx, reg.PRURL, update); err != nil {
+		t.Fatalf("UpdateState() error = %v", err)
+	}
+
+	if err := s.ClearReviewIfCurrent(ctx, reg.PRURL, reviewHref); err != nil {
+		t.Fatalf("ClearReviewIfCurrent() error = %v", err)
+	}
+
+	got, ok, err := s.Get(ctx, reg.PRURL)
+	if err != nil || !ok {
+		t.Fatalf("Get() = (%+v, %v, %v)", got, ok, err)
+	}
+	if got.LatestReviewState != "" || got.LatestReviewer != "" || got.ReviewHref != "" || !got.LatestReviewAt.IsZero() {
+		t.Errorf("Get() = %+v, want every latest-review field blanked", got)
+	}
+	if got.DismissedReviewHref != "" {
+		t.Errorf("DismissedReviewHref = %q, want empty (ClearReviewIfCurrent sets no marker)", got.DismissedReviewHref)
+	}
+}
+
+func TestClearReviewIfCurrentIgnoresStaleHref(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now()
+	reg := Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "a", Provider: "github",
+		NextDueAt: now, CreatedAt: now,
+	}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	currentHref := "https://github.com/o/r/pull/1#pullrequestreview-2"
+	update := StateUpdate{LatestReviewState: "APPROVED", LatestReviewer: "alice", ReviewHref: currentHref, NextDueAt: now}
+	if err := s.UpdateState(ctx, reg.PRURL, update); err != nil {
+		t.Fatalf("UpdateState() error = %v", err)
+	}
+
+	if err := s.ClearReviewIfCurrent(ctx, reg.PRURL, "https://github.com/o/r/pull/1#pullrequestreview-1"); err != nil {
+		t.Fatalf("ClearReviewIfCurrent() error = %v", err)
+	}
+
+	got, ok, err := s.Get(ctx, reg.PRURL)
+	if err != nil || !ok {
+		t.Fatalf("Get() = (%+v, %v, %v)", got, ok, err)
+	}
+	if got.LatestReviewState != "APPROVED" || got.ReviewHref != currentHref {
+		t.Errorf("Get() = %+v, want the current review untouched since href didn't match", got)
+	}
+}
+
+func TestSetDismissedReviewMarksAndBlanksWhenCurrent(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now()
+	reg := Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "a", Provider: "github",
+		NextDueAt: now, CreatedAt: now,
+	}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	reviewHref := "https://github.com/o/r/pull/1#pullrequestreview-1"
+	update := StateUpdate{LatestReviewState: "COMMENTED", LatestReviewer: "bob", ReviewHref: reviewHref, NextDueAt: now}
+	if err := s.UpdateState(ctx, reg.PRURL, update); err != nil {
+		t.Fatalf("UpdateState() error = %v", err)
+	}
+
+	if err := s.SetDismissedReview(ctx, reg.PRURL, reviewHref); err != nil {
+		t.Fatalf("SetDismissedReview() error = %v", err)
+	}
+
+	got, ok, err := s.Get(ctx, reg.PRURL)
+	if err != nil || !ok {
+		t.Fatalf("Get() = (%+v, %v, %v)", got, ok, err)
+	}
+	if got.DismissedReviewHref != reviewHref {
+		t.Errorf("DismissedReviewHref = %q, want %q", got.DismissedReviewHref, reviewHref)
+	}
+	if got.LatestReviewState != "" || got.LatestReviewer != "" || got.ReviewHref != "" || !got.LatestReviewAt.IsZero() {
+		t.Errorf("Get() = %+v, want every latest-review field blanked since href matched the current review", got)
+	}
+}
+
+func TestSetDismissedReviewMarksOnlyWhenNotCurrent(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now()
+	reg := Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "a", Provider: "github",
+		NextDueAt: now, CreatedAt: now,
+	}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	currentHref := "https://github.com/o/r/pull/1#pullrequestreview-2"
+	update := StateUpdate{LatestReviewState: "CHANGES_REQUESTED", LatestReviewer: "carol", ReviewHref: currentHref, NextDueAt: now}
+	if err := s.UpdateState(ctx, reg.PRURL, update); err != nil {
+		t.Fatalf("UpdateState() error = %v", err)
+	}
+
+	olderHref := "https://github.com/o/r/pull/1#pullrequestreview-1"
+	if err := s.SetDismissedReview(ctx, reg.PRURL, olderHref); err != nil {
+		t.Fatalf("SetDismissedReview() error = %v", err)
+	}
+
+	got, ok, err := s.Get(ctx, reg.PRURL)
+	if err != nil || !ok {
+		t.Fatalf("Get() = (%+v, %v, %v)", got, ok, err)
+	}
+	if got.DismissedReviewHref != olderHref {
+		t.Errorf("DismissedReviewHref = %q, want %q", got.DismissedReviewHref, olderHref)
+	}
+	if got.LatestReviewState != "CHANGES_REQUESTED" || got.ReviewHref != currentHref {
+		t.Errorf("Get() = %+v, want the currently-displayed review left untouched", got)
+	}
+}
+
+func TestStopAllOwnedByStopsOnlyThatSessionsNonStopped(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
 	now := time.Now()
 
 	regs := []Registration{
-		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", NextDueAt: now, CreatedAt: now}, // will become merged
-		{PRURL: "https://github.com/o/r/pull/2", SessionID: "sess1", Provider: "github", NextDueAt: now, CreatedAt: now}, // new registration, kept
-		{PRURL: "https://github.com/o/r/pull/3", SessionID: "sess1", Provider: "github", NextDueAt: now, CreatedAt: now}, // will become watching, must stay untouched
-		{PRURL: "https://github.com/o/r/pull/4", SessionID: "sess2", Provider: "github", NextDueAt: now, CreatedAt: now}, // other session, will become merged, must stay untouched
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", NextDueAt: now, CreatedAt: now}, // watching, will be stopped
+		{PRURL: "https://github.com/o/r/pull/2", SessionID: "sess1", Provider: "github", NextDueAt: now, CreatedAt: now}, // will become merged, will be stopped
+		{PRURL: "https://github.com/o/r/pull/3", SessionID: "sess2", Provider: "github", NextDueAt: now, CreatedAt: now}, // other session, must stay untouched
 	}
 	for _, r := range regs {
 		if err := s.Add(ctx, r); err != nil {
 			t.Fatalf("Add() error = %v", err)
 		}
 	}
-	if err := s.SetStatus(ctx, regs[0].PRURL, StatusMerged); err != nil {
-		t.Fatalf("SetStatus() error = %v", err)
-	}
-	if err := s.SetStatus(ctx, regs[3].PRURL, StatusMerged); err != nil {
+	if err := s.SetStatus(ctx, regs[1].PRURL, StatusMerged); err != nil {
 		t.Fatalf("SetStatus() error = %v", err)
 	}
 
-	if err := s.StopOtherMerged(ctx, "sess1", regs[1].PRURL); err != nil {
-		t.Fatalf("StopOtherMerged() error = %v", err)
+	count, err := s.StopAllOwnedBy(ctx, "sess1")
+	if err != nil {
+		t.Fatalf("StopAllOwnedBy() error = %v", err)
+	}
+	if count != 2 {
+		t.Errorf("count = %d, want 2", count)
 	}
 
 	got := map[string]string{}
@@ -649,15 +779,33 @@ func TestStopOtherMergedStopsOnlyMergedForThatSession(t *testing.T) {
 		got[r.PRURL] = r.Status
 	}
 	if got[regs[0].PRURL] != StatusStopped {
-		t.Errorf("pull/1 status = %q, want %q (was merged, different PR, same session)", got[regs[0].PRURL], StatusStopped)
+		t.Errorf("pull/1 status = %q, want %q", got[regs[0].PRURL], StatusStopped)
 	}
-	if got[regs[1].PRURL] != StatusWatching {
-		t.Errorf("pull/2 status = %q, want %q (the newly-registered PR itself, must not be stopped)", got[regs[1].PRURL], StatusWatching)
+	if got[regs[1].PRURL] != StatusStopped {
+		t.Errorf("pull/2 status = %q, want %q", got[regs[1].PRURL], StatusStopped)
 	}
 	if got[regs[2].PRURL] != StatusWatching {
-		t.Errorf("pull/3 status = %q, want %q (already-watching, unrelated to merged cleanup)", got[regs[2].PRURL], StatusWatching)
+		t.Errorf("pull/3 status = %q, want %q (a different session's registration must be untouched)", got[regs[2].PRURL], StatusWatching)
 	}
-	if got[regs[3].PRURL] != StatusMerged {
-		t.Errorf("pull/4 status = %q, want %q (a different session's merged PR must be untouched)", got[regs[3].PRURL], StatusMerged)
+}
+
+func TestStopAllOwnedByIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now()
+	reg := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", NextDueAt: now, CreatedAt: now}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	if _, err := s.StopAllOwnedBy(ctx, "sess1"); err != nil {
+		t.Fatalf("StopAllOwnedBy() error = %v", err)
+	}
+
+	count, err := s.StopAllOwnedBy(ctx, "sess1")
+	if err != nil {
+		t.Fatalf("StopAllOwnedBy() second call error = %v", err)
+	}
+	if count != 0 {
+		t.Errorf("count = %d, want 0 (already stopped, nothing left to change)", count)
 	}
 }

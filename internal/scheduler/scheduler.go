@@ -312,16 +312,27 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 		return
 	}
 
+	// A review dismiss_review couldn't clear on GitHub itself (re-requested,
+	// or the local-only fallback) stays suppressed here: GitHub keeps
+	// reporting the exact same review every poll, so without this check it
+	// would resurface on the very next tick, undoing the dismissal.
+	// ReviewCount is left untouched either way, so no spurious REVIEW event
+	// fires from Diff (above) for a review it's already seen.
+	latestReviewState, latestReviewer, latestReviewAt, reviewHref := result.LatestReviewState, result.LatestReviewer, result.LatestReviewAt, result.ReviewHref
+	if reg.DismissedReviewHref != "" && result.ReviewHref == reg.DismissedReviewHref {
+		latestReviewState, latestReviewer, latestReviewAt, reviewHref = "", "", time.Time{}, ""
+	}
+
 	update := registry.StateUpdate{
 		ReviewCount:         result.ReviewCount,
 		CIBucket:            result.CIBucket,
 		CIDetail:            result.CIDetail,
 		CIHref:              result.CIHref,
-		ReviewHref:          result.ReviewHref,
+		ReviewHref:          reviewHref,
 		UnresolvedThreadIDs: result.UnresolvedThreadIDs,
-		LatestReviewState:   result.LatestReviewState,
-		LatestReviewer:      result.LatestReviewer,
-		LatestReviewAt:      result.LatestReviewAt,
+		LatestReviewState:   latestReviewState,
+		LatestReviewer:      latestReviewer,
+		LatestReviewAt:      latestReviewAt,
 		Title:               result.Title,
 		Description:         result.Description,
 		NextDueAt:           time.Now().Add(interval),

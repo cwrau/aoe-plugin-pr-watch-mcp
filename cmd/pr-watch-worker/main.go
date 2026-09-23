@@ -85,12 +85,17 @@ func main() {
 	// block a Tick forever.
 	httpClient := &http.Client{Timeout: httpTimeout}
 
+	// Shared with the MCP handler's dismiss_review tool below, not just the
+	// scheduler: both need the same GitHub credentials, and there's no
+	// reason to hold two separate token/client pairs for one API.
+	ghChecker := &provider.GitHubChecker{
+		HTTPClient: httpClient,
+		Token:      ghToken,
+	}
+
 	sched := &scheduler.Scheduler{
-		Store: store,
-		GitHub: &provider.GitHubChecker{
-			HTTPClient: httpClient,
-			Token:      ghToken,
-		},
+		Store:  store,
+		GitHub: ghChecker,
 		GitLab: &provider.GitLabChecker{
 			HTTPClient: httpClient,
 			// Resolved fresh per-host at check time, not once globally:
@@ -112,7 +117,7 @@ func main() {
 	rpc := newHostRPC(os.Stdout)
 
 	go runSchedulerLoop(ctx, sched, store, aoe, rpc, logger)
-	go runHTTPServer(ctx, store, logger)
+	go runHTTPServer(ctx, store, ghChecker, logger)
 
 	// The ndjson stdio channel is how the AoE daemon supervises this
 	// worker, and also how it answers this worker's own outbound calls
@@ -210,7 +215,7 @@ func pushUIState(ctx context.Context, store *registry.Store, aoe *aoeclient.Clie
 	}
 }
 
-func runHTTPServer(ctx context.Context, store *registry.Store, logger *slog.Logger) {
+func runHTTPServer(ctx context.Context, store *registry.Store, gh *provider.GitHubChecker, logger *slog.Logger) {
 	port := defaultPort
 	if raw := os.Getenv("PR_WATCH_MCP_PORT"); raw != "" {
 		if p, err := strconv.Atoi(raw); err == nil {
@@ -219,7 +224,7 @@ func runHTTPServer(ctx context.Context, store *registry.Store, logger *slog.Logg
 	}
 	srv := &http.Server{
 		Addr:    "127.0.0.1:" + strconv.Itoa(port),
-		Handler: mcpserver.NewHandler(store),
+		Handler: mcpserver.NewHandler(store, gh),
 	}
 	go func() {
 		<-ctx.Done()
