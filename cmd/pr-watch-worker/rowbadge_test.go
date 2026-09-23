@@ -65,6 +65,214 @@ func TestBuildRowBadgePayloadsChipFields(t *testing.T) {
 	}
 }
 
+func TestBuildRowBadgePayloadsEyeChipDangerOnConflictNoExtraChip(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", CIBucket: "failure", HasConflict: true},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	items := got["sess1"].Items
+	if len(items) != 3 {
+		t.Fatalf("items len = %d, want 3 (eye, ci, review) — a conflict recolors the eye chip, it doesn't add one", len(items))
+	}
+	if items[0].Tone != "danger" {
+		t.Errorf("eye.Tone = %q, want danger when HasConflict is true", items[0].Tone)
+	}
+	if items[1].Text != "failure" {
+		t.Errorf("items[1].Text = %q, want the CI chip right after the eye chip", items[1].Text)
+	}
+}
+
+func TestBuildRowBadgePayloadsEyeChipToneNeutralWithoutConflict(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", CIBucket: "success"},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	items := got["sess1"].Items
+	if len(items) != 3 {
+		t.Fatalf("items len = %d, want 3 (eye, ci, review)", len(items))
+	}
+	if items[0].Tone != "neutral" {
+		t.Errorf("eye.Tone = %q, want neutral when there's no conflict and no merge queue state", items[0].Tone)
+	}
+}
+
+func TestBuildRowBadgePayloadsEyeChipTooltipMentionsConflict(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", HasConflict: true},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	eye := got["sess1"].Items[0]
+	if !strings.Contains(eye.Tooltip, "has a merge conflict") {
+		t.Errorf("eye.Tooltip = %q, want it to mention the merge conflict", eye.Tooltip)
+	}
+}
+
+func TestBuildRowBadgePayloadsConflictTonePreemptsMergeQueueTone(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", HasConflict: true, MergeQueueState: "MERGEABLE"},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	eye := got["sess1"].Items[0]
+	if eye.Tone != "danger" {
+		t.Errorf("eye.Tone = %q, want danger — a real conflict must win over a stale/optimistic merge queue state", eye.Tone)
+	}
+}
+
+func TestBuildRowBadgePayloadsEyeChipWarnOnBlockedGitLabDependency(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://gitlab.corp.example/team/project/-/merge_requests/17", SessionID: "sess1", Provider: "gitlab", Blocked: true},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	items := got["sess1"].Items
+	if len(items) != 3 {
+		t.Fatalf("items len = %d, want 3 (eye, ci, review) — blocked recolors the eye chip, it doesn't add one", len(items))
+	}
+	eye := items[0]
+	if eye.Tone != "warn" {
+		t.Errorf("eye.Tone = %q, want warn when Blocked is true", eye.Tone)
+	}
+	if !strings.Contains(eye.Tooltip, "blocked by another merge request") {
+		t.Errorf("eye.Tooltip = %q, want it to mention being blocked", eye.Tooltip)
+	}
+}
+
+func TestBuildRowBadgePayloadsConflictTonePreemptsBlocked(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://gitlab.corp.example/team/project/-/merge_requests/17", SessionID: "sess1", Provider: "gitlab", HasConflict: true, Blocked: true},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	eye := got["sess1"].Items[0]
+	if eye.Tone != "danger" {
+		t.Errorf("eye.Tone = %q, want danger — a real conflict must win over just being blocked on sequencing", eye.Tone)
+	}
+	if !strings.Contains(eye.Tooltip, "has a merge conflict") {
+		t.Errorf("eye.Tooltip = %q, want the conflict message, not the blocked one", eye.Tooltip)
+	}
+}
+
+func TestBuildRowBadgePayloadsEyeChipToneByMergeQueueState(t *testing.T) {
+	cases := map[string]string{
+		"":                "neutral",
+		"QUEUED":          "info",
+		"AWAITING_CHECKS": "info",
+		"LOCKED":          "info",
+		"MERGEABLE":       "success",
+		"UNMERGEABLE":     "danger",
+	}
+	for state, wantTone := range cases {
+		t.Run(state, func(t *testing.T) {
+			regs := []registry.Registration{
+				{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", MergeQueueState: state},
+			}
+			got := buildRowBadgePayloads(regs)
+			eye := got["sess1"].Items[0]
+			if eye.Tone != wantTone {
+				t.Errorf("merge queue state %q -> eye.Tone = %q, want %q", state, eye.Tone, wantTone)
+			}
+		})
+	}
+}
+
+func TestBuildRowBadgePayloadsEyeChipTooltipIncludesQueuePosition(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/cwrau/aoe-pr-watch-mcp/pull/42", SessionID: "sess1", Provider: "github", MergeQueueState: "QUEUED", MergeQueuePosition: 3},
+	}
+	got := buildRowBadgePayloads(regs)
+	eye := got["sess1"].Items[0]
+	if !strings.Contains(eye.Tooltip, "in merge queue: queued (position 3)") {
+		t.Errorf("eye.Tooltip = %q, want it to mention the merge queue state and position", eye.Tooltip)
+	}
+}
+
+func TestBuildRowBadgePayloadsEyeChipTooltipUnchangedWithoutMergeQueue(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/cwrau/aoe-pr-watch-mcp/pull/42", SessionID: "sess1", Provider: "github"},
+	}
+	got := buildRowBadgePayloads(regs)
+	eye := got["sess1"].Items[0]
+	if strings.Contains(eye.Tooltip, "merge queue") {
+		t.Errorf("eye.Tooltip = %q, want no merge queue mention when MergeQueueState is empty", eye.Tooltip)
+	}
+}
+
+func TestBuildRowBadgePayloadsEyeChipLinksToGitHubConflictsUIOnConflict(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/cwrau/aoe-pr-watch-mcp/pull/42", SessionID: "sess1", Provider: "github", HasConflict: true},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	eye := got["sess1"].Items[0]
+	if eye.Href != "https://github.com/cwrau/aoe-pr-watch-mcp/pull/42/conflicts" {
+		t.Errorf("eye.Href = %q, want the GitHub conflicts UI", eye.Href)
+	}
+}
+
+func TestBuildRowBadgePayloadsEyeChipFallsBackToMRURLForGitLabConflict(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://gitlab.corp.example/team/project/-/merge_requests/17", SessionID: "sess1", Provider: "gitlab", HasConflict: true},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	eye := got["sess1"].Items[0]
+	if eye.Href != regs[0].PRURL {
+		t.Errorf("eye.Href = %q, want the plain MR URL fallback for GitLab", eye.Href)
+	}
+}
+
+func TestBuildRowBadgePayloadsCIChipLinksToCIHref(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", CIBucket: "failure", CIHref: "https://github.com/o/r/actions/runs/123"},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	ci := got["sess1"].Items[1]
+	if ci.Href != "https://github.com/o/r/actions/runs/123" {
+		t.Errorf("ci.Href = %q, want the specific run link over the PR URL", ci.Href)
+	}
+}
+
+func TestBuildRowBadgePayloadsCIChipFallsBackToPRURLWithoutCIHref(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", CIBucket: "pending"},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	ci := got["sess1"].Items[1]
+	if ci.Href != regs[0].PRURL {
+		t.Errorf("ci.Href = %q, want the PR URL fallback when no CIHref is known", ci.Href)
+	}
+}
+
+func TestBuildRowBadgePayloadsReviewChipLinksToReviewHref(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", LatestReviewState: "APPROVED", ReviewHref: "https://github.com/o/r/pull/1#pullrequestreview-999"},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	review := got["sess1"].Items[2]
+	if review.Href != "https://github.com/o/r/pull/1#pullrequestreview-999" {
+		t.Errorf("review.Href = %q, want the specific review link over the PR URL", review.Href)
+	}
+}
+
+func TestBuildRowBadgePayloadsReviewChipFallsBackToPRURLWithoutReviewHref(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github"},
+	}
+
+	got := buildRowBadgePayloads(regs)
+	review := got["sess1"].Items[2]
+	if review.Href != regs[0].PRURL {
+		t.Errorf("review.Href = %q, want the PR URL fallback when no ReviewHref is known", review.Href)
+	}
+}
+
 func TestBuildRowBadgePayloadsReviewTooltipIncludesReviewerAndTimestamp(t *testing.T) {
 	at := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
 	regs := []registry.Registration{

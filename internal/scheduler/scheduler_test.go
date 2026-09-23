@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -464,14 +465,14 @@ func TestTickPersistsStateEvenWhenNotifyFails(t *testing.T) {
 	now := time.Now()
 	reg := registry.Registration{
 		PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github",
-		ReviewCount: 1, CIBucket: "pending", Unresolved: 2,
+		ReviewCount: 1, CIBucket: "pending", UnresolvedThreadIDs: []string{"t1", "t2"},
 		NextDueAt: now.Add(-time.Minute), CreatedAt: now,
 	}
 	if err := store.Add(ctx, reg); err != nil {
 		t.Fatalf("Add() error = %v", err)
 	}
 
-	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "open", ReviewCount: 1, CIBucket: "failure", Unresolved: 2, Title: "Fix the thing"}}
+	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "open", ReviewCount: 1, CIBucket: "failure", UnresolvedThreadIDs: []string{"t1", "t2"}, Title: "Fix the thing"}}
 	notify := &fakeNotifier{err: errors.New("Acp-mode sessions have no tmux pane; send is not supported")}
 	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: notify}
 	if err := sched.Tick(ctx); err != nil {
@@ -487,6 +488,45 @@ func TestTickPersistsStateEvenWhenNotifyFails(t *testing.T) {
 	}
 	if !got.NextDueAt.After(reg.NextDueAt) {
 		t.Errorf("next_due_at = %v, want it advanced past %v (a failed send must not hold the registration due-immediately forever)", got.NextDueAt, reg.NextDueAt)
+	}
+}
+
+// TestTickPersistsHasConflict verifies a check result's HasConflict flag
+// makes it all the way through processGitHubBatch/finish into the stored
+// registration, and that a later check reporting the conflict resolved
+// clears it back out again (not just a one-way latch like MergedAt/Status).
+func TestTickPersistsHasConflict(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+	reg := registry.Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github",
+		NextDueAt: now.Add(-time.Minute), CreatedAt: now,
+	}
+	if err := store.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+
+	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "open", HasConflict: true}}
+	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{}}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	got := getReg(t, store, reg.PRURL)
+	if !got.HasConflict {
+		t.Error("stored HasConflict = false, want true after a check reports a conflict")
+	}
+
+	if err := store.UpdateState(ctx, reg.PRURL, registry.StateUpdate{NextDueAt: now.Add(-time.Minute)}); err != nil {
+		t.Fatalf("UpdateState() error = %v", err)
+	}
+	gh.result = provider.CheckResult{State: "open", HasConflict: false}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	got = getReg(t, store, reg.PRURL)
+	if got.HasConflict {
+		t.Error("stored HasConflict = true, want false once a later check reports the conflict resolved")
 	}
 }
 
@@ -531,7 +571,7 @@ func TestTickBacksOffOnCheckerError(t *testing.T) {
 	now := time.Now()
 	reg := registry.Registration{
 		PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github",
-		ReviewCount: 3, CIBucket: "success", Unresolved: 1,
+		ReviewCount: 3, CIBucket: "success", UnresolvedThreadIDs: []string{"t1"},
 		NextDueAt: now.Add(-time.Minute), CreatedAt: now,
 	}
 	if err := store.Add(ctx, reg); err != nil {
@@ -551,8 +591,8 @@ func TestTickBacksOffOnCheckerError(t *testing.T) {
 	if got.NextDueAt.Before(wantAtLeast) {
 		t.Errorf("next_due_at = %v, want at least %v (one MinPollInterval out) after a checker error", got.NextDueAt, wantAtLeast)
 	}
-	if got.ReviewCount != 3 || got.CIBucket != "success" || got.Unresolved != 1 {
-		t.Errorf("stored state = {reviews:%d ci:%q unresolved:%d}, want the unchanged {3 success 1} (a failed check knows nothing new)", got.ReviewCount, got.CIBucket, got.Unresolved)
+	if got.ReviewCount != 3 || got.CIBucket != "success" || !slices.Equal(got.UnresolvedThreadIDs, []string{"t1"}) {
+		t.Errorf("stored state = {reviews:%d ci:%q unresolved:%v}, want the unchanged {3 success [t1]} (a failed check knows nothing new)", got.ReviewCount, got.CIBucket, got.UnresolvedThreadIDs)
 	}
 }
 

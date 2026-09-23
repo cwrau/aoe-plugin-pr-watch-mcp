@@ -68,8 +68,11 @@ const githubPullRequestFieldsQuery = `      state
       body
       headRefOid
       mergedAt
+      mergeable
+      mergeQueueEntry { state position }
       reviewCount: reviews { totalCount }
-      latestReview: reviews(last: 1) { nodes { author { login } state submittedAt } }
+      latestReview: reviews(last: 1) { nodes { author { login } state submittedAt url } }
+      reviewThreads(first: 100) { nodes { id isResolved } }
       commits(last: 1) {
         nodes { commit { statusCheckRollup { state } } }
       }`
@@ -77,11 +80,16 @@ const githubPullRequestFieldsQuery = `      state
 // githubPullRequestFields is the shape of one aliased pullRequest entry in
 // a batch response.
 type githubPullRequestFields struct {
-	State       string `json:"state"`
-	Title       string `json:"title"`
-	Body        string `json:"body"`
-	HeadRefOid  string `json:"headRefOid"`
-	MergedAt    string `json:"mergedAt"`
+	State           string `json:"state"`
+	Title           string `json:"title"`
+	Body            string `json:"body"`
+	HeadRefOid      string `json:"headRefOid"`
+	MergedAt        string `json:"mergedAt"`
+	Mergeable       string `json:"mergeable"` // "MERGEABLE" | "CONFLICTING" | "UNKNOWN" (not yet computed)
+	MergeQueueEntry *struct {
+		State    string `json:"state"` // "QUEUED" | "AWAITING_CHECKS" | "LOCKED" | "MERGEABLE" | "UNMERGEABLE"
+		Position int    `json:"position"`
+	} `json:"mergeQueueEntry"` // nil if the PR isn't (or is no longer) in the repo's merge queue
 	ReviewCount struct {
 		TotalCount int `json:"totalCount"`
 	} `json:"reviewCount"`
@@ -92,8 +100,22 @@ type githubPullRequestFields struct {
 			} `json:"author"`
 			State       string `json:"state"`
 			SubmittedAt string `json:"submittedAt"`
+			URL         string `json:"url"`
 		} `json:"nodes"`
 	} `json:"latestReview"`
+	// ReviewThreads mirrors GitLab's own scope for Unresolved: inline
+	// review-comment threads only, not plain top-level PR conversation
+	// comments (GitHub has no "resolvable" concept for those, same as
+	// GitLab's discussions API only marks review-type notes resolvable).
+	// first: 100 matches the same "good enough, not exhaustively paginated"
+	// precedent as reviews(last: 1)/commits(last: 1) above — a PR with more
+	// than 100 threads is rare enough not to chase further here.
+	ReviewThreads struct {
+		Nodes []struct {
+			ID         string `json:"id"`
+			IsResolved bool   `json:"isResolved"`
+		} `json:"nodes"`
+	} `json:"reviewThreads"`
 	Commits struct {
 		Nodes []struct {
 			Commit struct {
@@ -105,19 +127,16 @@ type githubPullRequestFields struct {
 	} `json:"commits"`
 }
 
-// githubBatchGraphQLResponse is the shape of a batched query's response:
-// `data` is keyed by repo alias, each value keyed by that repo's PR
-// aliases — exactly mirroring the aliasing buildGitHubBatchQuery
-// generates, so `Data["repo0"]["pr1"]` is that repo's second PR's raw
-// field JSON, decoded lazily since a null repository or pullRequest (not
-// found / no access) must be told apart from a real payload.
+// githubBatchGraphQLResponse is the shape of a batched query's response.
+// `data` is keyed by every root query field's own alias — each repo alias
+// (e.g. "repo0") *and* the fixed "rateLimit" field are siblings directly
+// under `data`, since GraphQL nests every root query field there, not just
+// the aliased ones. That means "rateLimit"'s raw value isn't shaped like a
+// repo's PR-alias map, so Data is left untyped here (decoded per-key by
+// rateLimit()/pullRequestRaw() below) rather than given one shape that
+// would only fit the repo aliases.
 type githubBatchGraphQLResponse struct {
-	Data      map[string]map[string]json.RawMessage `json:"data"`
-	RateLimit struct {
-		Limit     int    `json:"limit"`
-		Remaining int    `json:"remaining"`
-		ResetAt   string `json:"resetAt"`
-	} `json:"rateLimit"`
+	Data map[string]json.RawMessage `json:"data"`
 	// Errors carries GraphQL-level failures (rate limiting, NOT_FOUND,
 	// field errors). GitHub returns these with HTTP 200, so checkHTTPStatus
 	// never sees them. Any top-level error fails the whole batch rather
@@ -127,6 +146,43 @@ type githubBatchGraphQLResponse struct {
 	Errors []struct {
 		Message string `json:"message"`
 	} `json:"errors"`
+}
+
+// rateLimit decodes the `rateLimit` field GitHub nests inside `data` (a
+// root query field, like every repo alias here — see the type doc above)
+// into a RateBudget. Missing or unparseable rate limit data — which
+// shouldn't happen, since the query always asks for it — reports the zero
+// RateBudget, the same "no signal yet" value ComputeInterval/HasHeadroom
+// already handle safely everywhere else.
+func (r *githubBatchGraphQLResponse) rateLimit() RateBudget {
+	var rl struct {
+		Limit     int    `json:"limit"`
+		Remaining int    `json:"remaining"`
+		ResetAt   string `json:"resetAt"`
+	}
+	if err := json.Unmarshal(r.Data["rateLimit"], &rl); err != nil {
+		return RateBudget{}
+	}
+	return RateBudget{Limit: rl.Limit, Remaining: rl.Remaining, ResetAt: parseRFC3339OrZero(rl.ResetAt)}
+}
+
+// pullRequestRaw returns the raw JSON for one aliased pullRequest entry
+// (e.g. repoAlias "repo0", prAlias "pr1"), decoding its parent repo
+// alias's own object on demand — data[repoAlias] is itself an object
+// keyed by that repo's PR aliases, mirroring buildGitHubBatchQuery's
+// nesting. A null/missing repository (not found or no access) reports
+// false, same as a null/missing pullRequest within it.
+func (r *githubBatchGraphQLResponse) pullRequestRaw(repoAlias, prAlias string) (json.RawMessage, bool) {
+	repoRaw, ok := r.Data[repoAlias]
+	if !ok || len(repoRaw) == 0 || string(repoRaw) == "null" {
+		return nil, false
+	}
+	var repo map[string]json.RawMessage
+	if err := json.Unmarshal(repoRaw, &repo); err != nil {
+		return nil, false
+	}
+	raw, ok := repo[prAlias]
+	return raw, ok
 }
 
 func mapGitHubRollupState(state string) string {
@@ -162,11 +218,29 @@ func buildCheckResult(pr githubPullRequestFields) CheckResult {
 		Title:       pr.Title,
 		Description: pr.Body,
 		ReviewCount: pr.ReviewCount.TotalCount,
+		HasConflict: pr.Mergeable == "CONFLICTING",
 	}
-	if len(pr.LatestReview.Nodes) > 0 {
+	if pr.MergeQueueEntry != nil {
+		result.MergeQueueState = pr.MergeQueueEntry.State
+		result.MergeQueuePosition = pr.MergeQueueEntry.Position
+	}
+	for _, t := range pr.ReviewThreads.Nodes {
+		if !t.IsResolved {
+			result.UnresolvedThreadIDs = append(result.UnresolvedThreadIDs, t.ID)
+		}
+	}
+	// A DISMISSED review carries no current signal — GitHub updates the
+	// review's own `state` in place when it's dismissed, rather than
+	// removing it from the list, but a dismissed review no longer counts
+	// toward anything (it doesn't block merge, doesn't reflect anyone's
+	// current opinion). Treating it as if this PR had no review at all,
+	// rather than surfacing "DISMISSED" as if it were a real state, is both
+	// more honest and reuses every "no review yet" code path for free.
+	if len(pr.LatestReview.Nodes) > 0 && pr.LatestReview.Nodes[0].State != "DISMISSED" {
 		result.LatestReviewer = pr.LatestReview.Nodes[0].Author.Login
 		result.LatestReviewState = pr.LatestReview.Nodes[0].State
 		result.LatestReviewAt = parseRFC3339OrZero(pr.LatestReview.Nodes[0].SubmittedAt)
+		result.ReviewHref = pr.LatestReview.Nodes[0].URL
 	}
 	if pr.State == "MERGED" {
 		result.MergedAt = parseRFC3339OrZero(pr.MergedAt)
@@ -292,7 +366,7 @@ func (c *GitHubChecker) CheckBatch(ctx context.Context, urls []string) (map[stri
 		if !ok {
 			continue
 		}
-		raw, ok := resp.Data[repoAlias][prAlias]
+		raw, ok := resp.pullRequestRaw(repoAlias, prAlias)
 		// A null repository or pullRequest (not found / no access) decodes
 		// as a missing map entry or a literal JSON "null" here — either
 		// way there is nothing to report for this one URL, same case
@@ -313,13 +387,7 @@ func (c *GitHubChecker) CheckBatch(ctx context.Context, urls []string) (map[stri
 		}
 	}
 
-	budgets := GitHubBudgets{
-		GraphQL: RateBudget{
-			Limit:     resp.RateLimit.Limit,
-			Remaining: resp.RateLimit.Remaining,
-			ResetAt:   parseRFC3339OrZero(resp.RateLimit.ResetAt),
-		},
-	}
+	budgets := GitHubBudgets{GraphQL: resp.rateLimit()}
 
 	// Terminal PRs don't need the action_required cross-check — same
 	// early-out the single-PR path always had. The REST budget reported
@@ -341,8 +409,13 @@ func (c *GitHubChecker) CheckBatch(ctx context.Context, urls []string) (map[stri
 			if runs.actionRequired && result.CIBucket != "failure" {
 				result.CIBucket = "action_required"
 			}
-			if result.CIBucket == "failure" || result.CIBucket == "action_required" {
+			switch result.CIBucket {
+			case "failure":
 				result.CIDetail = runs.failingRunName
+				result.CIHref = runs.failingRunHref
+			case "action_required":
+				result.CIDetail = runs.actionRequiredName
+				result.CIHref = runs.actionRequiredHref
 			}
 		}
 		results[url] = result
@@ -395,29 +468,44 @@ type githubActionsRunsResponse struct {
 	WorkflowRuns []struct {
 		Name       string `json:"name"`
 		Conclusion string `json:"conclusion"`
+		HTMLURL    string `json:"html_url"`
 	} `json:"workflow_runs"`
 }
 
 // actionsRunsResult is what checkActionRequired learns from one PR's
 // Actions runs page: whether a run is stuck on the fork-PR
-// maintainer-approval gate, and (best-effort) the name of the first run
-// that didn't succeed, for CIDetail — the same page already fetched for the
-// action_required cross-check, so surfacing this costs no extra call.
+// maintainer-approval gate, plus (best-effort) the name and link of the
+// first run of each of the two kinds CheckBatch might report — a genuine
+// failure and an action_required gate — for CIDetail/CIHref. These are kept
+// separate rather than merged into one "first non-succeeding run" search:
+// CIBucket can be "failure" from the GraphQL statusCheckRollup (a signal
+// this REST call never touches) while the only non-succeeding run this page
+// actually has is action_required — conflating the two used to point
+// CIHref at an "awaiting approval" run while the badge said "failure"
+// (confirmed live: github.com/agent-of-empires/agent-of-empires/pull/4083).
+// Picking the run whose conclusion actually matches the reported bucket
+// (see CheckBatch) avoids that; if this page has no run of the matching
+// kind, CIDetail/CIHref just stay empty rather than naming the wrong one.
+// The *Href fields link to the run itself (a "pipeline"), not the specific
+// job within it — narrowing further would need one more REST call per
+// checked PR (GET .../actions/runs/{id}/jobs), not made here.
 type actionsRunsResult struct {
-	actionRequired bool
-	failingRunName string
+	actionRequired     bool
+	actionRequiredName string
+	actionRequiredHref string
+	failingRunName     string
+	failingRunHref     string
 }
 
-// failingRunConclusions are workflow_runs[].conclusion values that mean the
-// run didn't succeed and are worth naming in CIDetail. "skipped" and
-// "neutral" are deliberately excluded: neither indicates a problem worth
-// surfacing as the reason CI looks red.
-var failingRunConclusions = map[string]bool{
+// trueFailureConclusions are workflow_runs[].conclusion values that mean
+// the run itself actually failed — distinct from action_required (gated,
+// not failed) and from "skipped"/"neutral" (neither indicates a problem
+// worth surfacing as the reason CI looks red).
+var trueFailureConclusions = map[string]bool{
 	"failure":         true,
 	"timed_out":       true,
 	"cancelled":       true,
 	"startup_failure": true,
-	"action_required": true,
 }
 
 func (c *GitHubChecker) checkActionRequired(ctx context.Context, owner, repo, headSHA string) (RateBudget, actionsRunsResult, error) {
@@ -458,9 +546,14 @@ func (c *GitHubChecker) checkActionRequired(ctx context.Context, owner, repo, he
 	for _, run := range out.WorkflowRuns {
 		if run.Conclusion == "action_required" {
 			result.actionRequired = true
+			if result.actionRequiredName == "" {
+				result.actionRequiredName = run.Name
+				result.actionRequiredHref = run.HTMLURL
+			}
 		}
-		if result.failingRunName == "" && failingRunConclusions[run.Conclusion] {
+		if result.failingRunName == "" && trueFailureConclusions[run.Conclusion] {
 			result.failingRunName = run.Name
+			result.failingRunHref = run.HTMLURL
 		}
 	}
 	return budget, result, nil

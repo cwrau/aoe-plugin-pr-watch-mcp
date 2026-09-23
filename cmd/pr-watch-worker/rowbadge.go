@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
+	"github.com/cwrau/aoe-pr-watch-mcp/internal/provider"
 	"github.com/cwrau/aoe-pr-watch-mcp/internal/registry"
 )
 
@@ -66,8 +68,15 @@ func buildRowBadgePayloads(regs []registry.Registration) map[string]rowBadgePayl
 // badgeChipsFor renders one registration's chip cluster. A StatusWatching
 // registration gets three chips: the eye identity marker plus separate,
 // independently visible CI and review chips (previously that state was only
-// reachable via the eye chip's tooltip on hover). StatusMerged and
-// StatusClosed collapse to a single distinct, fixed chip instead — their
+// reachable via the eye chip's tooltip on hover). The eye chip itself is
+// recolored (and re-linked, and re-tooltipped) to reflect a merge conflict
+// or GitHub merge queue state — a conflict always wins (danger) over
+// whatever the merge queue state would otherwise say, since it's the more
+// urgent, more actionable problem. No separate conflict chip: a conflict is
+// exactly the kind of "this identity marker itself has a problem" signal
+// the eye chip already exists to carry, once it's colorable at all.
+// StatusMerged and StatusClosed collapse to a single distinct, fixed chip
+// instead — their
 // CI/review state is no longer meaningful once the PR/MR itself is
 // resolved, and (being terminal) that chip stays exactly as-is forever once
 // set, which is the whole point of using a badge instead of a one-time
@@ -97,27 +106,119 @@ func badgeChipsFor(r registry.Registration) []badgeChip {
 	default:
 		ci := ciBadge(r.CIBucket)
 		review := reviewBadge(r.LatestReviewState)
-		return []badgeChip{
-			{
-				Icon:    "eye",
-				Tone:    "neutral",
-				Tooltip: subject,
-				Href:    r.PRURL,
-			},
-			{
+		chips := []badgeChip{{
+			Icon:    "eye",
+			Tone:    mainChipTone(r),
+			Tooltip: mainChipTooltip(subject, r),
+			Href:    mainChipHref(r),
+		}}
+		chips = append(chips,
+			badgeChip{
 				Text:    ci.Text,
 				Tone:    ci.Tone,
 				Tooltip: ciTooltip(ci.Text, r.CIDetail),
-				Href:    r.PRURL,
+				Href:    hrefOr(r.CIHref, r.PRURL),
 			},
-			{
+			badgeChip{
 				Text:    review.Text,
 				Tone:    review.Tone,
 				Tooltip: reviewTooltip(review.Text, r.LatestReviewer, r.LatestReviewAt),
-				Href:    r.PRURL,
+				Href:    hrefOr(r.ReviewHref, r.PRURL),
 			},
+		)
+		return chips
+	}
+}
+
+// mainChipTone colors the eye chip, most urgent condition first: a merge
+// conflict (danger) is a real defect in this PR/MR itself, so it always
+// wins. Being blocked on a GitLab dependency (warn, not danger) isn't a
+// defect at all — the MR itself may be perfectly fine, it's just waiting on
+// another one to merge first, a sequencing state rather than a problem to
+// fix here. Otherwise it falls back to the GitHub merge queue entry state
+// (always "" for GitLab, which has no merge-queue support here) — a real
+// problem there (UNMERGEABLE) is danger, actually about to merge
+// (MERGEABLE) is success, and every other in-progress state (QUEUED,
+// AWAITING_CHECKS, LOCKED) is info. None of these present keeps the chip's
+// ordinary neutral tone.
+func mainChipTone(r registry.Registration) string {
+	switch {
+	case r.HasConflict:
+		return "danger"
+	case r.Blocked:
+		return "warn"
+	}
+	switch r.MergeQueueState {
+	case "":
+		return "neutral"
+	case "MERGEABLE":
+		return "success"
+	case "UNMERGEABLE":
+		return "danger"
+	default:
+		return "info"
+	}
+}
+
+// mergeQueueLabel renders state as lowercase, space-separated text for the
+// tooltip — e.g. "AWAITING_CHECKS" -> "awaiting checks".
+func mergeQueueLabel(state string) string {
+	return strings.ToLower(strings.ReplaceAll(state, "_", " "))
+}
+
+// mainChipTooltip appends whichever of conflict/blocked/merge-queue detail
+// applies to the eye chip's usual subject tooltip, in the same priority
+// order as mainChipTone; none applying leaves the tooltip as plain subject.
+func mainChipTooltip(subject string, r registry.Registration) string {
+	switch {
+	case r.HasConflict:
+		return fmt.Sprintf("%s — has a merge conflict", subject)
+	case r.Blocked:
+		return fmt.Sprintf("%s — blocked by another merge request", subject)
+	case r.MergeQueueState != "" && r.MergeQueuePosition > 0:
+		return fmt.Sprintf("%s — in merge queue: %s (position %d)", subject, mergeQueueLabel(r.MergeQueueState), r.MergeQueuePosition)
+	case r.MergeQueueState != "":
+		return fmt.Sprintf("%s — in merge queue: %s", subject, mergeQueueLabel(r.MergeQueueState))
+	default:
+		return subject
+	}
+}
+
+// mainChipHref sends the eye chip straight to GitHub's conflict-resolution
+// UI while there's a conflict to resolve, and to the plain PR/MR URL
+// otherwise.
+func mainChipHref(r registry.Registration) string {
+	if r.HasConflict {
+		return conflictHref(r)
+	}
+	return r.PRURL
+}
+
+// conflictHref links straight to GitHub's own conflict-resolution UI,
+// derivable from the PR URL alone with no extra API call. GitLab has no
+// equivalent worth hardcoding here: its conflict-resolution page's path
+// has changed across versions and isn't reliably guessable the way
+// GitHub's is, so a GitLab registration just falls back to the plain MR
+// URL like it would without this badge at all.
+func conflictHref(r registry.Registration) string {
+	if r.Provider == "github" {
+		if owner, repo, number, err := provider.ParseGitHubPRURL(r.PRURL); err == nil {
+			return fmt.Sprintf("https://github.com/%s/%s/pull/%d/conflicts", owner, repo, number)
 		}
 	}
+	return r.PRURL
+}
+
+// hrefOr returns specific if it's known, falling back to the PR/MR URL
+// itself — the CI/review chips link to the exact job/pipeline or
+// review/comment when the provider reported one, and to the PR/MR as a
+// whole otherwise (e.g. an unreviewed PR, or a CI provider that doesn't
+// expose a per-run URL).
+func hrefOr(specific, fallback string) string {
+	if specific != "" {
+		return specific
+	}
+	return fallback
 }
 
 // ciTooltip appends the failing check/job name to the CI tooltip, when

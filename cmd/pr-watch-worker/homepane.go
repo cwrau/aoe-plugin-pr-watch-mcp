@@ -122,30 +122,39 @@ func registrationColumns(reg registry.Registration, titleOf func(string) string,
 
 	// Prefer the PR/MR's real title once the first successful check has
 	// fetched it; before that (or if a fetch ever comes back empty), fall
-	// back to the derived short ref instead. No Prefix field: the host
-	// renders it in a shrink-0 span that never truncates via CSS the way
+	// back to the derived short ref instead. No Prefix field: the host used
+	// to render it in a shrink-0 span that never truncated via CSS the way
 	// Label does, so a long org/repo name there alone overflowed the grid
-	// column and bled into the session column beside it (confirmed live).
-	// A single truncated Label avoids that class of overflow entirely.
+	// column and bled into the session column beside it (confirmed live) —
+	// still no Prefix field here for that reason, but Label itself is no
+	// longer truncated server-side (see homepane_test.go's
+	// TestBuildHomePanePayloadDoesNotTruncateLongLabels for why: the host's
+	// `columns` grid was patched to stack to one column below the `sm`
+	// breakpoint and, verified live against a running dashboard at both the
+	// stacked and 2-column widths, its Label span now cleanly
+	// CSS-ellipsis-clips an unbroken 120-character string with no overflow
+	// either way — sending the real, untruncated title lets the host's own
+	// responsive clipping do a better job than a fixed character count ever
+	// could).
 	prLabel := reg.Title
 	if prLabel == "" {
 		prLabel = shortRef(reg)
 	}
-	prLabel = truncateLabel(prLabel)
-	sessionLabel = truncateLabel(sessionLabel)
+
+	badges := []rowBadge{providerBadge(reg.Provider)}
+	if reg.HasConflict {
+		badges = append(badges, conflictBadge())
+	}
+	badges = append(badges, ciBadge(reg.CIBucket), reviewBadge(reg.LatestReviewState))
 
 	return columnsBlock{
 		Kind: "columns",
 		Children: []any{
 			rowBlock{
-				Kind:  "row",
-				Label: prLabel,
-				Href:  reg.PRURL,
-				Badges: []rowBadge{
-					providerBadge(reg.Provider),
-					ciBadge(reg.CIBucket),
-					reviewBadge(reg.LatestReviewState),
-				},
+				Kind:   "row",
+				Label:  prLabel,
+				Href:   reg.PRURL,
+				Badges: badges,
 			},
 			rowBlock{
 				Kind:  "row",
@@ -154,25 +163,6 @@ func registrationColumns(reg registry.Registration, titleOf func(string) string,
 			},
 		},
 	}
-}
-
-// maxRowLabelLen bounds a row's label text. The host's `columns` block lays
-// two rows out in a rigid, equal-width CSS grid whose items have no
-// min-width: 0 (confirmed by reading PluginSlots.tsx directly), so an
-// unbroken long string — a real PR title, once fetched, is exactly that —
-// overflows its 50% track and visually covers the sibling column instead of
-// wrapping or eliding. Truncating here, before the title is ever sent, is
-// the defensive fix on this side of that boundary: it can't overflow a grid
-// track it never grows past. Kept tight enough for the narrowest column the
-// pane renders at (mobile width), not just desktop.
-const maxRowLabelLen = 25
-
-func truncateLabel(s string) string {
-	r := []rune(s)
-	if len(r) <= maxRowLabelLen {
-		return s
-	}
-	return string(r[:maxRowLabelLen-1]) + "…"
 }
 
 // shortRef derives a compact PR/MR reference from the registration's own
@@ -197,6 +187,10 @@ func providerBadge(prov string) rowBadge {
 		return rowBadge{Text: "GH", Tone: "neutral"}
 	}
 	return rowBadge{Text: "GL", Tone: "neutral"}
+}
+
+func conflictBadge() rowBadge {
+	return rowBadge{Text: "conflict", Tone: "danger"}
 }
 
 func ciBadge(bucket string) rowBadge {

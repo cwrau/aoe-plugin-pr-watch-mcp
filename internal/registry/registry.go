@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -24,23 +25,29 @@ const (
 // Registration is one watched PR/MR: which session to wake, where its
 // last-seen state sits, and when the scheduler should check it next.
 type Registration struct {
-	PRURL             string
-	SessionID         string
-	Provider          string // "github" | "gitlab"
-	ReviewCount       int
-	CIBucket          string
-	CIDetail          string // e.g. the failing check/job name; empty if not applicable/unknown
-	Unresolved        int
-	LatestReviewState string // e.g. "APPROVED", "CHANGES_REQUESTED", "COMMENTED"; empty if no review yet
-	LatestReviewer    string // empty if no review yet
-	LatestReviewAt    time.Time
-	Title             string // empty until the first successful check populates it
-	Description       string // the PR/MR body; empty until the first successful check populates it, or if the provider returned none
-	Status            string // one of the Status* constants; see their doc comments
-	NextDueAt         time.Time
-	Archived          bool
-	CreatedAt         time.Time
-	MergedAt          time.Time // zero unless Status == StatusMerged
+	PRURL               string
+	SessionID           string
+	Provider            string // "github" | "gitlab"
+	ReviewCount         int
+	CIBucket            string
+	CIDetail            string   // e.g. the failing check/job name; empty if not applicable/unknown
+	CIHref              string   // link to the relevant job, or failing that the pipeline/run itself; empty if unknown
+	ReviewHref          string   // link to the latest review/comment; empty if unknown
+	UnresolvedThreadIDs []string // IDs of threads unresolved as of the last check; compared by identity so a same-window resolve+new-thread can't hide the new one
+	LatestReviewState   string   // e.g. "APPROVED", "CHANGES_REQUESTED", "COMMENTED"; empty if no review yet (also empty for a DISMISSED review — treated the same as no review)
+	LatestReviewer      string   // empty if no review yet
+	LatestReviewAt      time.Time
+	Title               string // empty until the first successful check populates it
+	Description         string // the PR/MR body; empty until the first successful check populates it, or if the provider returned none
+	Status              string // one of the Status* constants; see their doc comments
+	NextDueAt           time.Time
+	Archived            bool
+	CreatedAt           time.Time
+	MergedAt            time.Time // zero unless Status == StatusMerged
+	HasConflict         bool      // true if the PR/MR can't currently be merged due to a conflict with its target branch
+	MergeQueueState     string    // GitHub merge queue entry state; empty if not in a merge queue
+	MergeQueuePosition  int       // this entry's position in the merge queue; meaningless when MergeQueueState == ""
+	Blocked             bool      // GitLab only: true if blocked on an unmerged merge request dependency
 }
 
 type Store struct {
@@ -55,7 +62,9 @@ CREATE TABLE IF NOT EXISTS registrations (
 	review_count INTEGER NOT NULL DEFAULT 0,
 	ci_bucket TEXT NOT NULL DEFAULT 'none',
 	ci_detail TEXT NOT NULL DEFAULT '',
-	unresolved INTEGER NOT NULL DEFAULT 0,
+	ci_href TEXT NOT NULL DEFAULT '',
+	review_href TEXT NOT NULL DEFAULT '',
+	unresolved_thread_ids TEXT NOT NULL DEFAULT '[]',
 	latest_review_state TEXT NOT NULL DEFAULT '',
 	latest_reviewer TEXT NOT NULL DEFAULT '',
 	latest_review_at INTEGER NOT NULL DEFAULT 0,
@@ -65,7 +74,11 @@ CREATE TABLE IF NOT EXISTS registrations (
 	next_due_at INTEGER NOT NULL,
 	archived INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL,
-	merged_at INTEGER NOT NULL DEFAULT 0
+	merged_at INTEGER NOT NULL DEFAULT 0,
+	has_conflict INTEGER NOT NULL DEFAULT 0,
+	merge_queue_state TEXT NOT NULL DEFAULT '',
+	merge_queue_position INTEGER NOT NULL DEFAULT 0,
+	blocked INTEGER NOT NULL DEFAULT 0
 );
 `
 
@@ -107,6 +120,19 @@ var columnMigrations = []string{
 	`ALTER TABLE registrations ADD COLUMN latest_reviewer TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE registrations ADD COLUMN latest_review_at INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE registrations ADD COLUMN merged_at INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE registrations ADD COLUMN has_conflict INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE registrations ADD COLUMN ci_href TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE registrations ADD COLUMN review_href TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE registrations ADD COLUMN merge_queue_state TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE registrations ADD COLUMN merge_queue_position INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE registrations ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0`,
+	// Supersedes the old `unresolved` (a plain count) column, which stays
+	// in place unused rather than being dropped — same
+	// never-destroy-a-column policy as everywhere else here. A plain count
+	// couldn't tell a same-window resolve+new-thread apart from no change
+	// at all; storing the actual thread IDs (as JSON) lets Diff compare by
+	// identity instead.
+	`ALTER TABLE registrations ADD COLUMN unresolved_thread_ids TEXT NOT NULL DEFAULT '[]'`,
 }
 
 func migrateAddedColumns(db *sql.DB) error {
@@ -131,10 +157,10 @@ func (s *Store) Close() error { return s.db.Close() }
 // how that PR/MR resumes being watched.
 func (s *Store) Add(ctx context.Context, r Registration) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, ci_detail, unresolved, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, ci_detail, ci_href, review_href, unresolved_thread_ids, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(pr_url) DO UPDATE SET session_id = excluded.session_id, next_due_at = excluded.next_due_at, status = excluded.status
-	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.CIDetail, r.Unresolved, r.LatestReviewState, r.LatestReviewer, unixOrZero(r.LatestReviewAt), r.Title, r.Description, StatusWatching, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix(), unixOrZero(r.MergedAt))
+	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.CIDetail, r.CIHref, r.ReviewHref, marshalThreadIDs(r.UnresolvedThreadIDs), r.LatestReviewState, r.LatestReviewer, unixOrZero(r.LatestReviewAt), r.Title, r.Description, StatusWatching, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix(), unixOrZero(r.MergedAt), boolToInt(r.HasConflict), r.MergeQueueState, r.MergeQueuePosition, boolToInt(r.Blocked))
 	if err != nil {
 		return fmt.Errorf("add registration: %w", err)
 	}
@@ -151,8 +177,9 @@ func (s *Store) Get(ctx context.Context, prURL string) (Registration, bool, erro
 
 	var r Registration
 	var nextDue, created, latestReviewAt, mergedAt int64
-	var archived int
-	if err := row.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.CIDetail, &r.Unresolved, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt); err != nil {
+	var archived, hasConflict, blocked int
+	var unresolvedThreadIDs string
+	if err := row.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.CIDetail, &r.CIHref, &r.ReviewHref, &unresolvedThreadIDs, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt, &hasConflict, &r.MergeQueueState, &r.MergeQueuePosition, &blocked); err != nil {
 		if err == sql.ErrNoRows {
 			return Registration{}, false, nil
 		}
@@ -163,6 +190,9 @@ func (s *Store) Get(ctx context.Context, prURL string) (Registration, bool, erro
 	r.CreatedAt = time.Unix(created, 0)
 	r.LatestReviewAt = zeroOrUnix(latestReviewAt)
 	r.MergedAt = zeroOrUnix(mergedAt)
+	r.HasConflict = hasConflict != 0
+	r.Blocked = blocked != 0
+	r.UnresolvedThreadIDs = unmarshalThreadIDs(unresolvedThreadIDs)
 	return r, true, nil
 }
 
@@ -261,21 +291,27 @@ func (s *Store) DueBefore(ctx context.Context, t time.Time) ([]Registration, err
 // grouped into a struct rather than positional parameters since the list
 // has grown past the point a caller can safely track by position alone.
 type StateUpdate struct {
-	ReviewCount       int
-	CIBucket          string
-	CIDetail          string
-	Unresolved        int
-	LatestReviewState string
-	LatestReviewer    string
-	LatestReviewAt    time.Time
-	Title             string
-	Description       string
-	NextDueAt         time.Time
+	ReviewCount         int
+	CIBucket            string
+	CIDetail            string
+	CIHref              string
+	ReviewHref          string
+	UnresolvedThreadIDs []string
+	LatestReviewState   string
+	LatestReviewer      string
+	LatestReviewAt      time.Time
+	Title               string
+	Description         string
+	NextDueAt           time.Time
+	HasConflict         bool
+	MergeQueueState     string
+	MergeQueuePosition  int
+	Blocked             bool
 }
 
 func (s *Store) UpdateState(ctx context.Context, prURL string, u StateUpdate) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE registrations SET review_count = ?, ci_bucket = ?, ci_detail = ?, unresolved = ?, latest_review_state = ?, latest_reviewer = ?, latest_review_at = ?, title = ?, description = ?, next_due_at = ? WHERE pr_url = ?`,
-		u.ReviewCount, u.CIBucket, u.CIDetail, u.Unresolved, u.LatestReviewState, u.LatestReviewer, unixOrZero(u.LatestReviewAt), u.Title, u.Description, u.NextDueAt.Unix(), prURL)
+	_, err := s.db.ExecContext(ctx, `UPDATE registrations SET review_count = ?, ci_bucket = ?, ci_detail = ?, ci_href = ?, review_href = ?, unresolved_thread_ids = ?, latest_review_state = ?, latest_reviewer = ?, latest_review_at = ?, title = ?, description = ?, next_due_at = ?, has_conflict = ?, merge_queue_state = ?, merge_queue_position = ?, blocked = ? WHERE pr_url = ?`,
+		u.ReviewCount, u.CIBucket, u.CIDetail, u.CIHref, u.ReviewHref, marshalThreadIDs(u.UnresolvedThreadIDs), u.LatestReviewState, u.LatestReviewer, unixOrZero(u.LatestReviewAt), u.Title, u.Description, u.NextDueAt.Unix(), boolToInt(u.HasConflict), u.MergeQueueState, u.MergeQueuePosition, boolToInt(u.Blocked), prURL)
 	if err != nil {
 		return fmt.Errorf("update state: %w", err)
 	}
@@ -318,8 +354,9 @@ func scanAll(rows *sql.Rows) ([]Registration, error) {
 	for rows.Next() {
 		var r Registration
 		var nextDue, created, latestReviewAt, mergedAt int64
-		var archived int
-		if err := rows.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.CIDetail, &r.Unresolved, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt); err != nil {
+		var archived, hasConflict, blocked int
+		var unresolvedThreadIDs string
+		if err := rows.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.CIDetail, &r.CIHref, &r.ReviewHref, &unresolvedThreadIDs, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt, &hasConflict, &r.MergeQueueState, &r.MergeQueuePosition, &blocked); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
 		r.NextDueAt = time.Unix(nextDue, 0)
@@ -327,6 +364,9 @@ func scanAll(rows *sql.Rows) ([]Registration, error) {
 		r.CreatedAt = time.Unix(created, 0)
 		r.LatestReviewAt = zeroOrUnix(latestReviewAt)
 		r.MergedAt = zeroOrUnix(mergedAt)
+		r.HasConflict = hasConflict != 0
+		r.Blocked = blocked != 0
+		r.UnresolvedThreadIDs = unmarshalThreadIDs(unresolvedThreadIDs)
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
@@ -346,7 +386,31 @@ func boolToInt(b bool) int {
 // scan order, shared by every SELECT * from registrations — Get, List, and
 // DueBefore must agree on exactly this order or Scan silently assigns the
 // wrong value to the wrong field.
-const registrationColumns = `pr_url, session_id, provider, review_count, ci_bucket, ci_detail, unresolved, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at`
+const registrationColumns = `pr_url, session_id, provider, review_count, ci_bucket, ci_detail, ci_href, review_href, unresolved_thread_ids, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked`
+
+// marshalThreadIDs encodes ids as a JSON array for storage — "[]" for an
+// empty/nil slice rather than "null", so unmarshalThreadIDs never has to
+// special-case the empty case on the way back in.
+func marshalThreadIDs(ids []string) string {
+	if len(ids) == 0 {
+		return "[]"
+	}
+	b, err := json.Marshal(ids)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
+// unmarshalThreadIDs reverses marshalThreadIDs. Malformed or empty input
+// (e.g. a pre-migration row that never had this column) reports nil,
+// exactly equivalent to "no threads known" — Diff treats a nil and an
+// empty slice identically.
+func unmarshalThreadIDs(s string) []string {
+	var ids []string
+	_ = json.Unmarshal([]byte(s), &ids)
+	return ids
+}
 
 // unixOrZero converts t to a Unix timestamp, or 0 for the zero time — 0
 // itself (1970-01-01) is never a real review/merge timestamp this program
