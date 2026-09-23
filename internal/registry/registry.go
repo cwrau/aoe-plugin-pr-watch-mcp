@@ -48,6 +48,7 @@ type Registration struct {
 	MergeQueueState     string    // GitHub merge queue entry state; empty if not in a merge queue
 	MergeQueuePosition  int       // this entry's position in the merge queue; meaningless when MergeQueueState == ""
 	Blocked             bool      // GitLab only: true if blocked on an unmerged merge request dependency
+	DismissedReviewHref string    // ReviewHref of a review dismiss_review couldn't clear on GitHub itself (re-requested or local-only); the scheduler hides a poll result whose ReviewHref still matches this instead of letting it resurface. Empty if nothing is suppressed.
 }
 
 type Store struct {
@@ -78,7 +79,8 @@ CREATE TABLE IF NOT EXISTS registrations (
 	has_conflict INTEGER NOT NULL DEFAULT 0,
 	merge_queue_state TEXT NOT NULL DEFAULT '',
 	merge_queue_position INTEGER NOT NULL DEFAULT 0,
-	blocked INTEGER NOT NULL DEFAULT 0
+	blocked INTEGER NOT NULL DEFAULT 0,
+	dismissed_review_href TEXT NOT NULL DEFAULT ''
 );
 `
 
@@ -133,6 +135,7 @@ var columnMigrations = []string{
 	// at all; storing the actual thread IDs (as JSON) lets Diff compare by
 	// identity instead.
 	`ALTER TABLE registrations ADD COLUMN unresolved_thread_ids TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE registrations ADD COLUMN dismissed_review_href TEXT NOT NULL DEFAULT ''`,
 }
 
 func migrateAddedColumns(db *sql.DB) error {
@@ -157,10 +160,10 @@ func (s *Store) Close() error { return s.db.Close() }
 // how that PR/MR resumes being watched.
 func (s *Store) Add(ctx context.Context, r Registration) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, ci_detail, ci_href, review_href, unresolved_thread_ids, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, ci_detail, ci_href, review_href, unresolved_thread_ids, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked, dismissed_review_href)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(pr_url) DO UPDATE SET session_id = excluded.session_id, next_due_at = excluded.next_due_at, status = excluded.status
-	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.CIDetail, r.CIHref, r.ReviewHref, marshalThreadIDs(r.UnresolvedThreadIDs), r.LatestReviewState, r.LatestReviewer, unixOrZero(r.LatestReviewAt), r.Title, r.Description, StatusWatching, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix(), unixOrZero(r.MergedAt), boolToInt(r.HasConflict), r.MergeQueueState, r.MergeQueuePosition, boolToInt(r.Blocked))
+	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.CIDetail, r.CIHref, r.ReviewHref, marshalThreadIDs(r.UnresolvedThreadIDs), r.LatestReviewState, r.LatestReviewer, unixOrZero(r.LatestReviewAt), r.Title, r.Description, StatusWatching, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix(), unixOrZero(r.MergedAt), boolToInt(r.HasConflict), r.MergeQueueState, r.MergeQueuePosition, boolToInt(r.Blocked), r.DismissedReviewHref)
 	if err != nil {
 		return fmt.Errorf("add registration: %w", err)
 	}
@@ -179,7 +182,7 @@ func (s *Store) Get(ctx context.Context, prURL string) (Registration, bool, erro
 	var nextDue, created, latestReviewAt, mergedAt int64
 	var archived, hasConflict, blocked int
 	var unresolvedThreadIDs string
-	if err := row.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.CIDetail, &r.CIHref, &r.ReviewHref, &unresolvedThreadIDs, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt, &hasConflict, &r.MergeQueueState, &r.MergeQueuePosition, &blocked); err != nil {
+	if err := row.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.CIDetail, &r.CIHref, &r.ReviewHref, &unresolvedThreadIDs, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt, &hasConflict, &r.MergeQueueState, &r.MergeQueuePosition, &blocked, &r.DismissedReviewHref); err != nil {
 		if err == sql.ErrNoRows {
 			return Registration{}, false, nil
 		}
@@ -240,21 +243,20 @@ func (s *Store) SetStatusOwnedBy(ctx context.Context, prURL, sessionID, status s
 	return affected > 0, nil
 }
 
-// StopOtherMerged moves every StatusMerged registration owned by sessionID
-// to StatusStopped, except keepPRURL (the registration just (re-)registered,
-// so a re-register of an already-merged PR/MR doesn't immediately stop
-// itself). Called from the register handler so a session that moves on to a
-// new PR/MR doesn't keep an old merged badge cluttering its row/pane
-// forever — the old registration is never deleted, just excluded from
-// display the same way an explicit unregister excludes it.
-func (s *Store) StopOtherMerged(ctx context.Context, sessionID, keepPRURL string) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE registrations SET status = ? WHERE session_id = ? AND status = ? AND pr_url != ?`,
-		StatusStopped, sessionID, StatusMerged, keepPRURL)
+// StopAllOwnedBy moves every not-already-stopped registration owned by
+// sessionID to StatusStopped in one statement, reporting how many rows were
+// actually changed — unregister's bulk mode (no pr_url given) uses this to
+// clear everything a session owns without requiring one call per URL.
+func (s *Store) StopAllOwnedBy(ctx context.Context, sessionID string) (int, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE registrations SET status = ? WHERE session_id = ? AND status != ?`, StatusStopped, sessionID, StatusStopped)
 	if err != nil {
-		return fmt.Errorf("stop other merged registrations: %w", err)
+		return 0, fmt.Errorf("stop all owned: %w", err)
 	}
-	return nil
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("stop all owned: rows affected: %w", err)
+	}
+	return int(affected), nil
 }
 
 func (s *Store) List(ctx context.Context) ([]Registration, error) {
@@ -349,6 +351,47 @@ func (s *Store) SetArchived(ctx context.Context, prURL string, archived bool) er
 	return nil
 }
 
+// ClearReviewIfCurrent blanks the four latest-review fields, but only if
+// href is still what's currently shown as this registration's review — for
+// dismiss_review's real-API-dismiss path, where GitHub itself now reports
+// the review as DISMISSED and buildCheckResult already treats that as no
+// review forever, so no dismissed_review_href marker is needed here (unlike
+// SetDismissedReview below). If href isn't the currently-displayed review
+// (an older review from a different reviewer, say), there's nothing
+// locally to clear and this is a no-op.
+func (s *Store) ClearReviewIfCurrent(ctx context.Context, prURL, href string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE registrations SET latest_review_state = '', latest_reviewer = '', latest_review_at = 0, review_href = ''
+		WHERE pr_url = ? AND review_href = ?`, prURL, href)
+	if err != nil {
+		return fmt.Errorf("clear review if current: %w", err)
+	}
+	return nil
+}
+
+// SetDismissedReview marks href as suppressed for prURL: the scheduler
+// hides any future poll result whose ReviewHref still matches it, since
+// GitHub itself keeps reporting this exact review (a re-request doesn't
+// change the original review's own state, and the local-only fallback
+// never touches GitHub at all) and it would otherwise resurface on the very
+// next tick. If href is currently displayed as this registration's review,
+// the four latest-review fields are blanked in the same statement — instant
+// badge feedback instead of waiting for that next poll.
+func (s *Store) SetDismissedReview(ctx context.Context, prURL, href string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE registrations SET
+			dismissed_review_href = ?,
+			latest_review_state = CASE WHEN review_href = ? THEN '' ELSE latest_review_state END,
+			latest_reviewer      = CASE WHEN review_href = ? THEN '' ELSE latest_reviewer END,
+			latest_review_at     = CASE WHEN review_href = ? THEN 0  ELSE latest_review_at END,
+			review_href          = CASE WHEN review_href = ? THEN '' ELSE review_href END
+		WHERE pr_url = ?`, href, href, href, href, href, prURL)
+	if err != nil {
+		return fmt.Errorf("set dismissed review: %w", err)
+	}
+	return nil
+}
+
 func scanAll(rows *sql.Rows) ([]Registration, error) {
 	var out []Registration
 	for rows.Next() {
@@ -356,7 +399,7 @@ func scanAll(rows *sql.Rows) ([]Registration, error) {
 		var nextDue, created, latestReviewAt, mergedAt int64
 		var archived, hasConflict, blocked int
 		var unresolvedThreadIDs string
-		if err := rows.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.CIDetail, &r.CIHref, &r.ReviewHref, &unresolvedThreadIDs, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt, &hasConflict, &r.MergeQueueState, &r.MergeQueuePosition, &blocked); err != nil {
+		if err := rows.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &r.CIDetail, &r.CIHref, &r.ReviewHref, &unresolvedThreadIDs, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt, &hasConflict, &r.MergeQueueState, &r.MergeQueuePosition, &blocked, &r.DismissedReviewHref); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
 		r.NextDueAt = time.Unix(nextDue, 0)
@@ -386,7 +429,7 @@ func boolToInt(b bool) int {
 // scan order, shared by every SELECT * from registrations — Get, List, and
 // DueBefore must agree on exactly this order or Scan silently assigns the
 // wrong value to the wrong field.
-const registrationColumns = `pr_url, session_id, provider, review_count, ci_bucket, ci_detail, ci_href, review_href, unresolved_thread_ids, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked`
+const registrationColumns = `pr_url, session_id, provider, review_count, ci_bucket, ci_detail, ci_href, review_href, unresolved_thread_ids, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked, dismissed_review_href`
 
 // marshalThreadIDs encodes ids as a JSON array for storage — "[]" for an
 // empty/nil slice rather than "null", so unmarshalThreadIDs never has to

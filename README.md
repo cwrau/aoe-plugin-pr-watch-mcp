@@ -9,10 +9,22 @@ on review/CI/merge activity.
 
 One always-on process does three jobs:
 
-1. **MCP-over-HTTP server.** Exposes `register`, `unregister` and `list`
-   tools that any AoE session's MCP client can call directly. A
-   registration is owned by the session that created it: only that session
-   can unregister it, and another session cannot take it over.
+1. **MCP-over-HTTP server.** Exposes `register`, `unregister`, `list` and
+   `dismiss_review` tools that any AoE session's MCP client can call
+   directly. A registration is owned by the session that created it: only
+   that session can unregister it or dismiss its reviews, and another
+   session cannot take it over. `list` defaults to every registration
+   across every session and status, filterable by an optional `session_id`
+   and/or `status`. `unregister` normally takes a `pr_url` to stop one
+   registration; omitting it stops every registration `session_id` owns in
+   one call. Every `session_id` input accepts either the bare AoE session
+   id or the full `$AOE_ARTIFACT_DIR` value verbatim — the basename is
+   extracted server-side, so a caller never has to shell out to `basename`
+   itself. `dismiss_review` clears a GitHub review's badge — a real GitHub
+   dismissal if possible, falling back to re-requesting the reviewer,
+   falling back to a local-only badge clear when neither GitHub action
+   applies or succeeds (always the case for a `COMMENTED` review, which
+   GitHub's API can't dismiss at all).
 2. **Poll scheduler.** Keeps one due-heap per provider, reads the
    rate-limit signal off every real API response (GitHub's GraphQL
    `rateLimit` field and `X-RateLimit-*` headers, GitLab's `RateLimit-*`

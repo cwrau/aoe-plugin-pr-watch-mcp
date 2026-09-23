@@ -623,3 +623,132 @@ func TestGitHubCheckerBatchesMultiplePRsIntoOneGraphQLRequest(t *testing.T) {
 		}
 	}
 }
+
+// dispatchGraphQLServer serves POST /graphql, picking a canned response body
+// by matching a substring against the request's query text — each of
+// FindReview/DismissReview/RequestReviewer/userID sends a distinctly-shaped
+// query, so tests compose the exact call sequence they expect by keying on
+// what makes each one unique (a mutation's field name, or a query's
+// distinguishing selection).
+func dispatchGraphQLServer(t *testing.T, byQuerySubstring map[string]string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		for substr, resp := range byQuerySubstring {
+			if strings.Contains(body.Query, substr) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(resp))
+				return
+			}
+		}
+		t.Fatalf("no canned response matches query: %s", body.Query)
+	})
+	return httptest.NewServer(mux)
+}
+
+func TestFindReviewMatchesByURL(t *testing.T) {
+	srv := dispatchGraphQLServer(t, map[string]string{
+		"reviews(first: 100)": `{"data": {"repository": {"pullRequest": {"id": "PR_kwId", "reviews": {"nodes": [
+			{"id": "REV_1", "url": "https://github.com/o/r/pull/1#pullrequestreview-1", "state": "COMMENTED", "author": {"login": "alice"}},
+			{"id": "REV_2", "url": "https://github.com/o/r/pull/1#pullrequestreview-2", "state": "CHANGES_REQUESTED", "author": {"login": "bob"}}
+		]}}}}}`,
+	})
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	review, found, err := c.FindReview(t.Context(), "o", "r", 1, "https://github.com/o/r/pull/1#pullrequestreview-2")
+	if err != nil {
+		t.Fatalf("FindReview() error = %v", err)
+	}
+	if !found {
+		t.Fatal("FindReview() found = false, want true")
+	}
+	if review.ReviewID != "REV_2" || review.State != "CHANGES_REQUESTED" || review.AuthorLogin != "bob" || review.PullRequestID != "PR_kwId" {
+		t.Errorf("FindReview() = %+v, want the bob/CHANGES_REQUESTED review", review)
+	}
+}
+
+func TestFindReviewNoMatchReportsNotFound(t *testing.T) {
+	srv := dispatchGraphQLServer(t, map[string]string{
+		"reviews(first: 100)": `{"data": {"repository": {"pullRequest": {"id": "PR_1", "reviews": {"nodes": [
+			{"id": "REV_1", "url": "https://github.com/o/r/pull/1#pullrequestreview-1", "state": "APPROVED", "author": {"login": "alice"}}
+		]}}}}}`,
+	})
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	_, found, err := c.FindReview(t.Context(), "o", "r", 1, "https://github.com/o/r/pull/1#pullrequestreview-999")
+	if err != nil {
+		t.Fatalf("FindReview() error = %v", err)
+	}
+	if found {
+		t.Error("FindReview() found = true, want false for a url that matches no review")
+	}
+}
+
+func TestFindReviewMissingPullRequestErrors(t *testing.T) {
+	srv := dispatchGraphQLServer(t, map[string]string{
+		"reviews(first: 100)": `{"data": {"repository": {"pullRequest": null}}}`,
+	})
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	if _, _, err := c.FindReview(t.Context(), "o", "r", 404, "https://github.com/o/r/pull/404#pullrequestreview-1"); err == nil {
+		t.Error("FindReview() error = nil, want an error for a missing pull request")
+	}
+}
+
+func TestDismissReviewSendsMutation(t *testing.T) {
+	srv := dispatchGraphQLServer(t, map[string]string{
+		"dismissPullRequestReview": `{"data": {"dismissPullRequestReview": {"clientMutationId": null}}}`,
+	})
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	if err := c.DismissReview(t.Context(), "REV_2"); err != nil {
+		t.Errorf("DismissReview() error = %v", err)
+	}
+}
+
+func TestDismissReviewReportsGraphQLError(t *testing.T) {
+	srv := dispatchGraphQLServer(t, map[string]string{
+		"dismissPullRequestReview": `{"data": null, "errors": [{"message": "Only admins can dismiss reviews on this branch"}]}`,
+	})
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	if err := c.DismissReview(t.Context(), "REV_2"); err == nil {
+		t.Error("DismissReview() error = nil, want the branch-protection error surfaced")
+	}
+}
+
+func TestRequestReviewerLooksUpUserThenMutates(t *testing.T) {
+	srv := dispatchGraphQLServer(t, map[string]string{
+		"user(login: $login)": `{"data": {"user": {"id": "U_bob"}}}`,
+		"requestReviews":      `{"data": {"requestReviews": {"clientMutationId": null}}}`,
+	})
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	if err := c.RequestReviewer(t.Context(), "PR_1", "bob"); err != nil {
+		t.Errorf("RequestReviewer() error = %v", err)
+	}
+}
+
+func TestRequestReviewerUnknownUserErrors(t *testing.T) {
+	srv := dispatchGraphQLServer(t, map[string]string{
+		"user(login: $login)": `{"data": {"user": null}}`,
+	})
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	if err := c.RequestReviewer(t.Context(), "PR_1", "ghost"); err == nil {
+		t.Error("RequestReviewer() error = nil, want an error for an unresolvable login")
+	}
+}
