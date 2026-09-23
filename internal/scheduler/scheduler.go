@@ -279,7 +279,7 @@ func stateUpdateFromReg(reg registry.Registration, nextDueAt time.Time) registry
 // best-effort, then either mark a terminal PR resolved or persist the new
 // state and next due time.
 func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, result provider.CheckResult, interval time.Duration) {
-	prev := provider.PrevState{ReviewCount: reg.ReviewCount, CIBucket: reg.CIBucket, UnresolvedThreadIDs: reg.UnresolvedThreadIDs, MergeQueueState: reg.MergeQueueState}
+	prev := provider.PrevState{ReviewCount: reg.ReviewCount, CIBucket: reg.CIBucket, CIHref: reg.CIHref, UnresolvedThreadIDs: reg.UnresolvedThreadIDs, MergeQueueState: reg.MergeQueueState}
 
 	// Best-effort only: a session whose Sender can never deliver (e.g. an
 	// ACP-mode AoE session, which has no tmux pane for `aoe send` to write

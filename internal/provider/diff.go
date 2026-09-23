@@ -35,7 +35,15 @@ func Diff(prev PrevState, cur CheckResult) []Event {
 			Href:    cur.ReviewHref,
 		})
 	}
-	if cur.CIBucket != prev.CIBucket && cur.CIBucket == "failure" {
+	// Compared by href alongside the bucket, not bucket alone: a fix-push
+	// that fails again before the next poll happens to run goes
+	// failure -> pending -> failure between two consecutive checks, so
+	// prev.CIBucket and cur.CIBucket are both "failure" even though it's a
+	// different run. cur.CIHref (a per-run job/pipeline URL on both
+	// providers) still differs in that case, so the second failure still
+	// reports instead of silently matching the first one's already-seen
+	// bucket.
+	if cur.CIBucket == "failure" && (cur.CIBucket != prev.CIBucket || cur.CIHref != prev.CIHref) {
 		events = append(events, Event{Kind: "CI", Message: cur.CIBucket, Href: cur.CIHref})
 	}
 	// A merge queue entry disappearing while the PR is still open (not
