@@ -85,8 +85,8 @@ func TestBuildHomePanePayloadGitHubRow(t *testing.T) {
 	if sessionRow.Label != "Fix the thing" {
 		t.Errorf("sessionRow.Label = %q, want %q", sessionRow.Label, "Fix the thing")
 	}
-	if sessionRow.Href != "http://127.0.0.1:25808/session/sess1" {
-		t.Errorf("sessionRow.Href = %q, want %q", sessionRow.Href, "http://127.0.0.1:25808/session/sess1")
+	if sessionRow.Href != "/session/sess1" {
+		t.Errorf("sessionRow.Href = %q, want %q", sessionRow.Href, "/session/sess1")
 	}
 }
 
@@ -124,30 +124,18 @@ func TestBuildHomePanePayloadOmitsConflictBadgeWhenNoConflict(t *testing.T) {
 	}
 }
 
-func TestBuildHomePanePayloadOmitsSessionHrefWhenBaseURLUnavailable(t *testing.T) {
+func TestBuildHomePanePayloadUsesRelativeSessionHrefRegardlessOfBaseURL(t *testing.T) {
 	regs := []registry.Registration{githubReg("none", "")}
 	payload := buildHomePanePayload(regs, func(string) string { return "" }, "")
 
 	sec := payload.Blocks[0].(sectionBlock)
 	cols := sec.Children[0].(columnsBlock)
 	sessionRow := cols.Children[1].(rowBlock)
-	if sessionRow.Href != "" {
-		t.Errorf("sessionRow.Href = %q, want empty when no dashboard base URL is available (renderer's safeHref rejects anything non-http(s) anyway, so the plugin degrading to plain text is more honest than shipping a broken href)", sessionRow.Href)
+	if sessionRow.Href != "/session/sess1" {
+		t.Errorf("sessionRow.Href = %q, want %q (the host now accepts a plain relative href, no base URL needed)", sessionRow.Href, "/session/sess1")
 	}
 	if sessionRow.Label == "" {
-		t.Error("sessionRow.Label is empty, want the session id fallback to still show even without a link")
-	}
-}
-
-func TestBuildHomePanePayloadTrimsTrailingSlashOnBaseURL(t *testing.T) {
-	regs := []registry.Registration{githubReg("none", "")}
-	payload := buildHomePanePayload(regs, func(string) string { return "" }, "http://127.0.0.1:25808/")
-
-	sec := payload.Blocks[0].(sectionBlock)
-	cols := sec.Children[0].(columnsBlock)
-	sessionRow := cols.Children[1].(rowBlock)
-	if sessionRow.Href != "http://127.0.0.1:25808/session/sess1" {
-		t.Errorf("sessionRow.Href = %q, want no double slash before /session", sessionRow.Href)
+		t.Error("sessionRow.Label is empty, want the session id fallback to still show")
 	}
 }
 
