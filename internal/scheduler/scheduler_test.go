@@ -70,6 +70,29 @@ func openTestStore(t *testing.T) *registry.Store {
 	return s
 }
 
+func TestEventMessagePrefixesAutomatedPing(t *testing.T) {
+	got := eventMessage(provider.Event{Kind: "MERGED", Message: "MERGED"})
+	if got != "[pr-watch] MERGED" {
+		t.Errorf("eventMessage() = %q, want %q", got, "[pr-watch] MERGED")
+	}
+}
+
+func TestEventMessageAppendsHrefWhenPresent(t *testing.T) {
+	got := eventMessage(provider.Event{Kind: "CI", Message: "failure", Href: "https://github.com/o/r/actions/runs/1"})
+	want := "[pr-watch] CI failure (https://github.com/o/r/actions/runs/1)"
+	if got != want {
+		t.Errorf("eventMessage() = %q, want %q", got, want)
+	}
+}
+
+func TestEventMessageOmitsHrefWhenEmpty(t *testing.T) {
+	got := eventMessage(provider.Event{Kind: "CI", Message: "failure"})
+	want := "[pr-watch] CI failure"
+	if got != want {
+		t.Errorf("eventMessage() = %q, want %q", got, want)
+	}
+}
+
 func TestTickSendsOnCIChange(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -97,7 +120,7 @@ func TestTickSendsOnCIChange(t *testing.T) {
 	if gh.calls != 1 {
 		t.Errorf("GitHub checker calls = %d, want 1", gh.calls)
 	}
-	if len(notify.sent) != 1 || notify.sent[0] != "sess1: CI failure" {
+	if len(notify.sent) != 1 || notify.sent[0] != "sess1: [pr-watch] CI failure" {
 		t.Errorf("notify.sent = %v, want a single CI-failure message to sess1", notify.sent)
 	}
 }
@@ -157,7 +180,7 @@ func TestTickMarksMergedInsteadOfDeregistering(t *testing.T) {
 	if !remaining[0].MergedAt.Equal(mergedAt) {
 		t.Errorf("MergedAt = %v, want %v", remaining[0].MergedAt, mergedAt)
 	}
-	if len(notify.sent) != 1 || notify.sent[0] != "sess1: MERGED" {
+	if len(notify.sent) != 1 || notify.sent[0] != "sess1: [pr-watch] MERGED" {
 		t.Errorf("notify.sent = %v, want a single MERGED message", notify.sent)
 	}
 }

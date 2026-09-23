@@ -389,10 +389,17 @@ func budgetFresh(b provider.RateBudget, now time.Time) bool {
 // non-terminal events (CI, REVIEW, COMMENT) set Message to just the changed
 // value (e.g. CIBucket "failure", or "alice APPROVED"), so the Kind is
 // prefixed to keep the notification self-describing without duplicating it
-// for the terminal cases.
+// for the terminal cases. Every message carries the "[pr-watch] " prefix so
+// it reads as an automated ping rather than a human message in the session,
+// and, when the event names a source (a comment, review, or CI job/run),
+// its Href in parens so the link is one tap away.
 func eventMessage(ev provider.Event) string {
-	if ev.Kind == ev.Message {
-		return ev.Message
+	body := ev.Message
+	if ev.Kind != ev.Message {
+		body = ev.Kind + " " + ev.Message
 	}
-	return ev.Kind + " " + ev.Message
+	if ev.Href != "" {
+		body += " (" + ev.Href + ")"
+	}
+	return "[pr-watch] " + body
 }
