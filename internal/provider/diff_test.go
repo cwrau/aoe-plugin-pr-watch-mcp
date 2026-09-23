@@ -97,6 +97,34 @@ func TestDiffCIEventCarriesCIHref(t *testing.T) {
 	}
 }
 
+// TestDiffCIFiresAgainOnDifferentFailureWithSameBucket guards against the
+// race where a fix-push fails again before the next poll happens to run:
+// failure (run A) -> pending -> failure (run B) between two consecutive
+// checks looks like "still failure" by bucket alone, since the poller never
+// observed the intermediate pending state. The two runs' distinct CIHref
+// values are what makes run B still reportable.
+func TestDiffCIFiresAgainOnDifferentFailureWithSameBucket(t *testing.T) {
+	prev := PrevState{CIBucket: "failure", CIHref: "https://github.com/o/r/actions/runs/1"}
+	cur := CheckResult{State: "open", CIBucket: "failure", CIHref: "https://github.com/o/r/actions/runs/2"}
+	got := Diff(prev, cur)
+	if len(got) != 1 || got[0].Kind != "CI" || got[0].Href != "https://github.com/o/r/actions/runs/2" {
+		t.Fatalf("Diff() = %+v, want a CI event for the new run despite an unchanged bucket", got)
+	}
+}
+
+// TestDiffCISameFailureDoesNotRefire is FiresAgainOnDifferentFailureWithSameBucket's
+// counterpart: an unchanged bucket AND an unchanged href (the same failing
+// run reported twice, e.g. two polls before anything changed) must not
+// re-fire.
+func TestDiffCISameFailureDoesNotRefire(t *testing.T) {
+	prev := PrevState{CIBucket: "failure", CIHref: "https://github.com/o/r/actions/runs/1"}
+	cur := CheckResult{State: "open", CIBucket: "failure", CIHref: "https://github.com/o/r/actions/runs/1"}
+	got := Diff(prev, cur)
+	if len(got) != 0 {
+		t.Fatalf("Diff() = %+v, want no CI event when both bucket and href are unchanged", got)
+	}
+}
+
 func TestDiffCISuccessNeverFires(t *testing.T) {
 	prev := PrevState{CIBucket: "pending"}
 	cur := CheckResult{State: "open", CIBucket: "success"}

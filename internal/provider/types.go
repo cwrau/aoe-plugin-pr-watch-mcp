@@ -7,6 +7,7 @@ import "time"
 type PrevState struct {
 	ReviewCount         int
 	CIBucket            string
+	CIHref              string   // link to the last-notified CI failure's job/run, compared alongside CIBucket so a fix-then-fail-again cycle that lands on "failure" both times a poll runs is still reported: the two failures are different runs even though the bucket string is identical
 	UnresolvedThreadIDs []string // IDs of threads unresolved as of the last check; compared by identity, not count, so a resolve+new-thread happening in the same window can't cancel out and hide the new one
 	MergeQueueState     string
 }
