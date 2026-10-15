@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -272,11 +273,16 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 		}
 	}
 
-	approvalsRaw, _, err := c.getJSON(ctx, token, fmt.Sprintf("%s/api/v4/projects/%s/merge_requests/%d/approvals", base, encodedPath, iid), &gitlabApprovalsResponse{})
-	if err != nil {
-		return CheckResult{}, RateBudget{}, err
+	// Not every instance or project offers the approvals endpoint (403/404
+	// where the feature is off or the tier lacks it); such an MR simply has no
+	// approvals, rather than being unwatchable.
+	var approvals gitlabApprovalsResponse
+	if _, _, err := c.getJSON(ctx, token, fmt.Sprintf("%s/api/v4/projects/%s/merge_requests/%d/approvals", base, encodedPath, iid), &approvals); err != nil {
+		if status, ok := errors.AsType[*httpStatusError](err); !ok || (status.Code != http.StatusForbidden && status.Code != http.StatusNotFound) {
+			return CheckResult{}, RateBudget{}, err
+		}
+		approvals = gitlabApprovalsResponse{}
 	}
-	approvals := *approvalsRaw.(*gitlabApprovalsResponse)
 	result.ReviewCount = len(approvals.ApprovedBy)
 
 	if result.ReviewCount > 0 {
