@@ -6,31 +6,52 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/aoeclient"
 	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/provider"
 	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/registry"
 )
 
 type registerInput struct {
-	PRURL     string `json:"pr_url" jsonschema:"the GitHub PR or GitLab MR URL to watch"`
-	SessionID string `json:"session_id" jsonschema:"the calling AoE session's id — pass $AOE_ARTIFACT_DIR's raw value directly, its basename is extracted automatically, no need to run basename yourself"`
+	PRURLs    []string `json:"pr_urls" jsonschema:"one or more GitHub PR or GitLab MR URLs to watch — a single-element list registers just one, same as before"`
+	SessionID string   `json:"session_id" jsonschema:"the calling AoE session's id — pass $AOE_ARTIFACT_DIR's raw value directly, its basename is extracted automatically, no need to run basename yourself"`
+	Events    []string `json:"events,omitempty" jsonschema:"optional: only notify for these event kinds (REVIEW, REVIEW_DISMISSED, COMMENT, CI, CI_RECOVERED, CI_SUCCESS, CONFLICT, MERGED, CLOSED, REOPENED, MERGE_QUEUE), e.g. [\"MERGED\"] to only hear about the merge; omit for every kind. Applies to every URL in pr_urls alike. Re-registering the same pr_url/session_id with a different events list just replaces the filter, same as register's other idempotent-refresh behavior."`
+}
+
+// registerResult is one pr_urls entry's own outcome — register never fails
+// the whole call just because one URL in a batch was malformed or
+// otherwise rejected; every other URL in the same call still registers.
+type registerResult struct {
+	PRURL      string `json:"pr_url"`
+	Registered bool   `json:"registered"`
+	Error      string `json:"error,omitempty"` // set instead of Registered on a per-URL failure (e.g. an unrecognized pr_url shape)
 }
 
 type registerOutput struct {
-	Registered bool `json:"registered"`
+	Results []registerResult `json:"results"`
 }
 
 type unregisterInput struct {
-	PRURL     string `json:"pr_url,omitempty" jsonschema:"optional: the specific PR/MR URL to stop watching; omit to stop every registration session_id owns instead of just one"`
-	SessionID string `json:"session_id" jsonschema:"the calling AoE session's id — pass $AOE_ARTIFACT_DIR's raw value directly, its basename is extracted automatically, no need to run basename yourself; must match (or, in bulk mode, own) the affected registration(s)"`
+	PRURLs    []string `json:"pr_urls,omitempty" jsonschema:"optional: the specific PR/MR URL(s) to stop watching; omit entirely to stop every registration session_id owns in one call instead"`
+	SessionID string   `json:"session_id" jsonschema:"the calling AoE session's id — pass $AOE_ARTIFACT_DIR's raw value directly, its basename is extracted automatically, no need to run basename yourself; must match (or, in bulk mode, own) the affected registration(s)"`
+}
+
+// unregisterResult is one pr_urls entry's own outcome, same partial-success
+// shape as registerResult — only populated when pr_urls was given; the
+// bulk (pr_urls omitted) path has no per-URL granularity to report.
+type unregisterResult struct {
+	PRURL   string `json:"pr_url"`
+	Removed bool   `json:"removed"`
 }
 
 type unregisterOutput struct {
-	Removed bool `json:"removed"` // true if at least one registration was stopped
-	Count   int  `json:"count"`   // how many registrations were actually moved to stopped (0 or 1 for a single pr_url, any number in bulk mode)
+	Results []unregisterResult `json:"results,omitempty"` // one entry per pr_urls input; absent (nil) in bulk mode
+	Removed bool               `json:"removed"`           // true if at least one registration was stopped
+	Count   int                `json:"count"`             // how many registrations were actually moved to stopped
 }
 
 type listInput struct {
@@ -67,6 +88,28 @@ type GitHubReviewClient interface {
 	RequestReviewer(ctx context.Context, pullRequestID, login string) error
 }
 
+// UIPusher lets register/unregister/dismiss_review request an immediate
+// dashboard refresh right after a mutation succeeds, instead of leaving the
+// home-pane/row-badge/session-pane stale until the scheduler's next
+// scheduled push (up to tickInterval later). Push does no real provider
+// check of its own — it just re-renders and re-sends whatever's already in
+// the registry, so it's cheap enough to call synchronously and unconditionally
+// on every successful mutation.
+type UIPusher interface {
+	Push()
+}
+
+// SessionValidator is the narrow view of aoeclient.Client the register tool
+// needs. Refreshing on every register call (rather than trusting the
+// directory the lifecycle events keep current) means a session created
+// moments ago — before its event has arrived — is never rejected as
+// not-yet-seen. aoeclient.Client is safe for concurrent use, so this can be
+// the very instance the scheduler uses.
+type SessionValidator interface {
+	Refresh(ctx context.Context) error
+	Classify(id string) aoeclient.SessionClass
+}
+
 // normalizeSessionID accepts either a bare AoE session id or a full path
 // ending in it (as $AOE_ARTIFACT_DIR's raw value would be, e.g.
 // ".../artifacts/<id>") and returns just the id. Letting every session_id
@@ -85,6 +128,36 @@ var validStatuses = map[string]bool{
 	registry.StatusMerged:   true,
 	registry.StatusClosed:   true,
 	registry.StatusStopped:  true,
+}
+
+// validEventKinds is every provider.Event Kind value the register tool's
+// events filter accepts — kept in lockstep with provider.Event's Kind doc
+// comment by hand, since Diff builds Kind values as plain string literals
+// rather than through a shared constant set.
+var validEventKinds = map[string]bool{
+	"REVIEW":           true,
+	"REVIEW_DISMISSED": true,
+	"COMMENT":          true,
+	"CI":               true,
+	"CI_RECOVERED":     true,
+	"CI_SUCCESS":       true,
+	"REOPENED":         true,
+	"CONFLICT":         true,
+	"MERGED":           true,
+	"CLOSED":           true,
+	"MERGE_QUEUE":      true,
+}
+
+// validateEventFilter rejects an events list containing anything Diff could
+// never actually produce — catching a typo (e.g. "MERGE") at register time
+// instead of it silently matching nothing forever.
+func validateEventFilter(events []string) error {
+	for _, kind := range events {
+		if !validEventKinds[kind] {
+			return fmt.Errorf("events entry %q is not a recognized event kind (REVIEW, REVIEW_DISMISSED, COMMENT, CI, CI_RECOVERED, CI_SUCCESS, CONFLICT, MERGED, CLOSED, REOPENED, MERGE_QUEUE)", kind)
+		}
+	}
+	return nil
 }
 
 // detectProvider validates prURL against the same shapes the scheduler's
@@ -110,13 +183,13 @@ func detectProvider(prURL string) (string, error) {
 // per the handler's factory function, per the SDK's NewStreamableHTTPHandler
 // contract; it's cheap since all real state lives in store, not the server
 // value.
-func NewHandler(store *registry.Store, gh GitHubReviewClient) http.Handler {
+func NewHandler(store *registry.Store, gh GitHubReviewClient, sessions SessionValidator, push UIPusher) http.Handler {
 	newServer := func(*http.Request) *mcp.Server {
-		server := mcp.NewServer(&mcp.Implementation{Name: "io.cwrau.pr-watch-mcp", Version: "0.1.0"}, nil)
+		server := mcp.NewServer(&mcp.Implementation{Name: "io.cwrau.pr-watch-mcp", Version: "0.1.0"}, &mcp.ServerOptions{Instructions: serverInstructions})
 
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "register",
-			Description: "Start watching a GitHub PR or GitLab MR for review/CI/merge activity, waking this session on changes.",
+			Description: registerDescription,
 		}, func(ctx context.Context, req *mcp.CallToolRequest, in registerInput) (*mcp.CallToolResult, registerOutput, error) {
 			// An empty session_id can never match a real AoE session, so the
 			// scheduler would classify it SessionGone and silently delete
@@ -125,81 +198,131 @@ func NewHandler(store *registry.Store, gh GitHubReviewClient) http.Handler {
 			if in.SessionID == "" {
 				return nil, registerOutput{}, fmt.Errorf("session_id is required")
 			}
+			if len(in.PRURLs) == 0 {
+				return nil, registerOutput{}, fmt.Errorf("pr_urls must contain at least one URL")
+			}
 			in.SessionID = normalizeSessionID(in.SessionID)
-			prov, err := detectProvider(in.PRURL)
-			if err != nil {
+			// Reject a session_id no real AoE session will ever match right
+			// here, rather than storing it and letting the scheduler discover
+			// it's SessionGone (and silently auto-stop the registration, with
+			// no feedback to the caller) on the very next tick — confirmed
+			// live: a caller passing the literal text "$AOE_ARTIFACT_DIR"
+			// (never expanded, since there's no shell involved in a tool
+			// call's arguments) produced exactly that silent failure.
+			if err := sessions.Refresh(ctx); err != nil {
+				return nil, registerOutput{}, fmt.Errorf("verify session_id: %w", err)
+			}
+			if sessions.Classify(in.SessionID) == aoeclient.SessionGone {
+				return nil, registerOutput{}, fmt.Errorf("session_id %q does not match any known AoE session — pass the resolved value of $AOE_ARTIFACT_DIR, not the literal variable name", in.SessionID)
+			}
+			if err := validateEventFilter(in.Events); err != nil {
 				return nil, registerOutput{}, err
 			}
-			// Refuse to reassign someone else's watch. store.Add upserts, so
-			// without this check a caller could re-register another
-			// session's pr_url under its own session_id and thereby both
-			// hijack its notifications and gain the right to unregister it —
-			// defeating unregister's ownership check entirely.
-			existing, ok, err := store.Get(ctx, in.PRURL)
-			if err != nil {
-				return nil, registerOutput{}, err
+
+			// Every URL is attempted regardless of an earlier one failing —
+			// one malformed pr_url in a batch must not sink the rest, same
+			// "a single item's failure doesn't abort the whole pass"
+			// philosophy the scheduler's own batch checks already follow.
+			results := make([]registerResult, 0, len(in.PRURLs))
+			anySucceeded := false
+			for _, prURL := range in.PRURLs {
+				prov, err := detectProvider(prURL)
+				if err != nil {
+					results = append(results, registerResult{PRURL: prURL, Error: err.Error()})
+					continue
+				}
+				// No cross-session ownership check: multiple sessions can
+				// independently watch the same PR/MR, each getting its own
+				// row (registry's primary key is (pr_url, session_id), not
+				// pr_url alone) with its own state and notifications.
+				// store.Add's upsert only ever refreshes the caller's own
+				// row.
+				reg := registry.Registration{
+					PRURL:       prURL,
+					SessionID:   in.SessionID,
+					Provider:    prov,
+					CIBucket:    "none",
+					NextDueAt:   time.Now(),
+					CreatedAt:   time.Now(),
+					EventFilter: in.Events,
+				}
+				if err := store.Add(ctx, reg); err != nil {
+					results = append(results, registerResult{PRURL: prURL, Error: err.Error()})
+					continue
+				}
+				slog.Default().Info("registered", "pr_url", prURL, "session_id", in.SessionID, "provider", prov)
+				results = append(results, registerResult{PRURL: prURL, Registered: true})
+				anySucceeded = true
 			}
-			if ok && existing.SessionID != in.SessionID {
-				return nil, registerOutput{}, fmt.Errorf("pr_url %q is already registered by a different session", in.PRURL)
+			if anySucceeded {
+				push.Push()
+				return nil, registerOutput{Results: results}, nil
 			}
-			reg := registry.Registration{
-				PRURL:     in.PRURL,
-				SessionID: in.SessionID,
-				Provider:  prov,
-				CIBucket:  "none",
-				NextDueAt: time.Now(),
-				CreatedAt: time.Now(),
+			// Every URL failed — including the common single-URL case, where
+			// this keeps the old hard-error behavior intact rather than
+			// silently "succeeding" with nothing actually registered. A
+			// genuine multi-URL batch with a mix of outcomes still returns
+			// normally above, with the per-URL Results carrying which ones
+			// failed and why.
+			errs := make([]string, len(results))
+			for i, r := range results {
+				errs[i] = fmt.Sprintf("%s: %s", r.PRURL, r.Error)
 			}
-			if err := store.Add(ctx, reg); err != nil {
-				return nil, registerOutput{}, err
-			}
-			slog.Default().Info("registered", "pr_url", in.PRURL, "session_id", in.SessionID, "provider", prov)
-			return nil, registerOutput{Registered: true}, nil
+			return nil, registerOutput{Results: results}, fmt.Errorf("no URL in pr_urls could be registered: %s", strings.Join(errs, "; "))
 		})
 
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "unregister",
-			Description: "Stop watching a previously-registered GitHub PR or GitLab MR. Omit pr_url to stop every registration session_id owns in one call instead of just one.",
+			Description: unregisterDescription,
 		}, func(ctx context.Context, req *mcp.CallToolRequest, in unregisterInput) (*mcp.CallToolResult, unregisterOutput, error) {
 			if in.SessionID == "" {
 				return nil, unregisterOutput{}, fmt.Errorf("session_id is required")
 			}
 			in.SessionID = normalizeSessionID(in.SessionID)
 
-			if in.PRURL == "" {
+			if len(in.PRURLs) == 0 {
 				count, err := store.StopAllOwnedBy(ctx, in.SessionID)
 				if err != nil {
 					return nil, unregisterOutput{}, err
 				}
 				if count > 0 {
 					slog.Default().Info("unregistered all", "session_id", in.SessionID, "count", count)
+					push.Push()
 				}
 				return nil, unregisterOutput{Removed: count > 0, Count: count}, nil
 			}
 
-			// One atomic ownership-scoped update rather than a Get-then-
-			// SetStatus pair: nothing can change the row's owner between the
-			// check and the update. A false result covers both "not
-			// registered" and "registered by a different session" without
-			// distinguishing them, so a caller can't probe for which PRs/MRs
-			// other sessions are watching. The registration itself is never
-			// deleted, just moved to StatusStopped — its badge (if the host
-			// UI has one) reflects that permanently instead of vanishing.
-			removed, err := store.SetStatusOwnedBy(ctx, in.PRURL, in.SessionID, registry.StatusStopped)
-			if err != nil {
-				return nil, unregisterOutput{}, err
-			}
+			// One atomic ownership-scoped update per URL rather than a
+			// Get-then-SetStatus pair: nothing can change a row's owner
+			// between the check and the update. A false result covers both
+			// "not registered" and "registered by a different session"
+			// without distinguishing them, so a caller can't probe for
+			// which PRs/MRs other sessions are watching. The registration
+			// itself is never deleted, just moved to StatusStopped — its
+			// badge (if the host UI has one) reflects that permanently
+			// instead of vanishing.
+			results := make([]unregisterResult, 0, len(in.PRURLs))
 			count := 0
-			if removed {
-				count = 1
-				slog.Default().Info("unregistered", "pr_url", in.PRURL, "session_id", in.SessionID)
+			for _, prURL := range in.PRURLs {
+				removed, err := store.SetStatusOwnedBy(ctx, prURL, in.SessionID, registry.StatusStopped)
+				if err != nil {
+					return nil, unregisterOutput{}, err
+				}
+				if removed {
+					count++
+					slog.Default().Info("unregistered", "pr_url", prURL, "session_id", in.SessionID)
+				}
+				results = append(results, unregisterResult{PRURL: prURL, Removed: removed})
 			}
-			return nil, unregisterOutput{Removed: removed, Count: count}, nil
+			if count > 0 {
+				push.Push()
+			}
+			return nil, unregisterOutput{Results: results, Removed: count > 0, Count: count}, nil
 		})
 
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "list",
-			Description: "List PR/MR registrations, across all sessions and every status (watching, merged, closed, stopped) by default. Filter with session_id and/or status, both optional.",
+			Description: listDescription,
 		}, func(ctx context.Context, req *mcp.CallToolRequest, in listInput) (*mcp.CallToolResult, listOutput, error) {
 			if in.Status != "" && !validStatuses[in.Status] {
 				return nil, listOutput{}, fmt.Errorf("status %q is not a recognized status (watching, merged, closed, stopped)", in.Status)
@@ -228,20 +351,17 @@ func NewHandler(store *registry.Store, gh GitHubReviewClient) http.Handler {
 
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "dismiss_review",
-			Description: "Dismiss one GitHub PR review (changes-requested or comment) so its badge stops showing. Tries a real GitHub dismissal first, falls back to re-requesting the reviewer, then to hiding it locally only.",
+			Description: dismissReviewDescription,
 		}, func(ctx context.Context, req *mcp.CallToolRequest, in dismissReviewInput) (*mcp.CallToolResult, dismissReviewOutput, error) {
 			if in.SessionID == "" {
 				return nil, dismissReviewOutput{}, fmt.Errorf("session_id is required")
 			}
 			in.SessionID = normalizeSessionID(in.SessionID)
-			reg, ok, err := store.Get(ctx, in.PRURL)
+			reg, ok, err := store.Get(ctx, in.PRURL, in.SessionID)
 			if err != nil {
 				return nil, dismissReviewOutput{}, err
 			}
-			// Same "false covers both not-found and wrong-owner" shape as
-			// unregister — a caller can't probe which PRs other sessions
-			// are watching.
-			if !ok || reg.SessionID != in.SessionID {
+			if !ok {
 				return nil, dismissReviewOutput{}, fmt.Errorf("pr_url %q is not registered by this session", in.PRURL)
 			}
 			if reg.Provider != "github" {
@@ -261,29 +381,32 @@ func NewHandler(store *registry.Store, gh GitHubReviewClient) http.Handler {
 			}
 
 			localOnly := func() (dismissReviewOutput, error) {
-				if err := store.SetDismissedReview(ctx, in.PRURL, in.ReviewURL); err != nil {
+				if err := store.SetDismissedReview(ctx, in.PRURL, in.SessionID, in.ReviewURL); err != nil {
 					return dismissReviewOutput{}, err
 				}
 				slog.Default().Info("dismissed review", "pr_url", in.PRURL, "review_url", in.ReviewURL, "method", "local_only")
+				push.Push()
 				return dismissReviewOutput{Method: "local_only"}, nil
 			}
 
 			switch review.State {
 			case "CHANGES_REQUESTED":
 				if err := gh.DismissReview(ctx, review.ReviewID); err == nil {
-					if err := store.ClearReviewIfCurrent(ctx, in.PRURL, in.ReviewURL); err != nil {
+					if err := store.ClearReviewIfCurrent(ctx, in.PRURL, in.SessionID, in.ReviewURL); err != nil {
 						return nil, dismissReviewOutput{}, err
 					}
 					slog.Default().Info("dismissed review", "pr_url", in.PRURL, "review_url", in.ReviewURL, "method", "api_dismiss")
+					push.Push()
 					return nil, dismissReviewOutput{Method: "api_dismiss"}, nil
 				} else {
 					slog.Default().Warn("dismiss review failed, trying re-request", "pr_url", in.PRURL, "review_url", in.ReviewURL, "error", err)
 				}
 				if err := gh.RequestReviewer(ctx, review.PullRequestID, review.AuthorLogin); err == nil {
-					if err := store.SetDismissedReview(ctx, in.PRURL, in.ReviewURL); err != nil {
+					if err := store.SetDismissedReview(ctx, in.PRURL, in.SessionID, in.ReviewURL); err != nil {
 						return nil, dismissReviewOutput{}, err
 					}
 					slog.Default().Info("dismissed review", "pr_url", in.PRURL, "review_url", in.ReviewURL, "method", "requested_review_again")
+					push.Push()
 					return nil, dismissReviewOutput{Method: "requested_review_again"}, nil
 				} else {
 					slog.Default().Warn("re-request review failed, falling back to local-only", "pr_url", in.PRURL, "review_url", in.ReviewURL, "error", err)
@@ -301,5 +424,10 @@ func NewHandler(store *registry.Store, gh GitHubReviewClient) http.Handler {
 		return server
 	}
 
-	return mcp.NewStreamableHTTPHandler(newServer, nil)
+	// The server is unauthenticated and loopback-only, so a web page the user
+	// has open must not be able to drive it. The SDK already rejects a
+	// non-loopback Host (DNS rebinding); this adds the Origin /
+	// Sec-Fetch-Site check against cross-site requests. Non-browser clients
+	// send neither header and pass.
+	return http.NewCrossOriginProtection().Handler(mcp.NewStreamableHTTPHandler(newServer, nil))
 }
