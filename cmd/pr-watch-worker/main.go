@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -23,6 +24,19 @@ const (
 	defaultPort  = 8632
 	tickInterval = 15 * time.Second
 
+	// discoveryPollInterval is the slow fallback for the full auto-discovery
+	// pass (git reads for every live checkout plus a probe of every
+	// unresolved one). The fast path is event-driven: AoE reports a session
+	// going idle and discoveryDebounce later that session alone gets a
+	// DiscoverSessions pass. The periodic pass only has to catch what no
+	// event covers — a worker that was down when the event fired (events
+	// aren't replayed), or a PR opened outside any session's own turn.
+	discoveryPollInterval = 5 * time.Minute
+
+	// discoveryDebounce coalesces a burst of idle events (an agent flapping
+	// idle/running, several sessions finishing together) into one pass.
+	discoveryDebounce = 3 * time.Second
+
 	// httpTimeout bounds every provider API call. Without it a half-open
 	// connection to GitHub/GitLab would hang a Tick indefinitely.
 	httpTimeout = 30 * time.Second
@@ -37,11 +51,11 @@ const (
 	// backend.
 	tokenTimeout = 10 * time.Second
 
-	// panePushTimeout bounds one home-pane push, including its config.get
-	// round trip for dashboard_base_url. pushHomePane runs synchronously in
-	// the scheduler loop (once at startup, once after every tick), so an
-	// unbounded wait here — e.g. a host that never replies — would stall
-	// the entire loop, not just the pane feature.
+	// panePushTimeout bounds one full UI push (home-pane, row-badges, and
+	// session panes). pushUIState runs synchronously in the scheduler loop
+	// (once at startup, once after every tick), so an unbounded wait here —
+	// e.g. a host that never replies — would stall the entire loop, not
+	// just the pane feature.
 	panePushTimeout = 10 * time.Second
 )
 
@@ -49,35 +63,48 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(logger)
 
-	dataDir, err := os.UserConfigDir()
+	dataDir, err := stateDir()
 	if err != nil {
-		logger.Error("resolve config dir", "error", err)
+		logger.Error("resolve state dir", "error", err)
 		os.Exit(1)
 	}
-	dataDir = filepath.Join(dataDir, "pr-watch-mcp")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		logger.Error("create data dir", "error", err)
 		os.Exit(1)
 	}
+	// The registry used to live under the config dir; move it once so
+	// existing watches and badges survive the relocation.
+	if configDir, cerr := os.UserConfigDir(); cerr == nil {
+		migrated, merr := migrateLegacyRegistry(filepath.Join(configDir, "pr-watch-mcp"), dataDir)
+		switch {
+		case merr != nil:
+			logger.Error("migrate legacy registry", "error", merr)
+			os.Exit(1)
+		case migrated:
+			logger.Info("moved registry from config dir to state dir", "to", dataDir)
+		}
+	}
 
-	store, err := registry.Open(filepath.Join(dataDir, "registry.db"))
+	store, err := registry.Open(filepath.Join(dataDir, registryFileName))
 	if err != nil {
 		logger.Error("open registry", "error", err)
 		os.Exit(1)
 	}
 	defer func() { _ = store.Close() }()
 
-	aoe, err := aoeclient.New()
-	if err != nil {
-		logger.Error("create aoe session client", "error", err)
-		os.Exit(1)
-	}
+	// The host channel is created up front: the session directory lists
+	// sessions over it and the notifier delivers pings through it. It is
+	// goroutine-safe, and so is the directory — lifecycle notifications
+	// update it from the stdin loop while the scheduler loop and the MCP
+	// handler read it.
+	rpc := newHostRPC(os.Stdout)
+	aoe := aoeclient.New(rpc)
 
 	tokenCtx, cancelToken := context.WithTimeout(context.Background(), tokenTimeout)
 	ghToken, err := runToken(tokenCtx, "gh", "auth", "token")
 	cancelToken()
 	if err != nil {
-		logger.Warn("gh auth token unavailable at startup; GitHub checks will fail until it is", "error", err)
+		logger.Warn("gh auth token unavailable at startup; it is asked for again on the next GitHub request", "error", err)
 	}
 
 	// One shared client for both checkers, with an explicit timeout:
@@ -90,57 +117,118 @@ func main() {
 	// reason to hold two separate token/client pairs for one API.
 	ghChecker := &provider.GitHubChecker{
 		HTTPClient: httpClient,
-		Token:      ghToken,
+		// The startup token is used as is. If there was none (gh not logged
+		// in yet), or GitHub rejects it, the next request asks gh again.
+		Token: ghToken,
+		TokenFunc: func(ctx context.Context) (string, error) {
+			ctx, cancel := context.WithTimeout(ctx, tokenTimeout)
+			defer cancel()
+			return runToken(ctx, "gh", "auth", "token")
+		},
 	}
 
+	// Resolved fresh per-host at check time, not once globally: see
+	// provider.GitLabChecker.TokenFunc's doc comment for why a single
+	// static token is a credential leak across hosts. Shared with
+	// gitRemoteResolver below, which uses the exact same "does a
+	// credential resolve for this host" probe to decide whether an
+	// unrecognized workspace-checkout remote is a configured GitLab
+	// instance worth auto-watching at all.
+	glabTokenFunc := func(ctx context.Context, host string) (string, error) {
+		return runToken(ctx, "glab", "config", "get", "token", "--host", host)
+	}
+
+	snooze := &snoozeRules{}
+	filters := &commentFilters{}
+
 	sched := &scheduler.Scheduler{
-		Store:  store,
-		GitHub: ghChecker,
+		Snooze:         snooze.get,
+		CommentFilters: filters.get,
+		Store:          store,
+		GitHub:         ghChecker,
 		GitLab: &provider.GitLabChecker{
 			HTTPClient: httpClient,
-			// Resolved fresh per-host at check time, not once globally:
-			// see provider.GitLabChecker.TokenFunc's doc comment for why
-			// a single static token is a credential leak across hosts.
 			// Check's context is passed straight through so the glab fork
 			// is bounded by the same deadline as the poll it serves.
-			TokenFunc: func(ctx context.Context, host string) (string, error) {
-				return runToken(ctx, "glab", "config", "get", "token", "--host", host)
-			},
+			TokenFunc: glabTokenFunc,
 		},
 		Sessions: aoe,
-		Notify:   &notifier.Notifier{},
+		Notify:   &notifier.Notifier{RPC: rpc},
+		// Sessions and Workspaces read the same directory the MCP handler
+		// uses; it is safe for concurrent use.
+		Workspaces:        aoe,
+		Remotes:           &gitRemoteResolver{glabTokenFunc: glabTokenFunc},
+		DiscoveryInterval: discoveryPollInterval,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rpc := newHostRPC(os.Stdout)
+	refreshSettings := func() {
+		snooze.refresh(ctx, rpc, logger)
+		filters.refresh(ctx, rpc, logger)
+	}
+	rpc.onSettingsChanged = refreshSettings
+	discovery := newDiscoveryTrigger(discoveryDebounce)
+	rpc.onSessionIdle = discovery.Add
+	rpc.onSessionLifecycle = lifecycleHandler(aoe, logger)
 
-	go runSchedulerLoop(ctx, sched, store, aoe, rpc, logger)
-	go runHTTPServer(ctx, store, ghChecker, logger)
+	// Both read via config.get, whose reply the stdin loop below delivers,
+	// so they must run off that loop.
+	go func() {
+		refreshSettings()
+		ticker := time.NewTicker(snoozeRefreshEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				refreshSettings()
+			}
+		}
+	}()
+
+	go runSchedulerLoop(ctx, sched, store, aoe, rpc, discovery, logger)
+	go runHTTPServer(ctx, store, ghChecker, aoe, rpc, logger)
 
 	// The ndjson stdio channel is how the AoE daemon supervises this
-	// worker, and also how it answers this worker's own outbound calls
-	// (config.get for settings). Every line is handed to
-	// rpc.handleInboundLine, which delivers replies to whichever call is
-	// waiting on them; EOF is still the host's shutdown signal, same as
-	// the reference agent-of-empires.github worker's read loop.
-	scanner := bufio.NewScanner(os.Stdin)
+	// worker. Every line is handed to rpc.handleInboundLine, which only
+	// ever needs to answer a genuine host->worker request (this worker
+	// makes no blocking outbound calls of its own); EOF is still the
+	// host's shutdown signal, same as the reference agent-of-empires.github
+	// worker's read loop.
+	serveStdin(os.Stdin, rpc.handleInboundLine, logger)
+	logger.Info("stdin closed, shutting down")
+}
+
+// maxInboundLine bounds one ndjson line from the host. A sessions.list reply
+// carries a summary per session (hundreds of KB for a busy host), far past
+// bufio.Scanner's 64KB default, which would end the loop and with it the
+// worker.
+const maxInboundLine = 64 << 20
+
+// serveStdin hands every line from r to handle until EOF or a read error.
+func serveStdin(r io.Reader, handle func([]byte), logger *slog.Logger) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64<<10), maxInboundLine)
 	for scanner.Scan() {
-		rpc.handleInboundLine(scanner.Bytes())
+		handle(scanner.Bytes())
 	}
 	if err := scanner.Err(); err != nil {
 		logger.Error("read stdin", "error", err)
 	}
-	logger.Info("stdin closed, shutting down")
 }
 
-func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, store *registry.Store, aoe *aoeclient.Client, rpc *hostRPC, logger *slog.Logger) {
-	// Push once at startup so the home-pane and row-badges aren't blank
-	// until the first tick completes (up to tickInterval later). Session
-	// titles may still be unresolved at this point (RefreshSessionSets
-	// hasn't run yet), so rows briefly fall back to raw session ids until
-	// the first tick fills them in.
+func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, store *registry.Store, aoe *aoeclient.Client, rpc *hostRPC, discovery *discoveryTrigger, logger *slog.Logger) {
+	// Load the session directory once up front (this blocks on the host's
+	// reply, which the stdin loop delivers), then push so the home-pane and
+	// row-badges aren't blank until the first tick completes. If the
+	// listing fails, titles fall back to raw session ids and the first tick
+	// retries it.
+	if err := aoe.RefreshIfStale(ctx); err != nil {
+		logger.Warn("initial session listing failed", "error", err)
+	}
 	pushUIState(ctx, store, aoe, rpc, logger)
 
 	ticker := time.NewTicker(tickInterval)
@@ -158,6 +246,18 @@ func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, store *re
 			cancel()
 			if err != nil {
 				logger.Error("scheduler tick", "error", err)
+			}
+			pushUIState(ctx, store, aoe, rpc, logger)
+		case <-discovery.C:
+			ids := discovery.Drain()
+			if len(ids) == 0 {
+				continue
+			}
+			tickCtx, cancel := context.WithTimeout(ctx, tickTimeout)
+			err := sched.DiscoverSessions(tickCtx, ids)
+			cancel()
+			if err != nil {
+				logger.Error("session discovery", "sessions", ids, "error", err)
 			}
 			pushUIState(ctx, store, aoe, rpc, logger)
 		}
@@ -184,8 +284,7 @@ func pushUIState(ctx context.Context, store *registry.Store, aoe *aoeclient.Clie
 		return
 	}
 
-	baseURL := rpc.getStringSetting(pushCtx, dashboardBaseURLSettingKey, "")
-	if err := rpc.pushHomePane(buildHomePanePayload(regs, aoe.Title, baseURL)); err != nil {
+	if err := rpc.pushHomePane(buildHomePanePayload(regs, aoe.Title)); err != nil {
 		logger.Warn("push home pane", "error", err)
 	}
 
@@ -215,7 +314,25 @@ func pushUIState(ctx context.Context, store *registry.Store, aoe *aoeclient.Clie
 	}
 }
 
-func runHTTPServer(ctx context.Context, store *registry.Store, gh *provider.GitHubChecker, logger *slog.Logger) {
+// immediateUIPusher implements mcpserver.UIPusher for the HTTP handler's
+// register/unregister/dismiss_review tools: Push re-renders and re-sends the
+// dashboard right after a mutation succeeds, the same as pushUIState's
+// scheduled call, just triggered from a different goroutine.
+// context.Background() as the base (rather than the tool call's own
+// request-scoped ctx) is deliberate: that ctx is gone the instant the HTTP
+// response is written, before this fire-and-forget push would even start.
+type immediateUIPusher struct {
+	store *registry.Store
+	aoe   *aoeclient.Client
+	rpc   *hostRPC
+	log   *slog.Logger
+}
+
+func (p *immediateUIPusher) Push() {
+	pushUIState(context.Background(), p.store, p.aoe, p.rpc, p.log)
+}
+
+func runHTTPServer(ctx context.Context, store *registry.Store, gh *provider.GitHubChecker, sessions *aoeclient.Client, rpc *hostRPC, logger *slog.Logger) {
 	port := defaultPort
 	if raw := os.Getenv("PR_WATCH_MCP_PORT"); raw != "" {
 		if p, err := strconv.Atoi(raw); err == nil {
@@ -224,7 +341,7 @@ func runHTTPServer(ctx context.Context, store *registry.Store, gh *provider.GitH
 	}
 	srv := &http.Server{
 		Addr:    "127.0.0.1:" + strconv.Itoa(port),
-		Handler: mcpserver.NewHandler(store, gh),
+		Handler: mcpserver.NewHandler(store, gh, sessions, &immediateUIPusher{store: store, aoe: sessions, rpc: rpc, log: logger}),
 	}
 	go func() {
 		<-ctx.Done()
@@ -235,13 +352,12 @@ func runHTTPServer(ctx context.Context, store *registry.Store, gh *provider.GitH
 	}
 }
 
-// runToken shells out to a CLI's token-printing subcommand: once at startup
-// for the GitHub token, and once per GitLab poll for the GitLab token (see
-// provider.GitLabChecker.TokenFunc — it resolves per-host at check time, so
-// every GitLab registration's every poll forks one `glab`). That puts it in
-// the scheduler's hot path, which is why it runs under the caller's context
-// rather than unbounded: a stuck keyring backend would otherwise hang the
-// whole scheduler, not just one registration. The alternative (parsing gh's
+// runToken shells out to a CLI's token-printing subcommand. The providers
+// cache what it returns (GitHub's token, and GitLab's per host) and only ask
+// again after a 401 or when there was no token, so it is rare, but it can
+// still run in the scheduler's path, which is why it runs under the caller's
+// context rather than unbounded: a stuck keyring backend would otherwise hang
+// the whole scheduler, not just one registration. The alternative (parsing gh's
 // /glab's own credential storage directly) is far more fragile across
 // keyring backends, so the subprocess stays.
 func runToken(ctx context.Context, name string, args ...string) (string, error) {

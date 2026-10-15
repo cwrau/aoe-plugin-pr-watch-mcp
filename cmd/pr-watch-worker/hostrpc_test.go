@@ -3,13 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 func TestHostRPCSendWritesOneJSONLine(t *testing.T) {
@@ -132,50 +129,6 @@ func TestHostRPCPushHomePaneSendsCorrectSlotAndID(t *testing.T) {
 	}
 }
 
-// syncBuffer wraps bytes.Buffer with a mutex: hostRPC's own writes are
-// already serialized internally, but a test that polls Len()/String() from
-// the main goroutine while a call() goroutine is concurrently writing
-// needs the read side synchronized too, or the race detector (correctly)
-// flags the unsynchronized access to the underlying buffer memory.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-func (b *syncBuffer) Len() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Len()
-}
-
-// outboundID reads the single most-recently-written outbound line from buf
-// and returns its "id" field, for a test to build a matching reply.
-func outboundID(t *testing.T, buf *syncBuffer) int {
-	t.Helper()
-	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
-	var msg map[string]any
-	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &msg); err != nil {
-		t.Fatalf("decode outbound line: %v (%q)", err, lines[len(lines)-1])
-	}
-	idFloat, ok := msg["id"].(float64)
-	if !ok {
-		t.Fatalf("outbound id = %T, want a number", msg["id"])
-	}
-	return int(idFloat)
-}
-
 func TestHostRPCSetRowBadgeSendsCorrectSlotIDAndSession(t *testing.T) {
 	var buf bytes.Buffer
 	h := newHostRPC(&buf)
@@ -242,107 +195,6 @@ func TestHostRPCRemoveRowBadgeSendsCorrectSlotIDAndSession(t *testing.T) {
 	}
 }
 
-func TestHostRPCCallDeliversMatchingReply(t *testing.T) {
-	buf := &syncBuffer{}
-	h := newHostRPC(buf)
-
-	type callResult struct {
-		result json.RawMessage
-		err    error
-	}
-	done := make(chan callResult, 1)
-	go func() {
-		result, err := h.call(context.Background(), "config.get", map[string]any{"key": "dashboard_base_url"})
-		done <- callResult{result, err}
-	}()
-
-	// Poll until the call has actually written its request, then reply to it.
-	deadline := time.Now().Add(2 * time.Second)
-	var id int
-	for {
-		if buf.Len() > 0 {
-			id = outboundID(t, buf)
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for the outbound config.get request")
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	reply := fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"value":"https://example.com","revision":3}}`, id)
-	h.handleInboundLine([]byte(reply))
-
-	select {
-	case r := <-done:
-		if r.err != nil {
-			t.Fatalf("call() error = %v", r.err)
-		}
-		var parsed struct {
-			Value string `json:"value"`
-		}
-		if err := json.Unmarshal(r.result, &parsed); err != nil {
-			t.Fatalf("unmarshal result: %v", err)
-		}
-		if parsed.Value != "https://example.com" {
-			t.Errorf("result.value = %q, want %q", parsed.Value, "https://example.com")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("call() did not return after its reply was delivered")
-	}
-}
-
-func TestHostRPCCallReturnsErrorFromHostErrorReply(t *testing.T) {
-	buf := &syncBuffer{}
-	h := newHostRPC(buf)
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := h.call(context.Background(), "config.get", map[string]any{"key": "x"})
-		done <- err
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	var id int
-	for {
-		if buf.Len() > 0 {
-			id = outboundID(t, buf)
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for the outbound request")
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	reply := fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"error":{"code":-32000,"message":"boom"}}`, id)
-	h.handleInboundLine([]byte(reply))
-
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("call() error = nil, want an error from the host's error reply")
-		}
-		if !strings.Contains(err.Error(), "boom") {
-			t.Errorf("call() error = %v, want it to mention %q", err, "boom")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("call() did not return")
-	}
-}
-
-func TestHostRPCCallRespectsContextCancellation(t *testing.T) {
-	var buf bytes.Buffer
-	h := newHostRPC(&buf)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	if _, err := h.call(ctx, "config.get", map[string]any{"key": "x"}); err == nil {
-		t.Error("call() with an already-cancelled context, want error")
-	}
-}
-
 func TestHostRPCHandleInboundLineRepliesMethodNotFoundForRequest(t *testing.T) {
 	var buf bytes.Buffer
 	h := newHostRPC(&buf)
@@ -378,84 +230,130 @@ func TestHostRPCHandleInboundLineIgnoresMalformedOrNotification(t *testing.T) {
 	}
 }
 
-func TestHostRPCGetStringSettingReturnsHostValue(t *testing.T) {
-	buf := &syncBuffer{}
-	h := newHostRPC(buf)
-
-	done := make(chan string, 1)
-	go func() {
-		done <- h.getStringSetting(context.Background(), "dashboard_base_url", "fallback")
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	var id int
-	for {
-		if buf.Len() > 0 {
-			id = outboundID(t, buf)
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for the outbound config.get request")
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	reply := fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"value":"https://agent.example.com","revision":1}}`, id)
-	h.handleInboundLine([]byte(reply))
-
-	select {
-	case got := <-done:
-		if got != "https://agent.example.com" {
-			t.Errorf("getStringSetting() = %q, want %q", got, "https://agent.example.com")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("getStringSetting() did not return")
-	}
+func sessionStatusLine(sessionID, from, to string) []byte {
+	return []byte(`{"jsonrpc":"2.0","method":"session.status.changed","params":{"session_id":"` + sessionID + `","title":"t","from":"` + from + `","to":"` + to + `","at":"2026-10-03T14:00:00Z"}}`)
 }
 
-func TestHostRPCGetStringSettingFallsBackOnHostError(t *testing.T) {
-	buf := &syncBuffer{}
-	h := newHostRPC(buf)
-
-	done := make(chan string, 1)
-	go func() {
-		done <- h.getStringSetting(context.Background(), "dashboard_base_url", "fallback")
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	var id int
-	for {
-		if buf.Len() > 0 {
-			id = outboundID(t, buf)
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for the outbound request")
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	reply := fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"error":{"code":-32000,"message":"no such setting"}}`, id)
-	h.handleInboundLine([]byte(reply))
-
-	select {
-	case got := <-done:
-		if got != "fallback" {
-			t.Errorf("getStringSetting() = %q, want fallback %q on host error", got, "fallback")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("getStringSetting() did not return")
-	}
-}
-
-func TestHostRPCGetStringSettingFallsBackOnCancelledContext(t *testing.T) {
+// TestHostRPCSessionStatusChangedIdleNotifies: AoE pushes every status
+// transition as an id-less notification; only a transition *to* Idle ("the
+// agent stopped working") is worth a discovery pass, and a notification is
+// never replied to.
+func TestHostRPCSessionStatusChangedIdleNotifies(t *testing.T) {
 	var buf bytes.Buffer
 	h := newHostRPC(&buf)
+	var idle []string
+	h.onSessionIdle = func(sessionID string) { idle = append(idle, sessionID) }
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	h.handleInboundLine(sessionStatusLine("abc", "Running", "Idle"))
+	h.handleInboundLine(sessionStatusLine("def", "Idle", "Running"))
+	h.handleInboundLine(sessionStatusLine("ghi", "Running", "Waiting"))
+	h.handleInboundLine(sessionStatusLine("jkl", "Running", "Idle"))
 
-	if got := h.getStringSetting(ctx, "dashboard_base_url", "fallback"); got != "fallback" {
-		t.Errorf("getStringSetting() with a cancelled context = %q, want fallback %q", got, "fallback")
+	if len(idle) != 2 || idle[0] != "abc" || idle[1] != "jkl" {
+		t.Errorf("onSessionIdle calls = %v, want [abc jkl] (only transitions to Idle)", idle)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("handleInboundLine() wrote %q for a notification, want nothing", buf.String())
+	}
+}
+
+func TestHostRPCSessionStatusChangedWithoutHandlerIsIgnored(t *testing.T) {
+	h := newHostRPC(&bytes.Buffer{})
+	h.handleInboundLine(sessionStatusLine("abc", "Running", "Idle")) // must not panic
+}
+
+func sessionLifecycleLine(kind, sessionID, summary string) []byte {
+	s := `{"jsonrpc":"2.0","method":"session.lifecycle.changed","params":{"session_id":"` + sessionID + `","kind":"` + kind + `","at":"2026-10-05T10:00:00Z"`
+	if summary != "" {
+		s += `,"summary":` + summary
+	}
+	return []byte(s + `}}`)
+}
+
+// TestHostRPCSessionLifecycleChangedDelivers: every lifecycle kind reaches
+// the handler with its summary (absent for "deleted"), and a notification
+// is never replied to.
+func TestHostRPCSessionLifecycleChangedDelivers(t *testing.T) {
+	var buf bytes.Buffer
+	h := newHostRPC(&buf)
+	type got struct{ kind, id, summary string }
+	var calls []got
+	h.onSessionLifecycle = func(kind, sessionID string, summary json.RawMessage) {
+		calls = append(calls, got{kind, sessionID, string(summary)})
+	}
+
+	h.handleInboundLine(sessionLifecycleLine("created", "abc", `{"id":"abc","title":"T"}`))
+	h.handleInboundLine(sessionLifecycleLine("deleted", "abc", ""))
+
+	want := []got{{"created", "abc", `{"id":"abc","title":"T"}`}, {"deleted", "abc", ""}}
+	if len(calls) != 2 || calls[0] != want[0] || calls[1] != want[1] {
+		t.Errorf("onSessionLifecycle calls = %+v, want %+v", calls, want)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("handleInboundLine() wrote %q for a notification, want nothing", buf.String())
+	}
+}
+
+func TestHostRPCSessionLifecycleMalformedIsIgnored(t *testing.T) {
+	h := newHostRPC(&bytes.Buffer{})
+	called := false
+	h.onSessionLifecycle = func(string, string, json.RawMessage) { called = true }
+
+	h.handleInboundLine([]byte(`{"jsonrpc":"2.0","method":"session.lifecycle.changed","params":"nope"}`))
+	h.handleInboundLine([]byte(`{"jsonrpc":"2.0","method":"session.lifecycle.changed","params":{"kind":"created"}}`)) // no session_id
+	if called {
+		t.Error("onSessionLifecycle called for a malformed notification, want it ignored")
+	}
+}
+
+func TestHostRPCCallErrorCarriesTheStableKind(t *testing.T) {
+	h := newReplyingHost(`{}`)
+	h.replyErr = true
+	h.errData = `{"kind":"session_archived"}`
+
+	_, err := h.rpc.call(t.Context(), "sessions.message.send", map[string]any{"session_id": "s", "message": "m"})
+	if err == nil {
+		t.Fatal("call() error = nil, want the host's error")
+	}
+	if !strings.Contains(err.Error(), "session_archived") || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("call() error = %q, want it to carry both the message and data.kind", err)
+	}
+}
+
+func TestHostRPCCallExportedWrapperMatchesCall(t *testing.T) {
+	h := newReplyingHost(`{"ok":true}`)
+	got, err := h.rpc.Call(t.Context(), "any.method", nil)
+	if err != nil || string(got) != `{"ok":true}` {
+		t.Errorf("Call() = %s, %v, want the reply result", got, err)
+	}
+}
+
+func TestHostRPCListSessionsParsesTheHostReply(t *testing.T) {
+	h := newReplyingHost(`{"sessions":[{"id":"a","title":"One","archived":true},{"id":"b","trashed":true}]}`)
+
+	got, err := h.rpc.ListSessions(t.Context())
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "a" || !got[0].Archived || !got[1].Trashed {
+		t.Errorf("ListSessions() = %+v", got)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.seen) != 1 || h.seen[0] != "sessions.list" {
+		t.Errorf("methods called = %v, want exactly [sessions.list]", h.seen)
+	}
+	// No "exclude": the directory needs archived and trashed sessions too,
+	// to tell them apart from deleted ones.
+	if strings.Contains(h.params[0], "exclude") {
+		t.Errorf("params = %s, want no exclude filter", h.params[0])
+	}
+}
+
+func TestHostRPCListSessionsPropagatesErrors(t *testing.T) {
+	h := newReplyingHost(`{}`)
+	h.replyErr = true
+	if _, err := h.rpc.ListSessions(t.Context()); err == nil {
+		t.Error("ListSessions() error = nil on an RPC error, want it propagated")
 	}
 }
