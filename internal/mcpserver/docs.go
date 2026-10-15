@@ -9,6 +9,8 @@ The watch is a background worker, independent of this session: it survives resta
 
 Registering is usually unnecessary: the worker auto-discovers the open PR/MR on a session's own git checkout (any branch, forks included) within seconds of the session going idle. Call register only for instant coverage, an events filter, or a PR/MR that is not on the session's own branch.
 
+A new watch starts silent: its first poll is recorded as the baseline without a ping, so only changes after registration arrive (register's report_existing asks for the existing activity as a one-time ping).
+
 Pings arrive as user messages starting with the ref: "[pr-watch] owner/repo#42: <event>" (GitHub) or "[pr-watch] group/project!17: <event>" (GitLab). Several changes in one poll arrive as "[pr-watch] <ref>, N changes:" with one "- <event>" bullet per change; updates for several PRs/MRs of one session arrive as "[pr-watch] N updates:" with one blank-line-separated section per PR/MR. Handle every bullet and section separately. A ref marked "(merged)" or "(closed)" is a finished PR still watched for late REVIEW/COMMENT events.
 
 Events (the kind is the first word of the line):
@@ -36,6 +38,8 @@ Usually not needed: the worker auto-discovers the open PR/MR on the session's ow
 pr_urls takes several URLs at once; each gets its own outcome in results ({pr_url, registered, error?}) and one bad URL does not block the rest. session_id is the raw value of $AOE_ARTIFACT_DIR; resolve it first, the literal variable name matches no session and is rejected.
 
 events restricts which kinds ping the session: REVIEW, REVIEW_DISMISSED, COMMENT, CI, CI_RECOVERED, CI_SUCCESS, CONFLICT, MERGED, CLOSED, REOPENED, MERGE_QUEUE. Omit it for every kind except the opt-in CI_SUCCESS, which only fires when named. Auto-discovery always registers unfiltered. Never narrow the filter unprompted; use it when told to be quiet until e.g. the merge (["MERGED"]).
+
+A new watch starts silent: the first poll only records what the PR/MR already has (reviews, comments, failing CI, conflict) as the baseline, and only later changes ping. Set report_existing to get that existing activity as a one-time ping instead. Auto-discovered watches always start silent.
 
 Idempotent per URL and session: registering again refreshes it and replaces the events filter. Other sessions watching the same URL keep independent registrations. The watch persists after merge or close for 30 days so late reviews still arrive.`
 

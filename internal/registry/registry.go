@@ -25,6 +25,11 @@ const (
 // Registration is one watched PR/MR: which session to wake, where its
 // last-seen state sits, and when the scheduler should check it next.
 type Registration struct {
+	// SilentFirstPoll is an input to Add only (the row's state is read with
+	// Store.FirstPollSilent): the first poll then records the PR's existing
+	// activity as the baseline without pinging about it. Applied when the row
+	// is inserted, never when an existing one is refreshed.
+	SilentFirstPoll     bool
 	PRURL               string
 	SessionID           string
 	Provider            string // "github" | "gitlab"
@@ -98,6 +103,7 @@ CREATE TABLE IF NOT EXISTS registrations (
 	event_filter TEXT NOT NULL DEFAULT '[]',
 	thread_comment_ids TEXT NOT NULL DEFAULT 'null',
 	closed_at INTEGER NOT NULL DEFAULT 0,
+	silent_first_poll INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (pr_url, session_id)
 );
 
@@ -195,6 +201,9 @@ var columnMigrations = []string{
 	// When the PR/MR was seen closed, for FinishedWatchWindow. Not part of
 	// registrationColumns: only SQL reads it.
 	`ALTER TABLE registrations ADD COLUMN closed_at INTEGER NOT NULL DEFAULT 0`,
+	// 1 until the first poll has been taken as the baseline, see
+	// Registration.SilentFirstPoll. Not part of registrationColumns either.
+	`ALTER TABLE registrations ADD COLUMN silent_first_poll INTEGER NOT NULL DEFAULT 0`,
 }
 
 // autoDiscoveryColumnMigrations add the columns auto_discovery gained after
@@ -311,12 +320,36 @@ func (s *Store) Close() error { return s.db.Close() }
 // resumes being watched.
 func (s *Store) Add(ctx context.Context, r Registration) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, ci_detail, ci_href, review_href, unresolved_thread_ids, top_level_comment_ids, latest_comment_href, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked, dismissed_review_href, event_filter)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, ci_detail, ci_href, review_href, unresolved_thread_ids, top_level_comment_ids, latest_comment_href, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked, dismissed_review_href, event_filter, silent_first_poll)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(pr_url, session_id) DO UPDATE SET next_due_at = excluded.next_due_at, status = excluded.status, event_filter = excluded.event_filter
-	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.CIDetail, r.CIHref, r.ReviewHref, marshalStrings(r.UnresolvedThreadIDs), marshalStrings(r.TopLevelCommentIDs), r.LatestCommentHref, r.LatestReviewState, r.LatestReviewer, unixOrZero(r.LatestReviewAt), r.Title, r.Description, StatusWatching, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix(), unixOrZero(r.MergedAt), boolToInt(r.HasConflict), r.MergeQueueState, r.MergeQueuePosition, boolToInt(r.Blocked), r.DismissedReviewHref, marshalStrings(r.EventFilter))
+	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.CIDetail, r.CIHref, r.ReviewHref, marshalStrings(r.UnresolvedThreadIDs), marshalStrings(r.TopLevelCommentIDs), r.LatestCommentHref, r.LatestReviewState, r.LatestReviewer, unixOrZero(r.LatestReviewAt), r.Title, r.Description, StatusWatching, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix(), unixOrZero(r.MergedAt), boolToInt(r.HasConflict), r.MergeQueueState, r.MergeQueuePosition, boolToInt(r.Blocked), r.DismissedReviewHref, marshalStrings(r.EventFilter), boolToInt(r.SilentFirstPoll))
 	if err != nil {
 		return fmt.Errorf("add registration: %w", err)
+	}
+	return nil
+}
+
+// FirstPollSilent reports whether prURL's registration for sessionID is still
+// waiting for its first poll to be taken as a silent baseline. Absent rows
+// report false.
+func (s *Store) FirstPollSilent(ctx context.Context, prURL, sessionID string) (bool, error) {
+	var silent int
+	err := s.db.QueryRowContext(ctx, `SELECT silent_first_poll FROM registrations WHERE pr_url = ? AND session_id = ?`, prURL, sessionID).Scan(&silent)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("first poll silent: %w", err)
+	}
+	return silent != 0, nil
+}
+
+// ClearFirstPollSilent ends the silent first poll: from here on the
+// registration reports what changes.
+func (s *Store) ClearFirstPollSilent(ctx context.Context, prURL, sessionID string) error {
+	if _, err := s.db.ExecContext(ctx, `UPDATE registrations SET silent_first_poll = 0 WHERE pr_url = ? AND session_id = ?`, prURL, sessionID); err != nil {
+		return fmt.Errorf("clear first poll silent: %w", err)
 	}
 	return nil
 }

@@ -39,7 +39,11 @@ One always-on process does four jobs:
    before), which only a filter naming them lets through. If a recovery fires both
    `CI_RECOVERED` and `CI_SUCCESS`, the session gets the `CI_RECOVERED` ping only. Re-registering the same `(pr_url, session_id)` pair with a
    different `events` list just replaces the filter in place — no separate
-   tool needed to change it. `dismiss_review` clears a GitHub review's badge — a real GitHub
+   tool needed to change it. A new watch starts silent: its first poll is
+   recorded as the baseline (what the PR already has is visible on it) and
+   only later changes ping. `register`'s optional `report_existing` sends the
+   existing activity as a one-time ping instead; auto-discovered watches are
+   always silent at first. `dismiss_review` clears a GitHub review's badge — a real GitHub
    dismissal if possible, falling back to re-requesting the reviewer,
    falling back to a local-only badge clear when neither GitHub action
    applies or succeeds (always the case for a `COMMENTED` review, which

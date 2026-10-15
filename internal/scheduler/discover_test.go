@@ -162,6 +162,9 @@ func TestDiscoverTickFindsOpenGitLabMR(t *testing.T) {
 	}
 
 	getReg(t, store, "https://gitlab.corp.example/team/project/-/merge_requests/9", "sess1")
+	if silent, err := store.FirstPollSilent(ctx, "https://gitlab.corp.example/team/project/-/merge_requests/9", "sess1"); err != nil || !silent {
+		t.Errorf("FirstPollSilent() = (%v, %v), want true: a discovered PR's existing activity is not pinged", silent, err)
+	}
 }
 
 func TestDiscoverTickKeepsProbingWhenNoOpenPRYet(t *testing.T) {

@@ -17,9 +17,10 @@ import (
 )
 
 type registerInput struct {
-	PRURLs    []string `json:"pr_urls" jsonschema:"one or more GitHub PR or GitLab MR URLs to watch — a single-element list registers just one, same as before"`
-	SessionID string   `json:"session_id" jsonschema:"the calling AoE session's id — pass $AOE_ARTIFACT_DIR's raw value directly, its basename is extracted automatically, no need to run basename yourself"`
-	Events    []string `json:"events,omitempty" jsonschema:"optional: only notify for these event kinds (REVIEW, REVIEW_DISMISSED, COMMENT, CI, CI_RECOVERED, CI_SUCCESS, CONFLICT, MERGED, CLOSED, REOPENED, MERGE_QUEUE), e.g. [\"MERGED\"] to only hear about the merge; omit for every kind. Applies to every URL in pr_urls alike. Re-registering the same pr_url/session_id with a different events list just replaces the filter, same as register's other idempotent-refresh behavior."`
+	ReportExisting bool     `json:"report_existing,omitempty" jsonschema:"optional: send a ping for the activity the PR/MR already has (reviews, comments, failing CI, conflict) on the first poll; by default that first poll is only recorded as the baseline and stays silent, and later changes ping as usual"`
+	PRURLs         []string `json:"pr_urls" jsonschema:"one or more GitHub PR or GitLab MR URLs to watch — a single-element list registers just one, same as before"`
+	SessionID      string   `json:"session_id" jsonschema:"the calling AoE session's id — pass $AOE_ARTIFACT_DIR's raw value directly, its basename is extracted automatically, no need to run basename yourself"`
+	Events         []string `json:"events,omitempty" jsonschema:"optional: only notify for these event kinds (REVIEW, REVIEW_DISMISSED, COMMENT, CI, CI_RECOVERED, CI_SUCCESS, CONFLICT, MERGED, CLOSED, REOPENED, MERGE_QUEUE), e.g. [\"MERGED\"] to only hear about the merge; omit for every kind. Applies to every URL in pr_urls alike. Re-registering the same pr_url/session_id with a different events list just replaces the filter, same as register's other idempotent-refresh behavior."`
 }
 
 // registerResult is one pr_urls entry's own outcome — register never fails
@@ -245,6 +246,9 @@ func NewHandler(store *registry.Store, gh GitHubReviewClient, sessions SessionVa
 					NextDueAt:   time.Now(),
 					CreatedAt:   time.Now(),
 					EventFilter: in.Events,
+					// Existing activity is already visible on the PR; only a
+					// caller that asks gets it pinged as a backlog.
+					SilentFirstPoll: !in.ReportExisting,
 				}
 				if err := store.Add(ctx, reg); err != nil {
 					results = append(results, registerResult{PRURL: prURL, Error: err.Error()})

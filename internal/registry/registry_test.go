@@ -1106,3 +1106,45 @@ func TestReopenedRegistrationIsWatchedAgain(t *testing.T) {
 		t.Errorf("Status = %q, want watching", got.Status)
 	}
 }
+
+func TestSilentFirstPollIsSetOnInsertOnlyAndCleared(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	base := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "s1", Provider: "github", NextDueAt: time.Now(), CreatedAt: time.Now()}
+
+	silent, err := s.FirstPollSilent(ctx, base.PRURL, base.SessionID)
+	if err != nil || silent {
+		t.Fatalf("FirstPollSilent() before any row = (%v, %v), want (false, nil)", silent, err)
+	}
+
+	quiet := base
+	quiet.SilentFirstPoll = true
+	if err := s.Add(ctx, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if silent, _ := s.FirstPollSilent(ctx, base.PRURL, base.SessionID); !silent {
+		t.Error("FirstPollSilent() after Add(SilentFirstPoll) = false, want true")
+	}
+
+	// Re-registering must not touch the flag, either way.
+	if err := s.Add(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	if silent, _ := s.FirstPollSilent(ctx, base.PRURL, base.SessionID); !silent {
+		t.Error("re-Add without the flag cleared it; only the first poll may do that")
+	}
+
+	if err := s.ClearFirstPollSilent(ctx, base.PRURL, base.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	if silent, _ := s.FirstPollSilent(ctx, base.PRURL, base.SessionID); silent {
+		t.Error("FirstPollSilent() after Clear = true, want false")
+	}
+	loud := quiet
+	if err := s.Add(ctx, loud); err != nil {
+		t.Fatal(err)
+	}
+	if silent, _ := s.FirstPollSilent(ctx, base.PRURL, base.SessionID); silent {
+		t.Error("re-Add with the flag re-armed a polled registration")
+	}
+}

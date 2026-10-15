@@ -93,3 +93,20 @@ func TestEveryToolDescriptionIsSubstantial(t *testing.T) {
 		}
 	}
 }
+
+func TestRegisterStartsSilentUnlessReportExisting(t *testing.T) {
+	store := openTestStore(t)
+	srv := httptest.NewServer(NewHandler(store, &fakeGitHubReviewClient{}, &fakeSessionValidator{}, &fakeUIPusher{}))
+	t.Cleanup(srv.Close)
+
+	callTool(t, srv, "register", map[string]any{"pr_urls": []string{"https://github.com/o/r/pull/1"}, "session_id": "sess1"})
+	callTool(t, srv, "register", map[string]any{"pr_urls": []string{"https://github.com/o/r/pull/2"}, "session_id": "sess1", "report_existing": true})
+
+	ctx := context.Background()
+	if silent, err := store.FirstPollSilent(ctx, "https://github.com/o/r/pull/1", "sess1"); err != nil || !silent {
+		t.Errorf("default register: FirstPollSilent = (%v, %v), want true", silent, err)
+	}
+	if silent, err := store.FirstPollSilent(ctx, "https://github.com/o/r/pull/2", "sess1"); err != nil || silent {
+		t.Errorf("report_existing register: FirstPollSilent = (%v, %v), want false", silent, err)
+	}
+}

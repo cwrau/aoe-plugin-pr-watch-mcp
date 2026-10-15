@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -71,4 +72,47 @@ func (n *perSessionFailNotifier) Send(_ context.Context, sessionID, _ string) er
 		return context.DeadlineExceeded
 	}
 	return nil
+}
+
+// A silent first poll takes whatever the PR already shows as the baseline:
+// no ping, state saved, and the flag cleared so the next poll reports changes.
+func TestSilentFirstPollSavesBaselineWithoutPinging(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+
+	reg := registry.Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github",
+		CIBucket: "none", NextDueAt: now.Add(-time.Second), CreatedAt: now, SilentFirstPoll: true,
+	}
+	if err := store.Add(ctx, reg); err != nil {
+		t.Fatal(err)
+	}
+	gh := &fakeGitHubChecker{results: map[string]provider.CheckResult{
+		reg.PRURL: {State: "open", CIBucket: "failure", TopLevelCommentIDs: []string{"c1"}, HasConflict: true},
+	}, budgets: provider.GitHubBudgets{
+		GraphQL: provider.RateBudget{Limit: 5000, Remaining: 4999, ResetAt: now.Add(time.Hour)},
+		REST:    provider.RateBudget{Limit: 5000, Remaining: 4999, ResetAt: now.Add(time.Hour)},
+	}}
+	notify := &fakeNotifier{}
+	var buf bytes.Buffer
+	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: notify, Log: slog.New(slog.NewTextHandler(&buf, nil))}
+
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	if len(notify.sent) != 0 {
+		t.Errorf("notify.sent = %q, want nothing for a silent first poll", notify.sent)
+	}
+	if !strings.Contains(buf.String(), "reason=baseline") {
+		t.Errorf("log lacks the baseline suppression reason:\n%s", buf.String())
+	}
+	got := getReg(t, store, reg.PRURL, "sess1")
+	if got.CIBucket != "failure" || !got.HasConflict || !slices.Equal(got.TopLevelCommentIDs, []string{"c1"}) {
+		t.Errorf("stored state = %+v, want the first poll recorded as the baseline", got)
+	}
+	if silent, _ := store.FirstPollSilent(ctx, reg.PRURL, "sess1"); silent {
+		t.Error("the silent flag is still set after the first poll")
+	}
 }
