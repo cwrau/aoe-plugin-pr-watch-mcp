@@ -6,8 +6,8 @@
 id = "io.cwrau.pr-watch-mcp"
 name = "PR Watch"
 version = "0.1.0"
-api_version = 13
-aoe_version = ">=1.11.0, <2.0.0"
+api_version = 15
+aoe_version = ">=1.20.0, <2.0.0"
 description = "Persistent GitHub PR / GitLab MR watcher: register once, get woken on review/CI/merge activity, even across session restarts."
 
 # net             - GitHub GraphQL/REST calls, GitLab REST calls, and the
@@ -19,16 +19,28 @@ description = "Persistent GitHub PR / GitLab MR watcher: register once, get woke
 #                   open-ui-link action below. Client-executed (opens the
 #                   row-badge's own href straight from the browser), no
 #                   worker round-trip.
+# session.read    - lists sessions (`sessions.list`: lifecycle, titles and
+#                   checkouts) and receives the host's
+#                   `session.lifecycle.changed` (api_version >= 15) and
+#                   `session.status.changed` (api_version >= 14)
+#                   notifications. A session going Idle triggers one
+#                   auto-discovery pass for just that session.
+# session.message - delivers every PR/MR notification into the owning
+#                   session via `sessions.message.send` (api_version >= 15),
+#                   waking a stopped session and steering or queuing for a
+#                   busy one. It reaches any session, which is why it is a
+#                   capability of its own.
 #
-# No process.spawn declared: the worker shells to `aoe`/`gh`/`glab` as an
+# The session pane renders each PR/MR description as a `markdown` block
+# (api_version >= 15). A host without that block kind drops it silently, so
+# the descriptions would disappear there.
+#
+# No process.spawn declared: the worker shells to `git`/`gh`/`glab` as an
 # ordinary child process (the NoSandbox worker model already permits this,
 # same as the reference agent-of-empires.github plugin, which shells to
-# `git`/`gh` under just the `net` capability). No session.read/session.write
-# needed either: this plugin is never "attached" to a single session in the
-# host's sense — it serves every session equally over its own MCP-over-HTTP
-# listener, and resolves session identity from the caller's own
-# $AOE_ARTIFACT_DIR, not via a host RPC.
-capabilities = ["net", "runtime.worker", "browser_open"]
+# `git`/`gh` under just the `net` capability). It no longer runs the `aoe`
+# CLI at all: sessions and messages go over the host RPC.
+capabilities = ["net", "runtime.worker", "browser_open", "session.read", "session.message"]
 
 # Desktop-friendly alternative to the small row-badge chip: opens the
 # active session's watched PR/MR straight from the command palette (or a
@@ -70,18 +82,56 @@ id = "watched_badge"
 slot = "pane"
 id = "pr_pane"
 
-# The worker has no way to know which of the daemon's possibly-several
-# externally-reachable URLs (loopback, LAN, Tailscale, a reverse-proxied
-# domain) you actually view the dashboard from, so the session link in the
-# panel above needs this set explicitly — leave it empty to just show the
-# session id as plain, unlinked text instead.
+# Snooze rules: while a rule's gate command exits non-zero, registrations
+# whose PR/MR URL matches one of its patterns are not polled at all, so
+# nothing is notified. Everything that happened meanwhile is reported once
+# the gate opens. Empty by default, i.e. nothing is ever snoozed.
 [[settings]]
-key = "dashboard_base_url"
-label = "Dashboard base URL"
-description = "The URL you use to open the AoE dashboard (e.g. https://agent.example.com), used to build session links in the Watched PRs/MRs panel. Leave empty to show session ids without a link."
+key = "snooze"
+label = "Snooze rules"
+description = "Mute watched PRs/MRs while a gate command reports closed (exits non-zero). Every rule with a matching pattern applies, so a PR/MR is only checked while all of its matching gates are open; PRs/MRs matching no rule are never snoozed."
+type = "object_list"
+min_items = 0
+max_items = 20
+
+[[settings.fields]]
+key = "match"
+label = "URL patterns"
+description = "Matched against the PR/MR URL without scheme, case-insensitively. * matches any characters including /, ? matches one. Example: gitlab.example.com/*"
+type = "string_list"
+required = true
+
+[[settings.fields]]
+key = "gate"
+label = "Gate command"
+description = "Run with sh -c. Exit 0 = open (watch normally), non-zero = closed (snoozed). Example: systemctl --user is-active --quiet work.target"
 type = "string"
-default = ""
-advanced = true
+required = true
+
+# Comment filters: top-level PR/MR comments (the Conversation tab) matching
+# a rule are left out of what's tracked, so they never ping. Evaluated
+# against each comment's *current* body on every poll: a bot that edits a
+# "review in progress" placeholder into the real review starts pinging the
+# moment the edit stops matching. Empty by default, i.e. nothing is filtered.
+[[settings]]
+key = "comment_filters"
+label = "Comment filters"
+description = "Ignore matching top-level PR/MR comments (not reviews, not inline threads). A rule needs an author, at least one body text, or both; when both are set, the author must match and the body must contain any one of the texts."
+type = "object_list"
+min_items = 0
+max_items = 20
+
+[[settings.fields]]
+key = "author"
+label = "Author"
+description = "Comment author's login/username, case-insensitive; a trailing [bot] is ignored. Example: coderabbitai"
+type = "string"
+
+[[settings.fields]]
+key = "contains"
+label = "Body contains"
+description = "Case-insensitive texts; the comment body must contain at least one of them. Add several to cover more than one phrase for the same author. Example: review in progress"
+type = "string_list"
 
 [runtime]
 kind = "command"
