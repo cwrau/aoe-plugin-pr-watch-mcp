@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/provider"
@@ -10,13 +11,6 @@ import (
 
 const homePaneSlot = "home-pane"
 const homePaneID = "watched_prs"
-
-// dashboardBaseURLSettingKey must match the [[settings]] key declared in
-// aoe-plugin.toml. Unused for session-href building now that the host
-// accepts a plain relative href (see registrationColumns) — kept, setting
-// and all, only so a revert back to absolute-URL building is a small diff
-// if the relative-href host support turns out not to work everywhere.
-const dashboardBaseURLSettingKey = "dashboard_base_url"
 
 // panePayload mirrors the shape ui.state.set expects for a pane-family
 // slot (docs/plugin-api.md "Pane payload"), shared by home-pane and the
@@ -33,6 +27,7 @@ type sectionBlock struct {
 	Kind     string `json:"kind"`
 	Title    string `json:"title,omitempty"`
 	Value    string `json:"value,omitempty"`
+	Scroll   bool   `json:"scroll,omitempty"`
 	Children []any  `json:"children,omitempty"`
 }
 
@@ -58,6 +53,14 @@ type noteBlock struct {
 	Text string `json:"text"`
 }
 
+// markdownBlock is the pane vocabulary's markdown kind (host api_version 15):
+// the host renders and sanitises Text as GitHub-flavoured markdown. A host
+// that predates it drops the block.
+type markdownBlock struct {
+	Kind string `json:"kind"`
+	Text string `json:"text"`
+}
+
 // buildHomePanePayload renders the currently-watched registrations as a
 // home-pane payload: one section listing every actively-watched
 // registration, each as a PR/MR link paired with its owning session's link.
@@ -69,17 +72,26 @@ type noteBlock struct {
 // filterable, so rows are just sorted failures-first to keep the most
 // actionable ones on top. titleOf resolves a session id to its display
 // title (aoeclient.Client's Title method); an empty result falls back to
-// the raw session id. dashboardBaseURL is accepted but currently unused —
-// see registrationColumns.
-func buildHomePanePayload(regs []registry.Registration, titleOf func(sessionID string) string, dashboardBaseURL string) panePayload {
+// the raw session id.
+func buildHomePanePayload(regs []registry.Registration, titleOf func(sessionID string) string) panePayload {
 	var sorted []registry.Registration
 	for _, r := range regs {
 		if r.Status == registry.StatusWatching {
 			sorted = append(sorted, r)
 		}
 	}
-	sort.SliceStable(sorted, func(i, j int) bool {
-		return ciSeverity(sorted[i].CIBucket) < ciSeverity(sorted[j].CIBucket)
+	// Ties break on identity, not input order: the registry returns rows by
+	// next_due_at, which changes on every poll and would shuffle equal-severity
+	// rows each time the pane is pushed.
+	sort.Slice(sorted, func(i, j int) bool {
+		a, b := sorted[i], sorted[j]
+		if sa, sb := ciSeverity(a.CIBucket), ciSeverity(b.CIBucket); sa != sb {
+			return sa < sb
+		}
+		if a.PRURL != b.PRURL {
+			return a.PRURL < b.PRURL
+		}
+		return a.SessionID < b.SessionID
 	})
 
 	var children []any
@@ -87,7 +99,7 @@ func buildHomePanePayload(regs []registry.Registration, titleOf func(sessionID s
 		children = []any{noteBlock{Kind: "note", Text: "No PRs/MRs currently being watched."}}
 	} else {
 		for _, reg := range sorted {
-			children = append(children, registrationColumns(reg, titleOf, dashboardBaseURL))
+			children = append(children, registrationColumns(reg, titleOf))
 		}
 	}
 
@@ -95,22 +107,24 @@ func buildHomePanePayload(regs []registry.Registration, titleOf func(sessionID s
 		Title: "PR Watch",
 		Blocks: []any{
 			sectionBlock{
-				Kind:     "section",
+				Kind: "section",
+				// scroll caps this section's own height instead of letting
+				// it grow unbounded — confirmed live: with 20+ active
+				// registrations, an unscrolled section on a host-wide
+				// home-pane (which "several plugins' home panes stack" on,
+				// per docs/plugin-api.md, with no outer scroll container of
+				// its own) pushed every other plugin's home-pane, and even
+				// the dashboard's own default panes, off-screen below it.
 				Title:    "Watched PRs/MRs",
 				Value:    fmt.Sprintf("%d", len(sorted)),
+				Scroll:   true,
 				Children: children,
 			},
 		},
 	}
 }
 
-// dashboardBaseURL is unused: the host's pane renderer now accepts a plain
-// relative href, so the session row always links to /session/<id> directly
-// rather than needing an absolute URL built from a user-configured base.
-// The parameter (and its setting, see dashboardBaseURLSettingKey) stays in
-// place only so reverting to absolute-URL building is a small diff if the
-// host's relative-href support doesn't pan out.
-func registrationColumns(reg registry.Registration, titleOf func(string) string, dashboardBaseURL string) columnsBlock {
+func registrationColumns(reg registry.Registration, titleOf func(string) string) columnsBlock {
 	sessionLabel := titleOf(reg.SessionID)
 	if sessionLabel == "" {
 		sessionLabel = reg.SessionID
@@ -139,11 +153,23 @@ func registrationColumns(reg registry.Registration, titleOf func(string) string,
 		prLabel = shortRef(reg)
 	}
 
+	// The provider badge always shows — it identifies the row, not an event
+	// kind the session could have filtered out. Every other badge mirrors a
+	// specific event.Kind (see registry.Registration.EventFilter's doc
+	// comment): shown when reg.EventFilter is empty (the default, every
+	// kind), or when its matching kind is explicitly in the filter.
 	badges := []rowBadge{providerBadge(reg.Provider)}
-	if reg.HasConflict {
+	if reg.HasConflict && eventFilterShows(reg.EventFilter, "CONFLICT") {
 		badges = append(badges, conflictBadge())
 	}
-	badges = append(badges, ciBadge(reg.CIBucket), reviewBadge(reg.LatestReviewState))
+	if eventFilterShows(reg.EventFilter, "CI") {
+		if ci, ok := ciBadge(reg.CIBucket); ok {
+			badges = append(badges, ci)
+		}
+	}
+	if eventFilterShows(reg.EventFilter, "REVIEW") {
+		badges = append(badges, reviewBadge(reg.LatestReviewState))
+	}
 
 	return columnsBlock{
 		Kind: "columns",
@@ -164,20 +190,18 @@ func registrationColumns(reg registry.Registration, titleOf func(string) string,
 }
 
 // shortRef derives a compact PR/MR reference from the registration's own
-// URL and provider — no extra API call, just the same parsers the checkers
-// already use to validate the URL shape at registration time.
+// URL and provider — see provider.ShortRef, shared with the scheduler's
+// notification text so a PR/MR reads identically wherever it's named.
 func shortRef(reg registry.Registration) string {
-	switch reg.Provider {
-	case "github":
-		if owner, repo, number, err := provider.ParseGitHubPRURL(reg.PRURL); err == nil {
-			return fmt.Sprintf("%s/%s#%d", owner, repo, number)
-		}
-	case "gitlab":
-		if _, path, iid, err := provider.ParseGitLabMRURL(reg.PRURL); err == nil {
-			return fmt.Sprintf("%s!%d", path, iid)
-		}
-	}
-	return reg.PRURL
+	return provider.ShortRef(reg.PRURL, reg.Provider)
+}
+
+// eventFilterShows reports whether a badge tied to event kind should render
+// for a registration carrying filter as its EventFilter: true when filter is
+// empty (the default — every kind, so every badge shows, matching this
+// dashboard's pre-filter behavior), or when kind is explicitly in it.
+func eventFilterShows(filter []string, kind string) bool {
+	return len(filter) == 0 || slices.Contains(filter, kind)
 }
 
 func providerBadge(prov string) rowBadge {
@@ -191,20 +215,21 @@ func conflictBadge() rowBadge {
 	return rowBadge{Text: "conflict", Tone: "danger"}
 }
 
-func ciBadge(bucket string) rowBadge {
-	tone := "neutral"
-	text := bucket
+// ciBadge reports ok=false for an empty/"none" bucket — no CI signal at all
+// isn't worth a badge (a row without one already reads as "nothing to show
+// here"), so every caller omits the badge entirely instead of rendering a
+// "no CI" placeholder.
+func ciBadge(bucket string) (rowBadge, bool) {
 	switch bucket {
 	case "success":
-		tone = "success"
+		return rowBadge{Text: bucket, Tone: "success"}, true
 	case "failure":
-		tone = "danger"
+		return rowBadge{Text: bucket, Tone: "danger"}, true
 	case "pending", "action_required":
-		tone = "warn"
-	case "", "none":
-		text = "no CI"
+		return rowBadge{Text: bucket, Tone: "warn"}, true
+	default:
+		return rowBadge{}, false
 	}
-	return rowBadge{Text: text, Tone: tone}
 }
 
 func reviewBadge(state string) rowBadge {

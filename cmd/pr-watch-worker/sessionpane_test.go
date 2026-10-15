@@ -1,7 +1,11 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/registry"
 )
@@ -67,12 +71,52 @@ func TestBuildSessionPanePayloadGitHubRegistration(t *testing.T) {
 		t.Errorf("refRow.Href = %q, want %q (ref line must be clickable too)", refRow.Href, regs[0].PRURL)
 	}
 
-	note, ok := payload.Blocks[2].(noteBlock)
+	// The description is markdown (a PR/MR body); the host renders it and
+	// sanitises it.
+	desc, ok := payload.Blocks[2].(markdownBlock)
 	if !ok {
-		t.Fatalf("Blocks[2] = %T, want noteBlock", payload.Blocks[2])
+		t.Fatalf("Blocks[2] = %T, want markdownBlock", payload.Blocks[2])
 	}
-	if note.Text != "This changes the widget to render correctly." {
-		t.Errorf("note.Text = %q, want the full description", note.Text)
+	if desc.Kind != "markdown" || desc.Text != "This changes the widget to render correctly." {
+		t.Errorf("description block = %+v, want kind markdown with the full description", desc)
+	}
+}
+
+func TestBuildSessionPanePayloadOnlyCIBadgeForCIOnlyFilter(t *testing.T) {
+	regs := []registry.Registration{
+		{
+			PRURL: "https://github.com/cwrau/aoe-pr-watch-mcp/pull/42", SessionID: "sess1", Provider: "github",
+			CIBucket: "failure", LatestReviewState: "APPROVED",
+			Status: registry.StatusWatching, EventFilter: []string{"CI"},
+		},
+	}
+
+	payload, ok := buildSessionPanePayload(regs)
+	if !ok {
+		t.Fatal("buildSessionPanePayload() ok = false, want true")
+	}
+	titleRow := payload.Blocks[0].(rowBlock)
+	if len(titleRow.Badges) != 1 || titleRow.Badges[0].Text != "failure" {
+		t.Errorf("titleRow.Badges = %+v, want just the CI badge for a CI-only filter", titleRow.Badges)
+	}
+}
+
+func TestBuildSessionPanePayloadNoBadgesForMergedOnlyFilter(t *testing.T) {
+	regs := []registry.Registration{
+		{
+			PRURL: "https://github.com/cwrau/aoe-pr-watch-mcp/pull/42", SessionID: "sess1", Provider: "github",
+			CIBucket: "failure", LatestReviewState: "APPROVED",
+			Status: registry.StatusWatching, EventFilter: []string{"MERGED"},
+		},
+	}
+
+	payload, ok := buildSessionPanePayload(regs)
+	if !ok {
+		t.Fatal("buildSessionPanePayload() ok = false, want true")
+	}
+	titleRow := payload.Blocks[0].(rowBlock)
+	if len(titleRow.Badges) != 0 {
+		t.Errorf("titleRow.Badges = %+v, want none for a MERGED-only filter", titleRow.Badges)
 	}
 }
 
@@ -151,5 +195,115 @@ func TestBuildSessionPanePayloadMergedAndClosedRows(t *testing.T) {
 	closed := payload.Blocks[3].(rowBlock)
 	if len(closed.Badges) != 1 || closed.Badges[0].Text != "closed" || closed.Badges[0].Tone != "neutral" {
 		t.Errorf("closed row badges = %+v, want {closed neutral}", closed.Badges)
+	}
+}
+
+func sessionPaneSize(t *testing.T, p panePayload) int {
+	t.Helper()
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(b)
+}
+
+// sessionPaneNotes is the text of every note and markdown block: the trim
+// note and the descriptions.
+func sessionPaneNotes(p panePayload) []string {
+	var out []string
+	for _, b := range p.Blocks {
+		switch n := b.(type) {
+		case noteBlock:
+			out = append(out, n.Text)
+		case markdownBlock:
+			out = append(out, n.Text)
+		}
+	}
+	return out
+}
+
+func sessionPaneHrefs(p panePayload) map[string]bool {
+	out := map[string]bool{}
+	for _, b := range p.Blocks {
+		if r, ok := b.(rowBlock); ok && r.Href != "" {
+			out[r.Href] = true
+		}
+	}
+	return out
+}
+
+func TestBuildSessionPanePayloadWithinBudgetIsNotTrimmed(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "s", Provider: "github", Status: registry.StatusWatching, Description: "small"},
+		{PRURL: "https://github.com/o/r/pull/2", SessionID: "s", Provider: "github", Status: registry.StatusMerged, Description: "small"},
+	}
+	p, _ := buildSessionPanePayload(regs)
+	for _, n := range sessionPaneNotes(p) {
+		if strings.Contains(n, "trimmed") {
+			t.Errorf("unexpected trim note %q for a small pane", n)
+		}
+	}
+}
+
+// The host rejects panes over 64KB, which silently freezes the pane. Finished
+// entries' descriptions go first, and the pane says so.
+func TestBuildSessionPanePayloadHidesFinishedDescriptionsWhenOverBudget(t *testing.T) {
+	big := strings.Repeat("d", 20*1024)
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "s", Provider: "github", Status: registry.StatusWatching, Description: "watched description"},
+	}
+	for i := 2; i <= 5; i++ {
+		regs = append(regs, registry.Registration{PRURL: fmt.Sprintf("https://github.com/o/r/pull/%d", i), SessionID: "s", Provider: "github", Status: registry.StatusMerged, Description: big})
+	}
+
+	p, ok := buildSessionPanePayload(regs)
+	if !ok {
+		t.Fatal("ok = false, want a pane")
+	}
+	if got := sessionPaneSize(t, p); got > maxSessionPaneBytes {
+		t.Errorf("pane is %d bytes, want <= %d", got, maxSessionPaneBytes)
+	}
+	notes := strings.Join(sessionPaneNotes(p), "\n")
+	if !strings.Contains(notes, "trimmed") || !strings.Contains(notes, "4 finished description") {
+		t.Errorf("notes = %q, want a trim note naming the 4 hidden finished descriptions", notes)
+	}
+	if !strings.Contains(notes, "watched description") {
+		t.Errorf("notes = %q, want the watched PR's description kept", notes)
+	}
+	if len(sessionPaneHrefs(p)) != 5 {
+		t.Errorf("hrefs = %v, want all 5 PRs still listed", sessionPaneHrefs(p))
+	}
+}
+
+// Past that, the oldest finished entries are omitted, never a watched one.
+func TestBuildSessionPanePayloadDropsOldestFinishedEntriesWhenStillOverBudget(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "s", Provider: "github", Status: registry.StatusWatching, CreatedAt: time.Unix(1, 0)},
+	}
+	for i := 2; i <= 400; i++ {
+		regs = append(regs, registry.Registration{
+			PRURL: fmt.Sprintf("https://github.com/o/r/pull/%d", i), SessionID: "s", Provider: "github",
+			Status: registry.StatusMerged, CreatedAt: time.Unix(int64(i), 0),
+			Title: strings.Repeat("t", 120),
+		})
+	}
+
+	p, _ := buildSessionPanePayload(regs)
+	if got := sessionPaneSize(t, p); got > maxSessionPaneBytes {
+		t.Errorf("pane is %d bytes, want <= %d", got, maxSessionPaneBytes)
+	}
+	hrefs := sessionPaneHrefs(p)
+	if !hrefs["https://github.com/o/r/pull/1"] {
+		t.Error("watched PR missing from the trimmed pane")
+	}
+	if !hrefs["https://github.com/o/r/pull/400"] {
+		t.Error("newest finished PR dropped, want the oldest dropped first")
+	}
+	if hrefs["https://github.com/o/r/pull/2"] {
+		t.Error("oldest finished PR kept, want it dropped first")
+	}
+	notes := strings.Join(sessionPaneNotes(p), "\n")
+	if !strings.Contains(notes, "omitted") {
+		t.Errorf("notes = %q, want a note that finished entries were omitted", notes)
 	}
 }

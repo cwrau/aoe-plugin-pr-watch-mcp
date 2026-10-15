@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -56,24 +55,14 @@ func TestPushUIStateRemovesBadgeForSessionThatDroppedOut(t *testing.T) {
 		t.Fatalf("Add() error = %v", err)
 	}
 
-	aoe, err := aoeclient.New()
-	if err != nil {
-		t.Fatalf("aoeclient.New() error = %v", err)
-	}
+	aoe := aoeclient.New(nil) // pushUIState only reads titles; an empty directory falls back to raw ids
 
 	var buf bytes.Buffer
 	rpc := newHostRPC(&buf)
 
-	// Each push gets its own short-deadline context: pushUIState's
-	// getStringSetting call blocks waiting for a config.get reply that
-	// nothing in this test ever sends, so it must time out quickly rather
-	// than eating the real panePushTimeout (10s) on every call.
-	pushCtx1, cancel1 := context.WithTimeout(t.Context(), 300*time.Millisecond)
-	defer cancel1()
-
 	// First push: sess1 has a watching registration, so it should get a
 	// row-badge set and no remove.
-	pushUIState(pushCtx1, store, aoe, rpc, logger)
+	pushUIState(t.Context(), store, aoe, rpc, logger)
 	firstRound := methodsOf(t, &buf)
 	sawSetForSess1 := false
 	for _, m := range firstRound {
@@ -98,9 +87,7 @@ func TestPushUIStateRemovesBadgeForSessionThatDroppedOut(t *testing.T) {
 	}
 	buf.Reset()
 
-	pushCtx2, cancel2 := context.WithTimeout(t.Context(), 300*time.Millisecond)
-	defer cancel2()
-	pushUIState(pushCtx2, store, aoe, rpc, logger)
+	pushUIState(t.Context(), store, aoe, rpc, logger)
 	secondRound := methodsOf(t, &buf)
 	sawRemoveForSess1 := false
 	for _, m := range secondRound {
@@ -143,17 +130,12 @@ func TestPushUIStateReconcilesStatelesslyOnFirstCall(t *testing.T) {
 		t.Fatalf("SetStatus() error = %v", err)
 	}
 
-	aoe, err := aoeclient.New()
-	if err != nil {
-		t.Fatalf("aoeclient.New() error = %v", err)
-	}
+	aoe := aoeclient.New(nil) // pushUIState only reads titles; an empty directory falls back to raw ids
 
 	var buf bytes.Buffer
 	rpc := newHostRPC(&buf)
 
-	pushCtx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
-	defer cancel()
-	pushUIState(pushCtx, store, aoe, rpc, logger)
+	pushUIState(t.Context(), store, aoe, rpc, logger)
 
 	sawRemoveForSess1 := false
 	for _, m := range methodsOf(t, &buf) {

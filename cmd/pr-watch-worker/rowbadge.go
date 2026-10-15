@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,7 +38,9 @@ type badgeChip struct {
 // chip clusters rather than one badge each. A StatusStopped registration is
 // excluded entirely — its owning session explicitly asked to stop watching
 // it, so unlike merged/closed there's nothing worth permanently surfacing.
-// Chip order is sorted by PR/MR URL for a deterministic push (the host
+// Chip order is by status (watching, merged, closed), then entries in a merge
+// queue (per repo, by queue position), then PR/MR number, then URL as a final
+// tiebreak, so the push is deterministic (the host
 // doesn't diff payload content, so a stable order avoids the badge visually
 // reordering itself on every push for no reason). A session with no
 // displayable registrations at all (e.g. every one of its registrations is
@@ -54,18 +58,184 @@ func buildRowBadgePayloads(regs []registry.Registration) map[string]rowBadgePayl
 	out := make(map[string]rowBadgePayload, len(bySession))
 	for sid, sessionRegs := range bySession {
 		sort.Slice(sessionRegs, func(i, j int) bool {
-			return sessionRegs[i].PRURL < sessionRegs[j].PRURL
+			a, b := sessionRegs[i], sessionRegs[j]
+			if ra, rb := statusRank(a.Status), statusRank(b.Status); ra != rb {
+				return ra < rb
+			}
+			// Queued entries first, grouped by repo (each repo has its own
+			// queue) and ordered by position within it; everything else
+			// follows by number. Kept as one total order so the comparator
+			// stays transitive across repos.
+			if qa, qb := inMergeQueue(a), inMergeQueue(b); qa != qb {
+				return qa
+			} else if qa {
+				if ra, rb := repoKey(a), repoKey(b); ra != rb {
+					return ra < rb
+				}
+				if a.MergeQueuePosition != b.MergeQueuePosition {
+					return a.MergeQueuePosition < b.MergeQueuePosition
+				}
+			}
+			if na, nb := prNumber(a), prNumber(b); na != nb {
+				return na < nb
+			}
+			return a.PRURL < b.PRURL
 		})
-		var items []badgeChip
+		// Finished PRs/MRs collapse into one counted chip per kind, first on
+		// the row: a session working through a chain of PRs would otherwise
+		// grow one permanent chip per PR in front of the one it is on now.
+		var watched, merged, closed []registry.Registration
 		for _, r := range sessionRegs {
-			items = append(items, badgeChipsFor(r)...)
+			switch r.Status {
+			case registry.StatusMerged:
+				merged = append(merged, r)
+			case registry.StatusClosed:
+				closed = append(closed, r)
+			default:
+				watched = append(watched, r)
+			}
 		}
-		out[sid] = rowBadgePayload{Items: items}
+		items := append(finishedChip(merged, registry.StatusMerged), finishedChip(closed, registry.StatusClosed)...)
+		watchedItems := chipsForRegistrations(watched, false)
+		if len(items)+len(watchedItems) > compactChipThreshold {
+			watchedItems = chipsForRegistrations(watched, true)
+		}
+		out[sid] = rowBadgePayload{Items: append(items, watchedItems...)}
 	}
 	return out
 }
 
-// badgeChipsFor renders one registration's chip cluster. A StatusWatching
+// statusRank orders chip clusters: still-watching first (the actionable
+// ones), then merged, then closed.
+func statusRank(status string) int {
+	switch status {
+	case registry.StatusWatching:
+		return 0
+	case registry.StatusMerged:
+		return 1
+	default:
+		return 2
+	}
+}
+
+// prNumber is the registration's PR number / MR iid, or 0 if its URL can't
+// be parsed — compared numerically, since URL string order puts #10 before
+// #9. Registrations in different repos can share a number; the caller falls
+// back to the URL to keep the order deterministic.
+func prNumber(r registry.Registration) int {
+	if r.Provider == "github" {
+		if _, _, n, err := provider.ParseGitHubPRURL(r.PRURL); err == nil {
+			return n
+		}
+		return 0
+	}
+	if _, _, n, err := provider.ParseGitLabMRURL(r.PRURL); err == nil {
+		return n
+	}
+	return 0
+}
+
+// inMergeQueue reports whether the registration currently has a merge queue
+// entry, whose position is then worth ordering by.
+func inMergeQueue(r registry.Registration) bool {
+	return r.MergeQueueState != ""
+}
+
+// repoKey identifies the repo (and so the merge queue) a registration
+// belongs to; empty if its URL can't be parsed.
+func repoKey(r registry.Registration) string {
+	if r.Provider == "github" {
+		if owner, repo, _, err := provider.ParseGitHubPRURL(r.PRURL); err == nil {
+			return owner + "/" + repo
+		}
+		return ""
+	}
+	if host, path, _, err := provider.ParseGitLabMRURL(r.PRURL); err == nil {
+		return host + "/" + path
+	}
+	return ""
+}
+
+// maxFinishedTooltipRefs bounds the PR list in a counted chip's tooltip, so a
+// long chain of PRs cannot push the row-badge payload past the host's cap.
+const maxFinishedTooltipRefs = 8
+
+// finishedChip is the single chip standing for every merged (or closed)
+// registration of a session. One registration keeps its plain chip; several
+// get the same icon with their count, linking to the newest and listing the
+// newest few in the tooltip.
+func finishedChip(regs []registry.Registration, status string) []badgeChip {
+	switch len(regs) {
+	case 0:
+		return nil
+	case 1:
+		return badgeChipsFor(regs[0], false)
+	}
+	newest := slices.Clone(regs)
+	sort.Slice(newest, func(i, j int) bool {
+		a, b := newest[i], newest[j]
+		if !a.MergedAt.Equal(b.MergedAt) {
+			return a.MergedAt.After(b.MergedAt)
+		}
+		if na, nb := prNumber(a), prNumber(b); na != nb {
+			return na > nb
+		}
+		return a.PRURL > b.PRURL
+	})
+
+	shown := newest
+	if len(shown) > maxFinishedTooltipRefs {
+		shown = shown[:maxFinishedTooltipRefs]
+	}
+	refs := make([]string, 0, len(shown))
+	for _, r := range shown {
+		refs = append(refs, shortRef(r))
+	}
+	list := strings.Join(refs, ", ")
+	if more := len(newest) - len(shown); more > 0 {
+		list += fmt.Sprintf(", +%d more", more)
+	}
+
+	chip := badgeChip{Text: strconv.Itoa(len(regs)), Tooltip: fmt.Sprintf("%d %s: %s", len(regs), status, list), Href: newest[0].PRURL}
+	if status == registry.StatusMerged {
+		chip.Icon, chip.Tone = "check-circle", "success"
+	} else {
+		chip.Icon, chip.Tone = "circle-slash", "neutral"
+	}
+	return []badgeChip{chip}
+}
+
+// compactChipThreshold is the chip count past which a session's badge
+// switches to compact mode. A session watching many PRs would otherwise fill
+// the row and run into the host's 8KB row-badge payload cap, past which the
+// push is rejected and the badge freezes.
+const compactChipThreshold = 16
+
+func chipsForRegistrations(regs []registry.Registration, compact bool) []badgeChip {
+	var items []badgeChip
+	for _, r := range regs {
+		items = append(items, badgeChipsFor(r, compact)...)
+	}
+	return items
+}
+
+// compactCIChip reports whether a CI state is worth a chip in compact mode:
+// only the ones needing a look. Success, none and pending are quiet.
+func compactCIChip(bucket string) bool {
+	return bucket == "failure" || bucket == "action_required"
+}
+
+// compactReviewChip reports whether a review state is worth a chip in
+// compact mode. No review and approvals (complete or partial, e.g. "APPROVED
+// 1/2") are quiet; a verdict like changes requested or a comment is not.
+func compactReviewChip(state string) bool {
+	return state != "" && !strings.HasPrefix(state, "APPROVED")
+}
+
+// badgeChipsFor renders one registration's chip cluster. In compact mode a
+// watched registration keeps its eye chip and gets CI/review chips only in
+// attention states (CI failure or action required; a review verdict other
+// than an approval, such as changes requested). A StatusWatching
 // registration gets three chips: the eye identity marker plus separate,
 // independently visible CI and review chips (previously that state was only
 // reachable via the eye chip's tooltip on hover). The eye chip itself is
@@ -81,7 +251,7 @@ func buildRowBadgePayloads(regs []registry.Registration) map[string]rowBadgePayl
 // resolved, and (being terminal) that chip stays exactly as-is forever once
 // set, which is the whole point of using a badge instead of a one-time
 // session rename.
-func badgeChipsFor(r registry.Registration) []badgeChip {
+func badgeChipsFor(r registry.Registration, compact bool) []badgeChip {
 	ref := shortRef(r)
 	subject := ref
 	if r.Title != "" {
@@ -104,28 +274,49 @@ func badgeChipsFor(r registry.Registration) []badgeChip {
 			Href:    r.PRURL,
 		}}
 	default:
-		ci := ciBadge(r.CIBucket)
-		review := reviewBadge(r.LatestReviewState)
-		chips := []badgeChip{{
+		// The eye chip always shows — it's this registration's identity
+		// marker, not an event kind the session could have filtered out.
+		// The CI/review chips each mirror a specific event.Kind (see
+		// eventFilterShows and registry.Registration.EventFilter's doc
+		// comment), so a session that registered with e.g. events:
+		// ["MERGED"] only gets the eye chip here — same principle as the
+		// home-pane's badges.
+		eye := badgeChip{
 			Icon:    "eye",
 			Tone:    mainChipTone(r),
 			Tooltip: mainChipTooltip(subject, r),
 			Href:    mainChipHref(r),
-		}}
-		chips = append(chips,
-			badgeChip{
-				Text:    ci.Text,
-				Tone:    ci.Tone,
-				Tooltip: ciTooltip(ci.Text, r.CIDetail),
-				Href:    hrefOr(r.CIHref, r.PRURL),
-			},
-			badgeChip{
+		}
+		// A partial approval gets no chip of its own in compact mode, so the
+		// eye chip carries it: the tone the "APPROVED 1/2" chip had (unless
+		// something more urgent already colours it) and the progress in the
+		// tooltip, enough to tell "something is up" without taking a slot.
+		if compact && provider.PartialApproval(r.LatestReviewState) {
+			if eye.Tone == "neutral" {
+				eye.Tone = "info"
+			}
+			eye.Tooltip += "; review " + r.LatestReviewState
+		}
+		chips := []badgeChip{eye}
+		if eventFilterShows(r.EventFilter, "CI") && (!compact || compactCIChip(r.CIBucket)) {
+			if ci, ok := ciBadge(r.CIBucket); ok {
+				chips = append(chips, badgeChip{
+					Text:    ci.Text,
+					Tone:    ci.Tone,
+					Tooltip: ciTooltip(ci.Text, r.CIDetail),
+					Href:    hrefOr(r.CIHref, r.PRURL),
+				})
+			}
+		}
+		if eventFilterShows(r.EventFilter, "REVIEW") && (!compact || compactReviewChip(r.LatestReviewState)) {
+			review := reviewBadge(r.LatestReviewState)
+			chips = append(chips, badgeChip{
 				Text:    review.Text,
 				Tone:    review.Tone,
 				Tooltip: reviewTooltip(review.Text, r.LatestReviewer, r.LatestReviewAt),
 				Href:    hrefOr(r.ReviewHref, r.PRURL),
-			},
-		)
+			})
+		}
 		return chips
 	}
 }

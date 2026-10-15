@@ -8,7 +8,7 @@ import (
 )
 
 func TestBuildHomePanePayloadEmpty(t *testing.T) {
-	payload := buildHomePanePayload(nil, func(string) string { return "" }, "")
+	payload := buildHomePanePayload(nil, func(string) string { return "" })
 
 	if len(payload.Blocks) != 1 {
 		t.Fatalf("Blocks len = %d, want 1", len(payload.Blocks))
@@ -25,6 +25,20 @@ func TestBuildHomePanePayloadEmpty(t *testing.T) {
 	}
 	if _, ok := sec.Children[0].(noteBlock); !ok {
 		t.Errorf("section.Children[0] = %T, want noteBlock", sec.Children[0])
+	}
+}
+
+// TestBuildHomePanePayloadSectionScrolls is a regression test: confirmed
+// live, with 20+ active registrations an unscrolled home-pane section
+// pushed every other plugin's home-pane (and even the dashboard's own
+// default panes) off-screen below it — home-pane has no outer scroll
+// container of its own (docs/plugin-api.md: "several plugins' home panes
+// stack"), so the section itself must cap its own height.
+func TestBuildHomePanePayloadSectionScrolls(t *testing.T) {
+	payload := buildHomePanePayload(nil, func(string) string { return "" })
+	sec := payload.Blocks[0].(sectionBlock)
+	if !sec.Scroll {
+		t.Error("section.Scroll = false, want true so a long list scrolls inside the section instead of growing unbounded")
 	}
 }
 
@@ -47,7 +61,7 @@ func TestBuildHomePanePayloadGitHubRow(t *testing.T) {
 			return "Fix the thing"
 		}
 		return ""
-	}, "http://127.0.0.1:25808")
+	})
 
 	sec := payload.Blocks[0].(sectionBlock)
 	if len(sec.Children) != 1 {
@@ -90,10 +104,30 @@ func TestBuildHomePanePayloadGitHubRow(t *testing.T) {
 	}
 }
 
+// TestBuildHomePanePayloadOmitsCIBadgeWithoutSignal confirms the "no CI"
+// placeholder text is gone: a registration with no CI signal at all (empty
+// CIBucket) gets no CI badge whatsoever, rather than a badge reading "no
+// CI" — the user asked to drop the badge entirely, not just reword it.
+func TestBuildHomePanePayloadOmitsCIBadgeWithoutSignal(t *testing.T) {
+	reg := githubReg("", "")
+	payload := buildHomePanePayload([]registry.Registration{reg}, func(string) string { return "" })
+
+	sec := payload.Blocks[0].(sectionBlock)
+	prRow := sec.Children[0].(columnsBlock).Children[0].(rowBlock)
+	if len(prRow.Badges) != 2 {
+		t.Fatalf("prRow.Badges len = %d, want 2 (provider, review — no CI badge at all)", len(prRow.Badges))
+	}
+	for _, b := range prRow.Badges {
+		if b.Text == "no CI" {
+			t.Errorf("prRow.Badges = %+v, want no \"no CI\" badge present", prRow.Badges)
+		}
+	}
+}
+
 func TestBuildHomePanePayloadShowsConflictBadgeBeforeCI(t *testing.T) {
 	reg := githubReg("failure", "")
 	reg.HasConflict = true
-	payload := buildHomePanePayload([]registry.Registration{reg}, func(string) string { return "" }, "")
+	payload := buildHomePanePayload([]registry.Registration{reg}, func(string) string { return "" })
 
 	sec := payload.Blocks[0].(sectionBlock)
 	prRow := sec.Children[0].(columnsBlock).Children[0].(rowBlock)
@@ -110,7 +144,7 @@ func TestBuildHomePanePayloadShowsConflictBadgeBeforeCI(t *testing.T) {
 
 func TestBuildHomePanePayloadOmitsConflictBadgeWhenNoConflict(t *testing.T) {
 	regs := []registry.Registration{githubReg("success", "")}
-	payload := buildHomePanePayload(regs, func(string) string { return "" }, "")
+	payload := buildHomePanePayload(regs, func(string) string { return "" })
 
 	sec := payload.Blocks[0].(sectionBlock)
 	prRow := sec.Children[0].(columnsBlock).Children[0].(rowBlock)
@@ -124,9 +158,69 @@ func TestBuildHomePanePayloadOmitsConflictBadgeWhenNoConflict(t *testing.T) {
 	}
 }
 
+func TestBuildHomePanePayloadShowsOnlyMainBadgeForMergedOnlyFilter(t *testing.T) {
+	reg := githubReg("failure", "CHANGES_REQUESTED")
+	reg.HasConflict = true
+	reg.EventFilter = []string{"MERGED"}
+	payload := buildHomePanePayload([]registry.Registration{reg}, func(string) string { return "" })
+
+	sec := payload.Blocks[0].(sectionBlock)
+	prRow := sec.Children[0].(columnsBlock).Children[0].(rowBlock)
+	if len(prRow.Badges) != 1 || prRow.Badges[0].Text != "GH" {
+		t.Fatalf("prRow.Badges = %+v, want just the provider badge for a MERGED-only filter", prRow.Badges)
+	}
+}
+
+func TestBuildHomePanePayloadShowsMainAndCIBadgeForCIOnlyFilter(t *testing.T) {
+	reg := githubReg("failure", "CHANGES_REQUESTED")
+	reg.HasConflict = true
+	reg.EventFilter = []string{"CI"}
+	payload := buildHomePanePayload([]registry.Registration{reg}, func(string) string { return "" })
+
+	sec := payload.Blocks[0].(sectionBlock)
+	prRow := sec.Children[0].(columnsBlock).Children[0].(rowBlock)
+	if len(prRow.Badges) != 2 {
+		t.Fatalf("prRow.Badges = %+v, want 2 (provider, ci) for a CI-only filter — no conflict or review badge", prRow.Badges)
+	}
+	if prRow.Badges[0].Text != "GH" {
+		t.Errorf("prRow.Badges[0].Text = %q, want %q", prRow.Badges[0].Text, "GH")
+	}
+	if prRow.Badges[1].Text != "failure" {
+		t.Errorf("prRow.Badges[1].Text = %q, want the CI badge", prRow.Badges[1].Text)
+	}
+}
+
+func TestBuildHomePanePayloadShowsEveryBadgeForEmptyFilter(t *testing.T) {
+	reg := githubReg("failure", "CHANGES_REQUESTED")
+	reg.HasConflict = true
+	payload := buildHomePanePayload([]registry.Registration{reg}, func(string) string { return "" })
+
+	sec := payload.Blocks[0].(sectionBlock)
+	prRow := sec.Children[0].(columnsBlock).Children[0].(rowBlock)
+	if len(prRow.Badges) != 4 {
+		t.Fatalf("prRow.Badges = %+v, want 4 (provider, conflict, ci, review) when no filter is set", prRow.Badges)
+	}
+}
+
+func TestBuildHomePanePayloadShowsMainAndConflictBadgeForConflictOnlyFilter(t *testing.T) {
+	reg := githubReg("failure", "CHANGES_REQUESTED")
+	reg.HasConflict = true
+	reg.EventFilter = []string{"CONFLICT"}
+	payload := buildHomePanePayload([]registry.Registration{reg}, func(string) string { return "" })
+
+	sec := payload.Blocks[0].(sectionBlock)
+	prRow := sec.Children[0].(columnsBlock).Children[0].(rowBlock)
+	if len(prRow.Badges) != 2 {
+		t.Fatalf("prRow.Badges = %+v, want 2 (provider, conflict) for a CONFLICT-only filter — no CI or review badge", prRow.Badges)
+	}
+	if prRow.Badges[1].Text != "conflict" {
+		t.Errorf("prRow.Badges[1].Text = %q, want the conflict badge", prRow.Badges[1].Text)
+	}
+}
+
 func TestBuildHomePanePayloadUsesRelativeSessionHrefRegardlessOfBaseURL(t *testing.T) {
 	regs := []registry.Registration{githubReg("none", "")}
-	payload := buildHomePanePayload(regs, func(string) string { return "" }, "")
+	payload := buildHomePanePayload(regs, func(string) string { return "" })
 
 	sec := payload.Blocks[0].(sectionBlock)
 	cols := sec.Children[0].(columnsBlock)
@@ -147,7 +241,7 @@ func TestBuildHomePanePayloadGitLabRow(t *testing.T) {
 		CIBucket:  "success",
 		Status:    registry.StatusWatching,
 	}}
-	payload := buildHomePanePayload(regs, func(string) string { return "" }, "")
+	payload := buildHomePanePayload(regs, func(string) string { return "" })
 
 	sec := payload.Blocks[0].(sectionBlock)
 	cols := sec.Children[0].(columnsBlock)
@@ -177,12 +271,41 @@ func TestBuildHomePanePayloadSortsFailuresFirst(t *testing.T) {
 	failure := githubReg("failure", "")
 	failure.PRURL = "https://github.com/o/r/pull/2"
 
-	payload := buildHomePanePayload([]registry.Registration{success, failure}, func(string) string { return "" }, "")
+	payload := buildHomePanePayload([]registry.Registration{success, failure}, func(string) string { return "" })
 
 	sec := payload.Blocks[0].(sectionBlock)
 	first := sec.Children[0].(columnsBlock).Children[0].(rowBlock)
 	if first.Href != failure.PRURL {
 		t.Errorf("first row href = %q, want the failing PR first (%q)", first.Href, failure.PRURL)
+	}
+}
+
+// The registry hands rows over ordered by next_due_at, which shifts on every
+// poll; rows of equal severity must not follow that order or the pane jumps.
+func TestBuildHomePanePayloadOrderIsIndependentOfInputOrder(t *testing.T) {
+	var regs []registry.Registration
+	for _, n := range []string{"1", "2", "3", "4"} {
+		r := githubReg("success", "APPROVED")
+		r.PRURL = "https://github.com/o/r/pull/" + n
+		r.SessionID = "sess" + n
+		regs = append(regs, r)
+	}
+	hrefs := func(in []registry.Registration) []string {
+		sec := buildHomePanePayload(in, func(string) string { return "" }).Blocks[0].(sectionBlock)
+		var out []string
+		for _, c := range sec.Children {
+			out = append(out, c.(columnsBlock).Children[0].(rowBlock).Href)
+		}
+		return out
+	}
+
+	want := hrefs(regs)
+	reversed := []registry.Registration{regs[3], regs[1], regs[0], regs[2]}
+	got := hrefs(reversed)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("row order depends on input order: %v vs %v", want, got)
+		}
 	}
 }
 
@@ -196,7 +319,7 @@ func TestBuildHomePanePayloadExcludesTerminalStatusRegistrations(t *testing.T) {
 	stopped.PRURL = "https://github.com/o/r/pull/3"
 	stopped.Status = registry.StatusStopped
 
-	payload := buildHomePanePayload([]registry.Registration{watching, merged, stopped}, func(string) string { return "" }, "")
+	payload := buildHomePanePayload([]registry.Registration{watching, merged, stopped}, func(string) string { return "" })
 
 	sec := payload.Blocks[0].(sectionBlock)
 	if sec.Value != "1" {
@@ -229,7 +352,7 @@ func TestBuildHomePanePayloadDoesNotTruncateLongLabels(t *testing.T) {
 	reg.Title = strings.Repeat("a very long PR title that keeps going ", 5)
 	longSessionTitle := strings.Repeat("a very long session title that keeps going ", 5)
 
-	payload := buildHomePanePayload([]registry.Registration{reg}, func(string) string { return longSessionTitle }, "http://127.0.0.1:25808")
+	payload := buildHomePanePayload([]registry.Registration{reg}, func(string) string { return longSessionTitle })
 
 	sec := payload.Blocks[0].(sectionBlock)
 	cols := sec.Children[0].(columnsBlock)
@@ -249,7 +372,7 @@ func TestBuildHomePanePayloadSectionCountMatchesRegistrations(t *testing.T) {
 	regs[0].PRURL = "https://github.com/o/r/pull/1"
 	regs[1].PRURL = "https://github.com/o/r/pull/2"
 
-	payload := buildHomePanePayload(regs, func(string) string { return "" }, "")
+	payload := buildHomePanePayload(regs, func(string) string { return "" })
 	sec := payload.Blocks[0].(sectionBlock)
 	if sec.Value != "2" {
 		t.Errorf("section.Value = %q, want %q", sec.Value, "2")
