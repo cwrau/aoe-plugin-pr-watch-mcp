@@ -491,3 +491,59 @@ func TestDiscoverTickPrefersPRInOriginRepoOverUpstream(t *testing.T) {
 		t.Error("registered the upstream PR as well, want only the first match")
 	}
 }
+
+// ghCancelsPollContext expires the poll's context in the middle of the batch
+// check, like a slow pass that has used up its deadline, and refuses discovery
+// work that still carries it.
+type ghCancelsPollContext struct {
+	*fakeGitHubChecker
+	cancel context.CancelFunc
+}
+
+func (g *ghCancelsPollContext) CheckBatch(ctx context.Context, urls []string) (map[string]provider.CheckResult, provider.GitHubBudgets, error) {
+	res, budgets, err := g.fakeGitHubChecker.CheckBatch(ctx, urls)
+	g.cancel()
+	return res, budgets, err
+}
+
+func (g *ghCancelsPollContext) DiscoverBranchPRs(ctx context.Context, items []provider.GitHubBranchQuery) (map[string]string, provider.RateBudget, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, provider.RateBudget{}, err
+	}
+	return g.fakeGitHubChecker.DiscoverBranchPRs(ctx, items)
+}
+
+// The periodic discovery pass runs last in a Tick; a slow pass before it must
+// not leave it with an already-expired context, or it would be starved on
+// every tick that is busy (e.g. the first one after a restart).
+func TestDiscoveryRunsEvenWhenThePollContextIsSpent(t *testing.T) {
+	store := openTestStore(t)
+	now := time.Now()
+	reg := registry.Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", CIBucket: "none", NextDueAt: now.Add(-time.Second), CreatedAt: now}
+	if err := store.Add(context.Background(), reg); err != nil {
+		t.Fatal(err)
+	}
+	workspaces := &fakeWorkspaceSource{workspaces: map[string][]aoeclient.WorkspaceRepo{
+		"sess1": {{SourcePath: "/repo", Branch: "feat/x"}},
+	}}
+	remotes := &fakeRemoteResolver{resolutions: map[string]resolution{
+		"/repo": {provider: "github", remoteKey: "o/r", branch: "feat/x"},
+	}}
+	inner := &fakeGitHubChecker{
+		results:    map[string]provider.CheckResult{reg.PRURL: {State: "open", CIBucket: "none"}},
+		discovered: map[string]string{provider.GitHubBranchKey("o", "r", "feat/x"): "https://github.com/o/r/pull/9"},
+		budgets: provider.GitHubBudgets{
+			GraphQL: provider.RateBudget{Limit: 5000, Remaining: 4999, ResetAt: now.Add(time.Hour)},
+			REST:    provider.RateBudget{Limit: 5000, Remaining: 4999, ResetAt: now.Add(time.Hour)},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sched := &Scheduler{Store: store, GitHub: &ghCancelsPollContext{fakeGitHubChecker: inner, cancel: cancel}, GitLab: &fakeGitLabChecker{}, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{}, Workspaces: workspaces, Remotes: remotes}
+
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	getReg(t, store, "https://github.com/o/r/pull/9", "sess1")
+}
