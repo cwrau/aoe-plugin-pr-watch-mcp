@@ -23,6 +23,12 @@ const (
 	// RateLimit-* headers at all.
 	FallbackInterval = 5 * time.Minute
 
+	// FinishedPollInterval is the least time between checks of a merged or
+	// closed PR/MR, which is only watched for late comments, reviews and a
+	// reopen. Checked as often as an open one, the ~100 finished
+	// registrations would take most of the API budget for the least activity.
+	FinishedPollInterval = 15 * time.Minute
+
 	// RateLimitFloorFrac is the reserved fraction of a pool's limit that
 	// must never be spent: usage is paced to stay at or under
 	// (1 - RateLimitFloorFrac) of the limit.
