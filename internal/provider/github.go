@@ -153,6 +153,7 @@ const githubPullRequestFieldsQuery = `      state
       mergeable
       mergeQueueEntry { state position }
       queueEvents: timelineItems(last: 2, itemTypes: [ADDED_TO_MERGE_QUEUE_EVENT, REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { __typename ... on RemovedFromMergeQueueEvent { reason } } }
+      reviewDecision
       reviewCount: reviews { totalCount }
       latestReview: reviews(last: 1) { nodes { author { login } state body submittedAt url } }
       reviewThreads(first: 100) { nodes { id isResolved comments(last: 3) { nodes { id url author { login } } } } }
@@ -184,7 +185,11 @@ type githubPullRequestFields struct {
 			Reason   string `json:"reason"`
 		} `json:"nodes"`
 	} `json:"queueEvents"`
-	ReviewCount struct {
+	// ReviewDecision is branch protection's verdict (null without any
+	// review requirement): REVIEW_REQUIRED next to an approving latest review
+	// means more approvals are still needed.
+	ReviewDecision string `json:"reviewDecision"`
+	ReviewCount    struct {
 		TotalCount int `json:"totalCount"`
 	} `json:"reviewCount"`
 	LatestReview struct {
@@ -395,6 +400,9 @@ func buildCheckResult(pr githubPullRequestFields) CheckResult {
 		result.LatestReviewAt = parseRFC3339OrZero(pr.LatestReview.Nodes[0].SubmittedAt)
 		result.ReviewHref = pr.LatestReview.Nodes[0].URL
 		result.LatestReviewBody = pr.LatestReview.Nodes[0].Body
+		if result.LatestReviewState == "APPROVED" && pr.ReviewDecision == "REVIEW_REQUIRED" {
+			result.LatestReviewState = "APPROVED (more needed)"
+		}
 	}
 	if pr.State == "MERGED" {
 		result.MergedAt = parseRFC3339OrZero(pr.MergedAt)

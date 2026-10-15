@@ -1212,3 +1212,39 @@ func TestGitHubCheckerReadsTheLatestReviewBody(t *testing.T) {
 		t.Errorf("LatestReviewBody = %q, want the review's text", got)
 	}
 }
+
+// With branch protection requiring more approvals than the PR has, GitHub
+// reports reviewDecision REVIEW_REQUIRED even though the latest review is an
+// approval. Like GitLab's "APPROVED 1/2" that approval is tracked, not
+// pinged; any other decision (or none, without protection) is a plain one.
+func TestGitHubCheckerPartialApprovalFromReviewDecision(t *testing.T) {
+	body := func(decision string) string {
+		return `{"data": {"repo0": {"pr0": {
+		  "state": "OPEN", "title": "t", "headRefOid": "x", ` + decision + `
+		  "reviewCount": {"totalCount": 1},
+		  "latestReview": {"nodes": [{"author": {"login": "alice"}, "state": "APPROVED"}]},
+		  "commits": {"nodes": []}
+		}}, "rateLimit": {"limit": 5000, "remaining": 4998, "resetAt": "2026-09-20T23:00:00Z"}}}`
+	}
+	for _, tc := range []struct {
+		name, decision, want string
+	}{
+		{"more approvals required", `"reviewDecision": "REVIEW_REQUIRED",`, "APPROVED (more needed)"},
+		{"fully approved", `"reviewDecision": "APPROVED",`, "APPROVED"},
+		{"no branch protection", `"reviewDecision": null,`, "APPROVED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := fakeGitHubServer(t, body(tc.decision), 0)
+			defer srv.Close()
+			c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+			url := "https://github.com/o/r/pull/1"
+			results, _, err := c.CheckBatch(t.Context(), []string{url})
+			if err != nil {
+				t.Fatalf("CheckBatch() error = %v", err)
+			}
+			if got := results[url].LatestReviewState; got != tc.want {
+				t.Errorf("LatestReviewState = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
