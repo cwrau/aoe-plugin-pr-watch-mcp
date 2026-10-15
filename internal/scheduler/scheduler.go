@@ -216,7 +216,12 @@ func (s *Scheduler) Tick(ctx context.Context) error {
 
 	if s.Workspaces != nil && s.Remotes != nil && now.Sub(s.lastDiscovery) >= s.DiscoveryInterval {
 		s.lastDiscovery = now
-		s.discoverTick(ctx, now)
+		// Its own budget, not what is left of the poll's: a busy pass before it
+		// (the first one after a restart checks everything at once) would
+		// otherwise leave it an expired context on every such tick.
+		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), discoveryTimeout)
+		defer cancel()
+		s.discoverTick(dctx, now)
 	}
 	return nil
 }
@@ -860,6 +865,10 @@ const pingPrefix = "[pr-watch] "
 // persistTimeout bounds one registration's state save, which runs even after
 // the poll's own context has expired.
 const persistTimeout = 10 * time.Second
+
+// discoveryTimeout bounds the periodic discovery pass, which runs on a
+// context of its own (see Tick).
+const discoveryTimeout = 30 * time.Second
 
 // sendTimeout bounds one ping's delivery, matching the host's own bound on a
 // message call.
