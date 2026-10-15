@@ -563,7 +563,14 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 	// PR/MR that's actually merged moves to StatusMerged for every session
 	// watching it regardless of whether that session asked to hear about it.
 	notifyEvents := filterEvents(events, reg.EventFilter)
+	if len(events) > 0 && len(notifyEvents) == 0 {
+		s.log().Info("ping suppressed", "pr_url", reg.PRURL, "session_id", reg.SessionID, "reason", "filter", "events", len(events))
+	}
+	beforeSelf := len(notifyEvents)
 	notifyEvents = filterSelfAuthored(notifyEvents, result, selfAuthor)
+	if beforeSelf > 0 && len(notifyEvents) == 0 {
+		s.log().Info("ping suppressed", "pr_url", reg.PRURL, "session_id", reg.SessionID, "reason", "self-authored", "events", beforeSelf)
+	}
 	// The ping goes out only once the state it reports is saved: if saving
 	// fails, the next poll finds the same events again and pings then, rather
 	// than the session being told over and over.
@@ -880,7 +887,9 @@ func (s *Scheduler) flushPings(ctx context.Context) {
 		cancel()
 		if err != nil {
 			s.log().Warn("notify failed", "session_id", sessionID, "updates", len(sections), "error", err)
+			continue
 		}
+		s.log().Info("ping sent", "session_id", sessionID, "updates", len(sections), "bytes", len(msg))
 	}
 }
 

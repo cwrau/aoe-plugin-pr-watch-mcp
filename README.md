@@ -249,3 +249,13 @@ CGO_ENABLED=0 go build ./cmd/pr-watch-worker
 
 No cgo: storage uses `modernc.org/sqlite`, so the result is a single
 static binary.
+
+## Logs
+
+The worker logs to stderr, which AoE writes to
+`<aoe config dir>/plugin-workers/<worker-id>.log` (one file per worker start;
+on Linux `~/.config/agent-of-empires/plugin-workers/`). Find the live one with
+`rg -l 'pr_url' <dir> | xargs ls -t | head -1`. It records every event found
+(`event`), every ping sent (`ping sent`) or held back (`ping suppressed`, with
+the reason `filter` or `self-authored`), failed sends (`notify failed`) and
+the rate-limit state after each provider pass.
