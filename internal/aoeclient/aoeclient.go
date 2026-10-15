@@ -5,112 +5,249 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os/exec"
-	"strings"
+	"sync"
+	"time"
 )
 
 type SessionClass int
 
 const (
-	// SessionGone covers both "never existed" and "hard-deleted": neither
-	// case should be sent to, and a registration pointing at one should be
-	// dropped.
+	// SessionGone covers both "never existed" and "hard-deleted", and also a
+	// trashed session: none of them should be sent to, and a registration
+	// pointing at one should be dropped.
 	SessionGone SessionClass = iota
 	SessionLive
 	SessionArchived
 )
 
-// Client classifies AoE sessions by shelling out to the `aoe` CLI rather
-// than calling the daemon's HTTP API directly. The daemon can be run with
-// `--auth passphrase`, in which case the public HTTP API rejects every
-// unauthenticated request (401 "Passphrase login required") and there is no
-// static bearer token a headless worker could present — only an interactive
-// browser login would do. The local CLI has a local-trust path the raw HTTP
-// API does not grant, so it works with no login at all. Same
-// "shell out to the trusted local CLI" pattern as the notifier.
+// defaultResyncEvery is how often RefreshIfStale re-lists every session from
+// the host. Lifecycle events keep the directory current in between, but they
+// are best-effort and never replayed, so a periodic full listing is the
+// backstop for anything missed.
+const defaultResyncEvery = 10 * time.Minute
+
+// WorkspaceRepo is one git checkout inside a session's workspace — the
+// workspace root itself plus every other repo of a multi-repo session. The
+// auto-watch discovery path reads these off the session summary rather than
+// scanning directories itself. Branch is as of the last summary the host
+// sent; discovery re-reads the real branch from git anyway.
+type WorkspaceRepo struct {
+	SourcePath string `json:"source_path"`
+	Branch     string `json:"branch"`
+}
+
+// Worktree is set when the session's own root (ProjectPath) is itself a git
+// worktree of another main checkout — the common single-repo case, which the
+// host reports separately from WorkspaceRepos. Confirmed live: omitting it
+// was why auto-watch discovery silently found nothing for that case.
+type Worktree struct {
+	Branch string `json:"branch"`
+}
+
+// Summary is one session as the host describes it, in `sessions.list` and in
+// the `summary` of a `session.lifecycle.changed` notification (the two are
+// the same shape by design).
+type Summary struct {
+	ID             string          `json:"id"`
+	Title          string          `json:"title"`
+	ProjectPath    string          `json:"project_path"`
+	Archived       bool            `json:"archived"`
+	Snoozed        bool            `json:"snoozed"`
+	Trashed        bool            `json:"trashed"`
+	WorkspaceRepos []WorkspaceRepo `json:"workspace_repos"`
+	Worktree       *Worktree       `json:"worktree"`
+}
+
+// Lister fetches every session from the host (the `sessions.list` RPC),
+// including archived and trashed ones. A deleted session is simply absent.
+type Lister interface {
+	ListSessions(ctx context.Context) ([]Summary, error)
+}
+
+// ParseSessionList decodes a `sessions.list` result: {"sessions": [...]}.
+func ParseSessionList(raw json.RawMessage) ([]Summary, error) {
+	var reply struct {
+		Sessions []Summary `json:"sessions"`
+	}
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		return nil, fmt.Errorf("decode sessions.list result: %w", err)
+	}
+	return reply.Sessions, nil
+}
+
+// ParseSummary decodes one session summary, e.g. a lifecycle event's.
+func ParseSummary(raw json.RawMessage) (Summary, error) {
+	var s Summary
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return Summary{}, fmt.Errorf("decode session summary: %w", err)
+	}
+	return s, nil
+}
+
+// Client is the worker's view of AoE sessions: their lifecycle class, title
+// and checkouts. It is loaded by listing sessions over RPC (Refresh,
+// RefreshIfStale) and kept current by the host's lifecycle notifications
+// (ApplyLifecycle). Those arrive on a different goroutine than the
+// scheduler's and the MCP handler's reads, so every method is safe for
+// concurrent use.
 type Client struct {
-	AoeBinary string // defaults to "aoe" resolved on PATH; overridable for tests
+	// Lister fetches the full session list.
+	Lister Lister
+	// ResyncEvery is RefreshIfStale's throttle; zero means defaultResyncEvery.
+	ResyncEvery time.Duration
 
-	classes map[string]SessionClass
-	titles  map[string]string
+	mu         sync.RWMutex
+	sessions   map[string]Summary
+	lastResync time.Time
+	now        func() time.Time // test seam; defaults to time.Now
 }
 
-// New returns a ready-to-use Client. Call RefreshSessionSets before the
-// first Classify.
-func New() (*Client, error) {
-	return &Client{}, nil
+// New returns a Client that lists sessions through l.
+func New(l Lister) *Client {
+	return &Client{Lister: l}
 }
 
-func (c *Client) binary() string {
-	if c.AoeBinary != "" {
-		return c.AoeBinary
+func (c *Client) clock() time.Time {
+	if c.now != nil {
+		return c.now()
 	}
-	return "aoe"
+	return time.Now()
 }
 
-type sessionRow struct {
-	ID    string `json:"id"`
-	State string `json:"state"`
-	Title string `json:"title"`
-}
-
-// RefreshSessionSets runs `aoe list --json --all` once (one call per
-// scheduler cycle, not per registration) and caches the resulting id ->
-// class mapping for subsequent Classify calls. The CLI reports an exact
-// per-row state — "live", "archived" or "trashed" — so no set-difference
-// inference is needed. Trashed ids are deliberately left out of the map so
-// Classify falls through to SessionGone for them: a trashed session is not
-// sent to and its registration is dropped, identical to an id the daemon
-// no longer knows about at all.
-func (c *Client) RefreshSessionSets(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, c.binary(), "list", "--json", "--all")
-	out, err := cmd.Output()
+// Refresh lists every session now and replaces the directory with the
+// result. A failed listing keeps the previous snapshot.
+func (c *Client) Refresh(ctx context.Context) error {
+	if c.Lister == nil {
+		return errors.New("aoeclient: no Lister configured")
+	}
+	list, err := c.Lister.ListSessions(ctx)
 	if err != nil {
-		var stderr string
-		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
-			stderr = strings.TrimSpace(string(exitErr.Stderr))
-		}
-		if stderr != "" {
-			return fmt.Errorf("%s list --json --all: %w: %s", c.binary(), err, stderr)
-		}
-		return fmt.Errorf("%s list --json --all: %w", c.binary(), err)
+		return err
 	}
-
-	var rows []sessionRow
-	if err := json.Unmarshal(out, &rows); err != nil {
-		return fmt.Errorf("decode %s list --json --all output: %w", c.binary(), err)
+	sessions := make(map[string]Summary, len(list))
+	for _, s := range list {
+		sessions[s.ID] = s
 	}
-
-	classes := make(map[string]SessionClass, len(rows))
-	titles := make(map[string]string, len(rows))
-	for _, r := range rows {
-		switch r.State {
-		case "live":
-			classes[r.ID] = SessionLive
-		case "archived":
-			classes[r.ID] = SessionArchived
-		}
-		if r.Title != "" {
-			titles[r.ID] = r.Title
-		}
-	}
-	c.classes = classes
-	c.titles = titles
+	c.mu.Lock()
+	c.sessions = sessions
+	c.lastResync = c.clock()
+	c.mu.Unlock()
 	return nil
 }
 
-// Title returns a session's title as of the last RefreshSessionSets call,
-// or "" if the id is unknown or has no title.
-func (c *Client) Title(id string) string {
-	return c.titles[id]
+// RefreshIfStale is Refresh, but only when the directory has never been
+// loaded or the last full listing is older than ResyncEvery. The scheduler
+// calls it every tick: lifecycle events keep the directory current, so this
+// is just the periodic backstop.
+func (c *Client) RefreshIfStale(ctx context.Context) error {
+	every := c.ResyncEvery
+	if every == 0 {
+		every = defaultResyncEvery
+	}
+	c.mu.RLock()
+	fresh := !c.lastResync.IsZero() && c.clock().Sub(c.lastResync) < every
+	c.mu.RUnlock()
+	if fresh {
+		return nil
+	}
+	return c.Refresh(ctx)
 }
 
-// Classify reports a session's lifecycle state as of the last
-// RefreshSessionSets call. An id absent from that snapshot is SessionGone
-// (trashed, hard-deleted, or never existed).
-func (c *Client) Classify(id string) SessionClass {
-	if cls, ok := c.classes[id]; ok {
-		return cls
+// ApplyLifecycle folds one `session.lifecycle.changed` notification into the
+// directory: "deleted" removes the session, any other kind replaces it with
+// the event's summary. A non-delete event without a summary is malformed and
+// ignored.
+func (c *Client) ApplyLifecycle(kind, id string, summary *Summary) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if kind == "deleted" {
+		delete(c.sessions, id)
+		return
 	}
-	return SessionGone
+	if summary == nil {
+		return
+	}
+	if c.sessions == nil {
+		c.sessions = make(map[string]Summary)
+	}
+	s := *summary
+	s.ID = id
+	c.sessions[id] = s
+}
+
+// Classify reports a session's lifecycle state. An id the directory doesn't
+// know, or one in the trash, is SessionGone.
+func (c *Client) Classify(id string) SessionClass {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	s, ok := c.sessions[id]
+	switch {
+	case !ok || s.Trashed:
+		return SessionGone
+	case s.Archived:
+		return SessionArchived
+	default:
+		return SessionLive
+	}
+}
+
+// Title returns a session's title, or "" if the id is unknown or untitled.
+func (c *Client) Title(id string) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.sessions[id].Title
+}
+
+// WorkspaceRepos returns the git checkouts inside a live session's
+// workspace — empty for an archived or gone session, or a live one with no
+// checkouts at all.
+func (c *Client) WorkspaceRepos(id string) []WorkspaceRepo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	s, ok := c.sessions[id]
+	if !ok {
+		return nil
+	}
+	return liveRepos(s)
+}
+
+// LiveWorkspaces returns every live session's checkouts, keyed by session
+// id — implements scheduler.WorkspaceSource. Only a session with at least
+// one checkout is present, and the result is a copy the caller may keep.
+func (c *Client) LiveWorkspaces() map[string][]WorkspaceRepo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string][]WorkspaceRepo)
+	for id, s := range c.sessions {
+		if repos := liveRepos(s); len(repos) > 0 {
+			out[id] = repos
+		}
+	}
+	return out
+}
+
+// liveRepos is s's checkouts, deduplicated by path, and only for a live
+// session: an archived or trashed session isn't being worked on, so there's
+// nothing new to discover a PR/MR for — the same "inactive session, don't
+// spend budget on it" reasoning the scheduler applies to every other poll.
+// The returned slice is always freshly allocated.
+func liveRepos(s Summary) []WorkspaceRepo {
+	if s.Archived || s.Trashed {
+		return nil
+	}
+	seen := make(map[string]bool, len(s.WorkspaceRepos)+1)
+	var repos []WorkspaceRepo
+	for _, r := range s.WorkspaceRepos {
+		if r.SourcePath == "" || seen[r.SourcePath] {
+			continue
+		}
+		seen[r.SourcePath] = true
+		repos = append(repos, r)
+	}
+	// The session's own root is a separate case from WorkspaceRepos: see
+	// Worktree's doc comment.
+	if s.Worktree != nil && s.ProjectPath != "" && !seen[s.ProjectPath] {
+		repos = append(repos, WorkspaceRepo{SourcePath: s.ProjectPath, Branch: s.Worktree.Branch})
+	}
+	return repos
 }
