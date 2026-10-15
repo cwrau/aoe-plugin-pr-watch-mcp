@@ -139,7 +139,12 @@ func gitRemoteNames(ctx context.Context, sourcePath string) []string {
 	if err != nil {
 		return nil
 	}
-	return strings.Fields(string(out))
+	// A remote name comes from the checkout's own config, which may hold
+	// anything; one that starts with "-" would be parsed as an option by the
+	// git commands these names are passed to.
+	return slices.DeleteFunc(strings.Fields(string(out)), func(name string) bool {
+		return strings.HasPrefix(name, "-")
+	})
 }
 
 // ExtraRemotes implements scheduler.ForkRemoteResolver. A fork checkout
@@ -169,7 +174,7 @@ func (r *gitRemoteResolver) ExtraRemotes(ctx context.Context, sourcePath string)
 				if name == "origin" {
 					continue
 				}
-				out, err := exec.CommandContext(ctx, "git", "-C", sourcePath, "remote", "get-url", name).Output()
+				out, err := exec.CommandContext(ctx, "git", "-C", sourcePath, "remote", "get-url", "--", name).Output()
 				if err != nil {
 					continue
 				}

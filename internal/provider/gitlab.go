@@ -366,7 +366,9 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 // needs aren't asked for here, since discovery only cares whether a match
 // exists at all.
 type gitlabMRSearchResult struct {
-	WebURL string `json:"web_url"`
+	WebURL          string `json:"web_url"`
+	SourceProjectID int    `json:"source_project_id"`
+	TargetProjectID int    `json:"target_project_id"`
 }
 
 // DiscoverBranchMR looks up whether host/projectPath has an open MR whose
@@ -392,7 +394,7 @@ func (c *GitLabChecker) DiscoverBranchMR(ctx context.Context, host, projectPath,
 	if base == "" {
 		base = "https://" + host
 	}
-	q := url.Values{"source_branch": {branch}, "state": {"opened"}, "per_page": {"1"}}
+	q := url.Values{"source_branch": {branch}, "state": {"opened"}, "per_page": {"20"}}
 	endpoint := fmt.Sprintf("%s/api/v4/projects/%s/merge_requests?%s", base, url.PathEscape(projectPath), q.Encode())
 
 	var results []gitlabMRSearchResult
@@ -400,10 +402,15 @@ func (c *GitLabChecker) DiscoverBranchMR(ctx context.Context, host, projectPath,
 	if err != nil {
 		return "", false, RateBudget{}, err
 	}
-	if len(results) == 0 {
-		return "", false, budget, nil
+	// The project's MR list also holds MRs from other people's forks that
+	// happen to use the same branch name; only one whose source is the
+	// project itself can be this checkout's.
+	for _, mr := range results {
+		if mr.SourceProjectID == mr.TargetProjectID {
+			return mr.WebURL, true, budget, nil
+		}
 	}
-	return results[0].WebURL, true, budget, nil
+	return "", false, budget, nil
 }
 
 func mapGitLabState(state string) string {

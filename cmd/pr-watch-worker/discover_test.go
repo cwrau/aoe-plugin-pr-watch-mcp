@@ -335,3 +335,16 @@ func TestGitRemoteResolverExtraRemotesIgnoresGitLabCheckouts(t *testing.T) {
 		t.Errorf("keys = %v, want none: extra remotes are only probed for a GitHub origin", keys)
 	}
 }
+
+// A checkout's config can name a remote anything, including text git would
+// parse as an option. Those names must never reach a git command line.
+func TestGitRemoteNamesSkipsOptionLikeNames(t *testing.T) {
+	dir := gitCheckoutWithRemote(t, "https://github.com/me/repo.git")
+	if out, err := exec.Command("git", "-C", dir, "config", "remote.--all.url", "https://github.com/up/stream.git").CombinedOutput(); err != nil {
+		t.Skipf("git config failed (%v): %s", err, out)
+	}
+	got := gitRemoteNames(context.Background(), dir)
+	if len(got) != 1 || got[0] != "origin" {
+		t.Errorf("gitRemoteNames() = %v, want [origin]", got)
+	}
+}

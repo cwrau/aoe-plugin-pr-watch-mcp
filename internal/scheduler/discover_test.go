@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -453,8 +454,8 @@ func TestDiscoverTickFindsPRInUpstreamRepoOfAForkCheckout(t *testing.T) {
 	if primary == nil || extra == nil {
 		t.Fatalf("lastDiscoverItems = %+v, want both the origin repo and the upstream repo probed", gh.lastDiscoverItems)
 	}
-	if len(primary.HeadOwners) != 0 {
-		t.Errorf("origin query HeadOwners = %v, want none (unchanged behaviour for the repo the checkout pushes to)", primary.HeadOwners)
+	if !slices.Equal(primary.HeadOwners, []string{"me"}) {
+		t.Errorf("origin query HeadOwners = %v, want just the origin's own owner [me]: a stranger's fork PR with the same branch name is not this checkout's", primary.HeadOwners)
 	}
 	if len(extra.HeadOwners) != 2 {
 		t.Errorf("upstream query HeadOwners = %v, want the checkout's remote owners [me up]", extra.HeadOwners)
