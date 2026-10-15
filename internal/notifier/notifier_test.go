@@ -1,96 +1,74 @@
 package notifier
 
 import (
-	"os"
-	"path/filepath"
-	"runtime"
+	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
 
-// fakeAoeBinary writes a shell script standing in for the real `aoe` CLI
-// that records its argv to a file, so the test can assert on exactly what
-// Send invoked without needing a real AoE daemon.
-func fakeAoeBinary(t *testing.T, exitCode int) (binPath, logPath string) {
-	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("fake binary script is posix-shell only")
-	}
-	dir := t.TempDir()
-	binPath = filepath.Join(dir, "aoe")
-	logPath = filepath.Join(dir, "argv.log")
-	script := "#!/bin/sh\necho \"$@\" > " + logPath + "\nexit " + itoa(exitCode) + "\n"
-	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
-	return binPath, logPath
+type fakeCaller struct {
+	method string
+	params any
+	result json.RawMessage
+	err    error
+	calls  int
 }
 
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var digits []byte
-	for n > 0 {
-		digits = append([]byte{byte('0' + n%10)}, digits...)
-		n /= 10
-	}
-	if neg {
-		return "-" + string(digits)
-	}
-	return string(digits)
+func (f *fakeCaller) Call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	f.calls++
+	f.method, f.params = method, params
+	return f.result, f.err
 }
 
-func TestSendInvokesAoeSendWithSessionAndMessage(t *testing.T) {
-	bin, log := fakeAoeBinary(t, 0)
-	n := &Notifier{AoeBinary: bin}
+func TestSendCallsTheMessageRPC(t *testing.T) {
+	fc := &fakeCaller{result: json.RawMessage(`{"disposition":"sent","revived":false}`)}
+	n := &Notifier{RPC: fc}
 
-	if err := n.Send(t.Context(), "abc123", "CI failure"); err != nil {
+	if err := n.Send(context.Background(), "sess-1", "[pr-watch] o/r#1: CI failure"); err != nil {
 		t.Fatalf("Send() error = %v", err)
 	}
-
-	got, err := os.ReadFile(log)
-	if err != nil {
-		t.Fatalf("ReadFile(argv.log) error = %v", err)
+	if fc.method != "sessions.message.send" {
+		t.Errorf("method = %q, want sessions.message.send", fc.method)
 	}
-	argv := strings.TrimSpace(string(got))
-	if argv != "send -- abc123 CI failure" {
-		t.Errorf("aoe invoked with argv %q, want %q", argv, "send -- abc123 CI failure")
+	params, ok := fc.params.(map[string]any)
+	if !ok || params["session_id"] != "sess-1" || params["message"] != "[pr-watch] o/r#1: CI failure" {
+		t.Errorf("params = %#v, want {session_id: sess-1, message: ...}", fc.params)
 	}
 }
 
-func TestSendReturnsErrorOnNonZeroExit(t *testing.T) {
-	bin, _ := fakeAoeBinary(t, 1)
-	n := &Notifier{AoeBinary: bin}
+// TestSendPassesUntrustedTextVerbatim: the message carries external content
+// (comment text, reviewer names). Over RPC it is a plain JSON string, so
+// nothing in it can act as a flag or command — it must arrive unchanged.
+func TestSendPassesUntrustedTextVerbatim(t *testing.T) {
+	fc := &fakeCaller{}
+	n := &Notifier{RPC: fc}
+	const msg = "--no-revive; $(rm -rf /) \"quoted\"\nnewline"
 
-	if err := n.Send(t.Context(), "abc123", "CI failure"); err == nil {
-		t.Error("Send() with a failing aoe binary, want error")
-	}
-}
-
-func TestSendTreatsMessageLikeAFlagAsPositional(t *testing.T) {
-	// Verify that messages starting with - or -- are treated as positional
-	// arguments, not as CLI flags. This is critical because message is
-	// untrusted external content (GitHub/GitLab comments, etc.).
-	bin, log := fakeAoeBinary(t, 0)
-	n := &Notifier{AoeBinary: bin}
-
-	if err := n.Send(t.Context(), "abc123", "--no-revive"); err != nil {
+	if err := n.Send(context.Background(), "sess-1", msg); err != nil {
 		t.Fatalf("Send() error = %v", err)
 	}
-
-	got, err := os.ReadFile(log)
-	if err != nil {
-		t.Fatalf("ReadFile(argv.log) error = %v", err)
+	if got := fc.params.(map[string]any)["message"]; got != msg {
+		t.Errorf("message = %q, want it verbatim", got)
 	}
-	argv := strings.TrimSpace(string(got))
-	// The -- end-of-options marker ensures --no-revive is treated as the <MESSAGE>
-	// positional argument, not misparsed as a flag.
-	if argv != "send -- abc123 --no-revive" {
-		t.Errorf("aoe invoked with argv %q, want %q", argv, "send -- abc123 --no-revive")
+}
+
+func TestSendWrapsTheRPCErrorWithTheSessionID(t *testing.T) {
+	rpcErr := errors.New("sessions.message.send: session is archived (code -32000, kind session_archived)")
+	n := &Notifier{RPC: &fakeCaller{err: rpcErr}}
+
+	err := n.Send(context.Background(), "sess-9", "hi")
+	if err == nil {
+		t.Fatal("Send() error = nil, want the RPC's error")
+	}
+	if !strings.Contains(err.Error(), "sess-9") || !errors.Is(err, rpcErr) {
+		t.Errorf("Send() error = %v, want it to name the session and wrap the RPC error", err)
+	}
+}
+
+func TestSendWithoutAnRPCClientFails(t *testing.T) {
+	if err := (&Notifier{}).Send(context.Background(), "sess-1", "hi"); err == nil {
+		t.Error("Send() error = nil without an RPC client, want an error rather than a panic")
 	}
 }
