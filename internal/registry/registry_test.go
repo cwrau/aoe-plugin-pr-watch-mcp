@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -53,7 +54,33 @@ func TestAddAndList(t *testing.T) {
 	}
 }
 
-func TestAddIsIdempotentOnConflict(t *testing.T) {
+func TestAddIsIdempotentForSameSession(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now().Truncate(time.Second)
+
+	reg := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", NextDueAt: now, CreatedAt: now}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() first error = %v", err)
+	}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() second error = %v", err)
+	}
+
+	got, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("List() len = %d, want 1 (re-registering the same (pr_url, session_id) pair should upsert, not duplicate)", len(got))
+	}
+}
+
+// TestAddCreatesSeparateRowPerSession guards the actual behavior this
+// registry's primary key exists to enable: multiple sessions independently
+// watching the same PR/MR each get their own row, not one shared row that
+// silently reassigns ownership on the second call.
+func TestAddCreatesSeparateRowPerSession(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
 	now := time.Now().Truncate(time.Second)
@@ -71,11 +98,12 @@ func TestAddIsIdempotentOnConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if len(got) != 1 {
-		t.Fatalf("List() len = %d, want 1 (re-register should upsert, not duplicate)", len(got))
+	if len(got) != 2 {
+		t.Fatalf("List() len = %d, want 2 (each session gets its own independent row for the same pr_url)", len(got))
 	}
-	if got[0].SessionID != "second" {
-		t.Errorf("List()[0].SessionID = %q, want %q", got[0].SessionID, "second")
+	sessions := map[string]bool{got[0].SessionID: true, got[1].SessionID: true}
+	if !sessions["first"] || !sessions["second"] {
+		t.Errorf("List() sessions = %v, want both %q and %q", sessions, "first", "second")
 	}
 }
 
@@ -105,6 +133,39 @@ func TestAddReactivatesStatusOnReregister(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Status != StatusWatching {
 		t.Errorf("List() = %+v, want a single row back to status %q", got, StatusWatching)
+	}
+}
+
+func TestAddPersistsAndUpdatesEventFilter(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now().Truncate(time.Second)
+
+	reg := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", NextDueAt: now, CreatedAt: now, EventFilter: []string{"MERGED", "CLOSED"}}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+
+	got, ok, err := s.Get(ctx, reg.PRURL, reg.SessionID)
+	if err != nil || !ok {
+		t.Fatalf("Get() = %+v, %v, %v", got, ok, err)
+	}
+	if !slices.Equal(got.EventFilter, []string{"MERGED", "CLOSED"}) {
+		t.Errorf("Get().EventFilter = %v, want [MERGED CLOSED]", got.EventFilter)
+	}
+
+	// Re-registering the same (pr_url, session_id) pair with a different
+	// filter replaces it in place — no separate tool needed to change it.
+	reg.EventFilter = []string{"CI"}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() (re-register with new filter) error = %v", err)
+	}
+	got, ok, err = s.Get(ctx, reg.PRURL, reg.SessionID)
+	if err != nil || !ok {
+		t.Fatalf("Get() = %+v, %v, %v", got, ok, err)
+	}
+	if !slices.Equal(got.EventFilter, []string{"CI"}) {
+		t.Errorf("Get().EventFilter after re-register = %v, want [CI]", got.EventFilter)
 	}
 }
 
@@ -152,8 +213,11 @@ func TestUpdateState(t *testing.T) {
 	update := StateUpdate{
 		ReviewCount:         3,
 		CIBucket:            "failure",
+		CIWasFailing:        true,
 		CIDetail:            "build",
 		UnresolvedThreadIDs: []string{"t1", "t2"},
+		TopLevelCommentIDs:  []string{"c1", "c2"},
+		LatestCommentHref:   "https://github.com/o/r/pull/1#issuecomment-1",
 		LatestReviewState:   "CHANGES_REQUESTED",
 		LatestReviewer:      "bob",
 		LatestReviewAt:      reviewAt,
@@ -167,7 +231,7 @@ func TestUpdateState(t *testing.T) {
 		MergeQueuePosition:  3,
 		Blocked:             true,
 	}
-	if err := s.UpdateState(ctx, reg.PRURL, update); err != nil {
+	if err := s.UpdateState(ctx, reg.PRURL, reg.SessionID, update); err != nil {
 		t.Fatalf("UpdateState() error = %v", err)
 	}
 
@@ -179,7 +243,7 @@ func TestUpdateState(t *testing.T) {
 		t.Fatalf("List() len = %d, want 1", len(got))
 	}
 	r := got[0]
-	if r.ReviewCount != 3 || r.CIBucket != "failure" || r.CIDetail != "build" || !slices.Equal(r.UnresolvedThreadIDs, update.UnresolvedThreadIDs) || r.LatestReviewState != "CHANGES_REQUESTED" || r.LatestReviewer != "bob" || !r.LatestReviewAt.Equal(reviewAt) || r.Title != "Fix the thing" || r.Description != "Fixes the widget rendering bug." || !r.NextDueAt.Equal(newDue) || !r.HasConflict || r.CIHref != update.CIHref || r.ReviewHref != update.ReviewHref || r.MergeQueueState != update.MergeQueueState || r.MergeQueuePosition != update.MergeQueuePosition || !r.Blocked {
+	if r.ReviewCount != 3 || r.CIBucket != "failure" || !r.CIWasFailing || r.CIDetail != "build" || !slices.Equal(r.UnresolvedThreadIDs, update.UnresolvedThreadIDs) || !slices.Equal(r.TopLevelCommentIDs, update.TopLevelCommentIDs) || r.LatestCommentHref != update.LatestCommentHref || r.LatestReviewState != "CHANGES_REQUESTED" || r.LatestReviewer != "bob" || !r.LatestReviewAt.Equal(reviewAt) || r.Title != "Fix the thing" || r.Description != "Fixes the widget rendering bug." || !r.NextDueAt.Equal(newDue) || !r.HasConflict || r.CIHref != update.CIHref || r.ReviewHref != update.ReviewHref || r.MergeQueueState != update.MergeQueueState || r.MergeQueuePosition != update.MergeQueuePosition || !r.Blocked {
 		t.Errorf("after UpdateState, got %+v", r)
 	}
 }
@@ -192,14 +256,14 @@ func TestUpdateStateClearsHasConflict(t *testing.T) {
 	if err := s.Add(ctx, reg); err != nil {
 		t.Fatalf("Add() error = %v", err)
 	}
-	if err := s.UpdateState(ctx, reg.PRURL, StateUpdate{NextDueAt: now, HasConflict: true}); err != nil {
+	if err := s.UpdateState(ctx, reg.PRURL, reg.SessionID, StateUpdate{NextDueAt: now, HasConflict: true}); err != nil {
 		t.Fatalf("UpdateState() error = %v", err)
 	}
-	if err := s.UpdateState(ctx, reg.PRURL, StateUpdate{NextDueAt: now, HasConflict: false}); err != nil {
+	if err := s.UpdateState(ctx, reg.PRURL, reg.SessionID, StateUpdate{NextDueAt: now, HasConflict: false}); err != nil {
 		t.Fatalf("UpdateState() error = %v", err)
 	}
 
-	got, _, err := s.Get(ctx, reg.PRURL)
+	got, _, err := s.Get(ctx, reg.PRURL, reg.SessionID)
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
@@ -502,6 +566,99 @@ CREATE TABLE IF NOT EXISTS registrations (
 	_ = s2.Close()
 }
 
+// TestOpenMigratesToCompositePrimaryKeyAllowingMultipleSessions is the
+// regression test for the live bug this migration fixes: a pre-existing
+// database still has the old pr_url-only primary key (plus the vestigial
+// `unresolved` column no real production database has ever had dropped),
+// which must survive migration with its data intact, and — the actual
+// point of the composite key — a second session must be able to register
+// its own independent watch on a pr_url a first session already owns,
+// something the old single-column key made structurally impossible.
+func TestOpenMigratesToCompositePrimaryKeyAllowingMultipleSessions(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "old.db")
+
+	oldSchema := `
+CREATE TABLE IF NOT EXISTS registrations (
+	pr_url TEXT PRIMARY KEY,
+	session_id TEXT NOT NULL,
+	provider TEXT NOT NULL,
+	review_count INTEGER NOT NULL DEFAULT 0,
+	ci_bucket TEXT NOT NULL DEFAULT 'none',
+	unresolved INTEGER NOT NULL DEFAULT 0,
+	latest_review_state TEXT NOT NULL DEFAULT '',
+	title TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL DEFAULT 'watching',
+	description TEXT NOT NULL DEFAULT '',
+	ci_detail TEXT NOT NULL DEFAULT '',
+	latest_reviewer TEXT NOT NULL DEFAULT '',
+	latest_review_at INTEGER NOT NULL DEFAULT 0,
+	merged_at INTEGER NOT NULL DEFAULT 0,
+	has_conflict INTEGER NOT NULL DEFAULT 0,
+	ci_href TEXT NOT NULL DEFAULT '',
+	review_href TEXT NOT NULL DEFAULT '',
+	merge_queue_state TEXT NOT NULL DEFAULT '',
+	merge_queue_position INTEGER NOT NULL DEFAULT 0,
+	blocked INTEGER NOT NULL DEFAULT 0,
+	unresolved_thread_ids TEXT NOT NULL DEFAULT '[]',
+	next_due_at INTEGER NOT NULL,
+	archived INTEGER NOT NULL DEFAULT 0,
+	created_at INTEGER NOT NULL
+);
+`
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	if _, err := db.Exec(oldSchema); err != nil {
+		t.Fatalf("apply old schema: %v", err)
+	}
+	now := time.Now().Truncate(time.Second)
+	if _, err := db.Exec(`INSERT INTO registrations (pr_url, session_id, provider, unresolved, next_due_at, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		"https://github.com/o/r/pull/1", "sess1", "github", 2, now.Unix(), now.Unix()); err != nil {
+		t.Fatalf("insert pre-migration row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close pre-migration db: %v", err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() on pre-migration db, error = %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	got, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(got) != 1 || got[0].SessionID != "sess1" {
+		t.Fatalf("List() = %+v, want the pre-existing sess1 row to survive migration", got)
+	}
+
+	// The actual regression: a second session registering the exact same
+	// pr_url an existing (even long-dead) row already owns must succeed as
+	// its own independent row, not be silently rejected or merged into the
+	// first session's row the way the old single-column key forced.
+	if err := s.Add(ctx, Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "sess2", Provider: "github", NextDueAt: now, CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("Add() for a second session on an already-registered pr_url, error = %v", err)
+	}
+
+	got, err = s.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("List() len = %d, want 2 (both sessions' independent registrations for the same pr_url)", len(got))
+	}
+	sessions := map[string]bool{got[0].SessionID: true, got[1].SessionID: true}
+	if !sessions["sess1"] || !sessions["sess2"] {
+		t.Errorf("List() sessions = %v, want both %q and %q", sessions, "sess1", "sess2")
+	}
+}
+
 func TestCountByProvider(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
@@ -626,15 +783,15 @@ func TestClearReviewIfCurrentBlanksMatchingReview(t *testing.T) {
 	}
 	reviewHref := "https://github.com/o/r/pull/1#pullrequestreview-1"
 	update := StateUpdate{LatestReviewState: "CHANGES_REQUESTED", LatestReviewer: "bob", ReviewHref: reviewHref, NextDueAt: now}
-	if err := s.UpdateState(ctx, reg.PRURL, update); err != nil {
+	if err := s.UpdateState(ctx, reg.PRURL, reg.SessionID, update); err != nil {
 		t.Fatalf("UpdateState() error = %v", err)
 	}
 
-	if err := s.ClearReviewIfCurrent(ctx, reg.PRURL, reviewHref); err != nil {
+	if err := s.ClearReviewIfCurrent(ctx, reg.PRURL, reg.SessionID, reviewHref); err != nil {
 		t.Fatalf("ClearReviewIfCurrent() error = %v", err)
 	}
 
-	got, ok, err := s.Get(ctx, reg.PRURL)
+	got, ok, err := s.Get(ctx, reg.PRURL, reg.SessionID)
 	if err != nil || !ok {
 		t.Fatalf("Get() = (%+v, %v, %v)", got, ok, err)
 	}
@@ -659,15 +816,15 @@ func TestClearReviewIfCurrentIgnoresStaleHref(t *testing.T) {
 	}
 	currentHref := "https://github.com/o/r/pull/1#pullrequestreview-2"
 	update := StateUpdate{LatestReviewState: "APPROVED", LatestReviewer: "alice", ReviewHref: currentHref, NextDueAt: now}
-	if err := s.UpdateState(ctx, reg.PRURL, update); err != nil {
+	if err := s.UpdateState(ctx, reg.PRURL, reg.SessionID, update); err != nil {
 		t.Fatalf("UpdateState() error = %v", err)
 	}
 
-	if err := s.ClearReviewIfCurrent(ctx, reg.PRURL, "https://github.com/o/r/pull/1#pullrequestreview-1"); err != nil {
+	if err := s.ClearReviewIfCurrent(ctx, reg.PRURL, reg.SessionID, "https://github.com/o/r/pull/1#pullrequestreview-1"); err != nil {
 		t.Fatalf("ClearReviewIfCurrent() error = %v", err)
 	}
 
-	got, ok, err := s.Get(ctx, reg.PRURL)
+	got, ok, err := s.Get(ctx, reg.PRURL, reg.SessionID)
 	if err != nil || !ok {
 		t.Fatalf("Get() = (%+v, %v, %v)", got, ok, err)
 	}
@@ -689,15 +846,15 @@ func TestSetDismissedReviewMarksAndBlanksWhenCurrent(t *testing.T) {
 	}
 	reviewHref := "https://github.com/o/r/pull/1#pullrequestreview-1"
 	update := StateUpdate{LatestReviewState: "COMMENTED", LatestReviewer: "bob", ReviewHref: reviewHref, NextDueAt: now}
-	if err := s.UpdateState(ctx, reg.PRURL, update); err != nil {
+	if err := s.UpdateState(ctx, reg.PRURL, reg.SessionID, update); err != nil {
 		t.Fatalf("UpdateState() error = %v", err)
 	}
 
-	if err := s.SetDismissedReview(ctx, reg.PRURL, reviewHref); err != nil {
+	if err := s.SetDismissedReview(ctx, reg.PRURL, reg.SessionID, reviewHref); err != nil {
 		t.Fatalf("SetDismissedReview() error = %v", err)
 	}
 
-	got, ok, err := s.Get(ctx, reg.PRURL)
+	got, ok, err := s.Get(ctx, reg.PRURL, reg.SessionID)
 	if err != nil || !ok {
 		t.Fatalf("Get() = (%+v, %v, %v)", got, ok, err)
 	}
@@ -722,16 +879,16 @@ func TestSetDismissedReviewMarksOnlyWhenNotCurrent(t *testing.T) {
 	}
 	currentHref := "https://github.com/o/r/pull/1#pullrequestreview-2"
 	update := StateUpdate{LatestReviewState: "CHANGES_REQUESTED", LatestReviewer: "carol", ReviewHref: currentHref, NextDueAt: now}
-	if err := s.UpdateState(ctx, reg.PRURL, update); err != nil {
+	if err := s.UpdateState(ctx, reg.PRURL, reg.SessionID, update); err != nil {
 		t.Fatalf("UpdateState() error = %v", err)
 	}
 
 	olderHref := "https://github.com/o/r/pull/1#pullrequestreview-1"
-	if err := s.SetDismissedReview(ctx, reg.PRURL, olderHref); err != nil {
+	if err := s.SetDismissedReview(ctx, reg.PRURL, reg.SessionID, olderHref); err != nil {
 		t.Fatalf("SetDismissedReview() error = %v", err)
 	}
 
-	got, ok, err := s.Get(ctx, reg.PRURL)
+	got, ok, err := s.Get(ctx, reg.PRURL, reg.SessionID)
 	if err != nil || !ok {
 		t.Fatalf("Get() = (%+v, %v, %v)", got, ok, err)
 	}
@@ -807,5 +964,145 @@ func TestStopAllOwnedByIsIdempotent(t *testing.T) {
 	}
 	if count != 0 {
 		t.Errorf("count = %d, want 0 (already stopped, nothing left to change)", count)
+	}
+}
+
+// A registration that predates thread-comment tracking has no baseline;
+// the first stored state (even an empty one) is the baseline from then on.
+func TestThreadCommentBaselineIsUnknownUntilFirstUpdate(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now().Truncate(time.Second)
+	reg := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "a", Provider: "github", NextDueAt: now, CreatedAt: now}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+
+	got, _, _ := s.Get(ctx, reg.PRURL, "a")
+	if got.ThreadCommentsKnown || len(got.ThreadCommentIDs) != 0 {
+		t.Errorf("fresh registration = %+v, want an unknown thread-comment baseline", got)
+	}
+
+	if err := s.UpdateState(ctx, reg.PRURL, "a", StateUpdate{ThreadCommentIDs: []string{"c1", "c2"}, ThreadCommentsKnown: true, NextDueAt: now}); err != nil {
+		t.Fatalf("UpdateState() error = %v", err)
+	}
+	got, _, _ = s.Get(ctx, reg.PRURL, "a")
+	if !got.ThreadCommentsKnown || !slices.Equal(got.ThreadCommentIDs, []string{"c1", "c2"}) {
+		t.Errorf("after update = %+v, want known baseline [c1 c2]", got)
+	}
+
+	if err := s.UpdateState(ctx, reg.PRURL, "a", StateUpdate{ThreadCommentsKnown: true, NextDueAt: now}); err != nil {
+		t.Fatalf("UpdateState() error = %v", err)
+	}
+	got, _, _ = s.Get(ctx, reg.PRURL, "a")
+	if !got.ThreadCommentsKnown || len(got.ThreadCommentIDs) != 0 {
+		t.Errorf("after an empty update = %+v, want a known, empty baseline (no unresolved threads is a real state)", got)
+	}
+	all, _ := s.List(ctx)
+	if !all[0].ThreadCommentsKnown {
+		t.Errorf("List() lost the known flag: %+v", all[0])
+	}
+
+	// A reschedule-only update of a row that never had a baseline must not
+	// invent one.
+	other := Registration{PRURL: "https://github.com/o/r/pull/2", SessionID: "a", Provider: "github", NextDueAt: now, CreatedAt: now}
+	if err := s.Add(ctx, other); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	if err := s.UpdateState(ctx, other.PRURL, "a", StateUpdate{NextDueAt: now}); err != nil {
+		t.Fatalf("UpdateState() error = %v", err)
+	}
+	if got, _, _ := s.Get(ctx, other.PRURL, "a"); got.ThreadCommentsKnown {
+		t.Errorf("got = %+v, want the baseline to stay unknown", got)
+	}
+}
+
+// Finished PRs stay due for FinishedWatchWindow after they finish, so late
+// comments and a reopen are noticed; after that they are left alone.
+func TestDueBeforeIncludesRecentlyFinishedRegistrations(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now().Truncate(time.Second)
+	past := now.Add(-time.Minute)
+
+	add := func(n int, status string, finished time.Time) string {
+		url := fmt.Sprintf("https://github.com/o/r/pull/%d", n)
+		if err := s.Add(ctx, Registration{PRURL: url, SessionID: "a", Provider: "github", NextDueAt: past, CreatedAt: now}); err != nil {
+			t.Fatalf("Add() error = %v", err)
+		}
+		switch status {
+		case StatusMerged:
+			if err := s.SetMerged(ctx, url, finished); err != nil {
+				t.Fatal(err)
+			}
+			if finished.IsZero() { // a legacy row from before merge dates were recorded
+				if _, err := s.db.Exec(`UPDATE registrations SET merged_at = 0 WHERE pr_url = ?`, url); err != nil {
+					t.Fatal(err)
+				}
+			}
+		case StatusClosed, StatusStopped:
+			if err := s.SetStatus(ctx, url, status); err != nil {
+				t.Fatal(err)
+			}
+			if status == StatusClosed {
+				if _, err := s.db.Exec(`UPDATE registrations SET closed_at = ? WHERE pr_url = ?`, finished.Unix(), url); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		return url
+	}
+	watching := add(1, StatusWatching, time.Time{})
+	mergedRecent := add(2, StatusMerged, now.Add(-24*time.Hour))
+	mergedOld := add(3, StatusMerged, now.Add(-31*24*time.Hour))
+	mergedUnknown := add(4, StatusMerged, time.Time{})
+	closedRecent := add(5, StatusClosed, now.Add(-24*time.Hour))
+	closedOld := add(6, StatusClosed, now.Add(-31*24*time.Hour))
+	stopped := add(7, StatusStopped, time.Time{})
+
+	due, err := s.DueBefore(ctx, now)
+	if err != nil {
+		t.Fatalf("DueBefore() error = %v", err)
+	}
+	got := map[string]bool{}
+	for _, r := range due {
+		got[r.PRURL] = true
+	}
+	for _, want := range []string{watching, mergedRecent, closedRecent} {
+		if !got[want] {
+			t.Errorf("%s not due, want it polled", want)
+		}
+	}
+	for _, unwanted := range []string{mergedOld, mergedUnknown, closedOld, stopped} {
+		if got[unwanted] {
+			t.Errorf("%s is due, want it left alone (outside the window, undated, or stopped)", unwanted)
+		}
+	}
+
+	counts, err := s.CountByProvider(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts["github"] != 3 {
+		t.Errorf("CountByProvider()[github] = %d, want 3 (the polled ones, so the rate budget is shared over them)", counts["github"])
+	}
+}
+
+func TestReopenedRegistrationIsWatchedAgain(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now().Truncate(time.Second)
+	reg := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "a", Provider: "github", NextDueAt: now.Add(-time.Minute), CreatedAt: now}
+	if err := s.Add(ctx, reg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetStatus(ctx, reg.PRURL, StatusClosed); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.SetStatusOwnedBy(ctx, reg.PRURL, "a", StatusWatching); err != nil || !ok {
+		t.Fatalf("SetStatusOwnedBy() = %v, %v", ok, err)
+	}
+	if got, _, _ := s.Get(ctx, reg.PRURL, "a"); got.Status != StatusWatching {
+		t.Errorf("Status = %q, want watching", got.Status)
 	}
 }
