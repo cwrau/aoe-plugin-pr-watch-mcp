@@ -278,6 +278,8 @@ func (s *Scheduler) finishDiscovery(ctx context.Context, t registry.AutoDiscover
 			CIBucket:  "none",
 			NextDueAt: now,
 			CreatedAt: now,
+			// Whatever the PR already shows is visible on it; only changes ping.
+			SilentFirstPoll: true,
 		}
 		if err := s.Store.Add(ctx, reg); err != nil {
 			s.log().Error("auto-register discovered PR", "pr_url", prURL, "session_id", t.SessionID, "error", err)

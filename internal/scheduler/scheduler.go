@@ -571,6 +571,18 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 	if beforeSelf > 0 && len(notifyEvents) == 0 {
 		s.log().Info("ping suppressed", "pr_url", reg.PRURL, "session_id", reg.SessionID, "reason", "self-authored", "events", beforeSelf)
 	}
+	// A watch registered to start silent takes this first poll as its
+	// baseline: whatever the PR already shows is not news to the session.
+	silentFirst, err := s.Store.FirstPollSilent(pctx, reg.PRURL, reg.SessionID)
+	if err != nil {
+		s.log().Error("read first poll flag", "pr_url", reg.PRURL, "session_id", reg.SessionID, "error", err)
+	}
+	if silentFirst {
+		if len(notifyEvents) > 0 {
+			s.log().Info("ping suppressed", "pr_url", reg.PRURL, "session_id", reg.SessionID, "reason", "baseline", "events", len(notifyEvents))
+		}
+		notifyEvents = nil
+	}
 	// The ping goes out only once the state it reports is saved: if saving
 	// fails, the next poll finds the same events again and pings then, rather
 	// than the session being told over and over.
@@ -646,6 +658,11 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 	if err := s.Store.UpdateState(pctx, reg.PRURL, reg.SessionID, update); err != nil {
 		s.log().Error("persist new state", "pr_url", reg.PRURL, "error", err)
 		return
+	}
+	if silentFirst {
+		if err := s.Store.ClearFirstPollSilent(pctx, reg.PRURL, reg.SessionID); err != nil {
+			s.log().Error("clear first poll flag", "pr_url", reg.PRURL, "session_id", reg.SessionID, "error", err)
+		}
 	}
 	ping()
 }
