@@ -920,3 +920,30 @@ func TestGitLabCheckerTracksCommentsOfUnresolvedThreads(t *testing.T) {
 		t.Errorf("ThreadCommentIDs = %v, want [11 12]", result.ThreadCommentIDs)
 	}
 }
+
+// An MR from someone else's fork can share a branch name with the checkout's.
+// It lists under the target project too, but it is not this session's MR.
+func TestDiscoverBranchMRIgnoresMRsFromForks(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"web_url": "https://gitlab.corp.example/team/project/-/merge_requests/8", "source_project_id": 99, "target_project_id": 5},
+			{"web_url": "https://gitlab.corp.example/team/project/-/merge_requests/9", "source_project_id": 5, "target_project_id": 5},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{
+		HTTPClient:      srv.Client(),
+		TokenFunc:       func(context.Context, string) (string, error) { return "test-token", nil },
+		apiBaseOverride: srv.URL,
+	}
+	mrURL, found, _, err := c.DiscoverBranchMR(t.Context(), "gitlab.corp.example", "team/project", "feature-x")
+	if err != nil {
+		t.Fatalf("DiscoverBranchMR() error = %v", err)
+	}
+	if !found || mrURL != "https://gitlab.corp.example/team/project/-/merge_requests/9" {
+		t.Errorf("DiscoverBranchMR() = (%q, %v), want the same-project MR 9, not the fork's MR 8", mrURL, found)
+	}
+}

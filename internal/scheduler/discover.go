@@ -208,12 +208,14 @@ func (s *Scheduler) discoverGitHub(ctx context.Context, due []registry.AutoDisco
 }
 
 // githubQueriesFor is the branch lookups for one target: the repo the
-// checkout pushes to, unfiltered as ever, then each extra remote's repo
-// restricted to PRs from the checkout's own remote owners.
+// checkout pushes to, restricted to PRs from that repo itself (anyone can
+// open a PR from their own fork under the same branch name, and it is not
+// this session's), then each extra remote's repo restricted to PRs from the
+// checkout's own remote owners.
 func githubQueriesFor(t registry.AutoDiscoveryTarget) []provider.GitHubBranchQuery {
 	var out []provider.GitHubBranchQuery
 	if owner, repo, ok := strings.Cut(t.RemoteKey, "/"); ok {
-		out = append(out, provider.GitHubBranchQuery{Owner: owner, Repo: repo, Branch: t.Branch})
+		out = append(out, provider.GitHubBranchQuery{Owner: owner, Repo: repo, Branch: t.Branch, HeadOwners: []string{owner}})
 	}
 	for _, key := range t.ExtraRemoteKeys {
 		if owner, repo, ok := strings.Cut(key, "/"); ok {
