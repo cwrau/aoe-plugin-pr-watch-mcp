@@ -1,5 +1,7 @@
 /.aoe-build/
 /.superpowers/
+/.playwright-mcp/
+/docs/superpowers/
 *.db
 *.db-shm
 *.db-wal
