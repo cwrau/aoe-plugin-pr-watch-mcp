@@ -947,3 +947,33 @@ func TestDiscoverBranchMRIgnoresMRsFromForks(t *testing.T) {
 		t.Errorf("DiscoverBranchMR() = (%q, %v), want the same-project MR 9, not the fork's MR 8", mrURL, found)
 	}
 }
+
+// Some instances (or projects) do not offer the approvals endpoint at all.
+// That must not make the whole MR unwatchable: it just has no approvals.
+func TestGitLabCheckerWorksWithoutTheApprovalsAPI(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"state": "opened", "title": "t", "pipeline": map[string]any{"status": "success"}})
+			})
+			mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, `{"message":"not available"}`, status)
+			})
+			mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode([]map[string]any{{"id": "d1", "notes": []map[string]any{{"resolvable": true, "resolved": false}}}})
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "tok", nil }, apiBaseOverride: srv.URL}
+			result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+			if err != nil {
+				t.Fatalf("Check() error = %v, want the MR still checked without approvals", err)
+			}
+			if result.ReviewCount != 0 || result.CIBucket != "success" || len(result.UnresolvedThreadIDs) != 1 {
+				t.Errorf("Check() = %+v, want no approvals but CI and threads intact", result)
+			}
+		})
+	}
+}
