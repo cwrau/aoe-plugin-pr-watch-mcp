@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -699,5 +701,47 @@ func TestBuildRowBadgePayloadsFinishedTooltipListsAtMostEightPRs(t *testing.T) {
 	chip := buildRowBadgePayloads(regs)["sess1"].Items[0]
 	if chip.Text != "12" || !strings.HasSuffix(chip.Tooltip, "+4 more") || strings.Contains(chip.Tooltip, "o/r#1,") {
 		t.Errorf("chip = %+v, want count 12 and a tooltip of the 8 newest ending in '+4 more'", chip)
+	}
+}
+
+// The host rejects a row-badge payload over 8KB and the badge then freezes at
+// its last accepted state, so a session watching a lot of busy PRs must still
+// get a payload that fits, saying how many chips were left out.
+func TestRowBadgePayloadStaysUnderTheHostCap(t *testing.T) {
+	var regs []registry.Registration
+	for i := 1; i <= 80; i++ {
+		regs = append(regs, registry.Registration{
+			PRURL: fmt.Sprintf("https://github.com/org/repo/pull/%d", i), SessionID: "sess1", Provider: "github",
+			Title: strings.Repeat("a long pull request title ", 10), CIBucket: "failure", CIDetail: strings.Repeat("failing job name ", 10),
+			LatestReviewState: "CHANGES_REQUESTED", LatestReviewer: "reviewer", ReviewHref: fmt.Sprintf("https://github.com/org/repo/pull/%d#r", i),
+			HasConflict: true,
+		})
+	}
+
+	badge := buildRowBadgePayloads(regs)["sess1"]
+	raw, err := json.Marshal(badge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) > maxRowBadgeBytes {
+		t.Fatalf("payload is %d bytes, want at most %d", len(raw), maxRowBadgeBytes)
+	}
+	last := badge.Items[len(badge.Items)-1]
+	if !strings.HasPrefix(last.Text, "+") || !strings.Contains(last.Tooltip, "not shown") {
+		t.Errorf("last chip = %+v, want an overflow chip counting what was left out", last)
+	}
+
+	again, _ := json.Marshal(buildRowBadgePayloads(regs)["sess1"])
+	if !bytes.Equal(raw, again) {
+		t.Error("payload differs between builds, want a deterministic result")
+	}
+}
+
+func TestRowBadgePayloadIsUntouchedWhenItFits(t *testing.T) {
+	regs := []registry.Registration{{PRURL: "https://github.com/org/repo/pull/1", SessionID: "sess1", Provider: "github", CIBucket: "failure"}}
+	for _, c := range buildRowBadgePayloads(regs)["sess1"].Items {
+		if strings.HasPrefix(c.Text, "+") {
+			t.Errorf("unexpected overflow chip %+v", c)
+		}
 	}
 }

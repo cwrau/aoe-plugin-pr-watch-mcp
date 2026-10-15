@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"sort"
@@ -100,9 +101,54 @@ func buildRowBadgePayloads(regs []registry.Registration) map[string]rowBadgePayl
 		if len(items)+len(watchedItems) > compactChipThreshold {
 			watchedItems = chipsForRegistrations(watched, true)
 		}
-		out[sid] = rowBadgePayload{Items: append(items, watchedItems...)}
+		out[sid] = rowBadgePayload{Items: fitRowBadge(append(items, watchedItems...))}
 	}
 	return out
+}
+
+// maxRowBadgeBytes is the largest row-badge payload this worker sends, a
+// margin under the host's 8KB cap (past which the push is rejected and the
+// badge freezes at its last accepted state).
+const maxRowBadgeBytes = 7 * 1024
+
+// maxShortTooltipRunes is what a chip's tooltip is cut to when the full ones
+// do not fit.
+const maxShortTooltipRunes = 80
+
+// fitRowBadge keeps the chips under maxRowBadgeBytes even compact mode could
+// not get them under: first by shortening tooltips, then by dropping chips
+// from the end (the order puts the actionable ones first) and ending the row
+// with a "+N" chip that says how many are missing.
+func fitRowBadge(items []badgeChip) []badgeChip {
+	if rowBadgeSize(items) <= maxRowBadgeBytes {
+		return items
+	}
+	short := make([]badgeChip, len(items))
+	for i, c := range items {
+		if r := []rune(c.Tooltip); len(r) > maxShortTooltipRunes {
+			c.Tooltip = string(r[:maxShortTooltipRunes-1]) + "…"
+		}
+		short[i] = c
+	}
+	if rowBadgeSize(short) <= maxRowBadgeBytes {
+		return short
+	}
+	overflow := func(n int) badgeChip {
+		return badgeChip{Text: "+" + strconv.Itoa(n), Tone: "neutral", Tooltip: fmt.Sprintf("%d more PRs/MRs not shown (row too large)", n)}
+	}
+	keep := len(short)
+	for keep > 0 && rowBadgeSize(append(slices.Clone(short[:keep]), overflow(len(short)-keep))) > maxRowBadgeBytes {
+		keep--
+	}
+	return append(slices.Clone(short[:keep]), overflow(len(short)-keep))
+}
+
+func rowBadgeSize(items []badgeChip) int {
+	raw, err := json.Marshal(rowBadgePayload{Items: items})
+	if err != nil {
+		return 0
+	}
+	return len(raw)
 }
 
 // statusRank orders chip clusters: still-watching first (the actionable
