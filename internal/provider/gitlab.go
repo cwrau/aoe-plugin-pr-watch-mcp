@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var gitlabMRURLPattern = regexp.MustCompile(`^https?://([^/]+)/(.+)/-/merge_requests/(\d+)`)
@@ -37,12 +39,13 @@ func ParseGitLabMRURL(mrURL string) (host, projectPath string, iid int, err erro
 type GitLabChecker struct {
 	HTTPClient *http.Client
 
-	// TokenFunc resolves the credential to send for a given MR's host,
-	// called fresh on every Check — never cached across hosts. It takes
-	// Check's own context because resolving a token typically means forking
-	// a credential-helper subprocess in the scheduler's hot path, and a
-	// hung keyring backend would otherwise stall the whole scheduler. This
-	// per-host resolution is
+	// TokenFunc resolves the credential to send for a given MR's host. The
+	// answer is cached per host (see token) and only asked for again after
+	// the host rejected it with a 401, since each call forks a
+	// credential-helper subprocess; an empty or failed answer is not cached,
+	// so a credential configured later is picked up. It takes the calling
+	// request's own context because a hung keyring backend would otherwise
+	// stall the whole scheduler. The per-host resolution is
 	// deliberate: a single static token sent to whatever host a
 	// registered pr_url happens to name would hand a real, working
 	// GitLab credential to any host an attacker can get accepted as a
@@ -54,9 +57,22 @@ type GitLabChecker struct {
 	TokenFunc   func(ctx context.Context, host string) (string, error)
 	TokenHeader string // defaults to "PRIVATE-TOKEN"; see Task 4's auth-header note
 
+	tokenMu sync.Mutex
+	tokens  map[string]string // host -> credential TokenFunc last returned for it
+
 	// apiBaseOverride replaces "https://{host}/api/v4" with a fixed base
 	// (test-only: a fake host can't answer the URL's real host header).
 	apiBaseOverride string
+
+	// selfUsernames caches SelfUsername's per-host result — unlike
+	// TokenFunc (deliberately never cached), a username doesn't change for
+	// the lifetime of the token behind it, and GitLabChecker is
+	// scheduler-only (never shared with the MCP HTTP handler the way
+	// GitHubChecker is), but Check/DiscoverBranchMR still run from the same
+	// scheduler goroutine sequentially — a plain map with a mutex is enough,
+	// no need for anything fancier.
+	selfUsernameMu sync.Mutex
+	selfUsernames  map[string]string
 }
 
 func (c *GitLabChecker) tokenHeader() string {
@@ -86,14 +102,37 @@ type gitlabMRResponse struct {
 }
 
 type gitlabApprovalsResponse struct {
-	ApprovedBy []json.RawMessage `json:"approved_by"`
+	ApprovedBy        []json.RawMessage `json:"approved_by"`
+	Approved          *bool             `json:"approved"`
+	ApprovalsRequired int               `json:"approvals_required"`
+	ApprovalsLeft     int               `json:"approvals_left"`
+}
+
+// reviewState is the state to report for the latest approval: plain APPROVED
+// once GitLab considers the MR approved, otherwise the progress ("APPROVED
+// 1/2") so a partially approved MR does not read as ready to merge.
+func (a gitlabApprovalsResponse) reviewState() string {
+	incomplete := a.ApprovalsLeft > 0 || (a.Approved != nil && !*a.Approved)
+	if !incomplete {
+		return "APPROVED"
+	}
+	if a.ApprovalsRequired > 0 {
+		return fmt.Sprintf("APPROVED %d/%d", len(a.ApprovedBy), a.ApprovalsRequired)
+	}
+	return "APPROVED (more needed)"
 }
 
 type gitlabDiscussion struct {
 	ID    string `json:"id"`
 	Notes []struct {
-		Resolvable bool `json:"resolvable"`
-		Resolved   bool `json:"resolved"`
+		ID         int    `json:"id"`
+		System     bool   `json:"system"`
+		Body       string `json:"body"`
+		Resolvable bool   `json:"resolvable"`
+		Resolved   bool   `json:"resolved"`
+		Author     struct {
+			Username string `json:"username"`
+		} `json:"author"`
 	} `json:"notes"`
 }
 
@@ -135,6 +174,40 @@ func mapGitLabPipelineStatus(status string) string {
 	}
 }
 
+// token returns host's cached credential, calling TokenFunc only when there
+// is none. Only a non-empty, successful answer is cached.
+func (c *GitLabChecker) token(ctx context.Context, host string) (string, error) {
+	c.tokenMu.Lock()
+	cached := c.tokens[host]
+	c.tokenMu.Unlock()
+	if cached != "" {
+		return cached, nil
+	}
+	token, err := c.TokenFunc(ctx, host)
+	if err != nil || token == "" {
+		return token, err
+	}
+	c.tokenMu.Lock()
+	if c.tokens == nil {
+		c.tokens = make(map[string]string)
+	}
+	c.tokens[host] = token
+	c.tokenMu.Unlock()
+	return token, nil
+}
+
+// forgetToken drops used wherever it is cached, after a host rejected it, so
+// the next request asks TokenFunc for a fresh one.
+func (c *GitLabChecker) forgetToken(used string) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	for host, token := range c.tokens {
+		if token == used {
+			delete(c.tokens, host)
+		}
+	}
+}
+
 func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, RateBudget, error) {
 	host, projectPath, iid, err := ParseGitLabMRURL(mrURL)
 	if err != nil {
@@ -144,7 +217,7 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 	if c.TokenFunc == nil {
 		return CheckResult{}, RateBudget{}, fmt.Errorf("gitlab %s: no TokenFunc configured", host)
 	}
-	token, err := c.TokenFunc(ctx, host)
+	token, err := c.token(ctx, host)
 	if err != nil {
 		return CheckResult{}, RateBudget{}, fmt.Errorf("resolve gitlab token for %s: %w", host, err)
 	}
@@ -203,7 +276,8 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 	if err != nil {
 		return CheckResult{}, RateBudget{}, err
 	}
-	result.ReviewCount = len(approvalsRaw.(*gitlabApprovalsResponse).ApprovedBy)
+	approvals := *approvalsRaw.(*gitlabApprovalsResponse)
+	result.ReviewCount = len(approvals.ApprovedBy)
 
 	if result.ReviewCount > 0 {
 		var notes []gitlabNote
@@ -213,7 +287,7 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 		for _, n := range notes {
 			if n.System && strings.Contains(n.Body, gitlabApprovedNoteBody) {
 				result.LatestReviewer = n.Author.Username
-				result.LatestReviewState = "APPROVED"
+				result.LatestReviewState = approvals.reviewState()
 				result.LatestReviewAt = parseRFC3339OrZero(n.CreatedAt)
 				result.ReviewHref = fmt.Sprintf("%s#note_%d", mrURL, n.ID)
 				break
@@ -225,16 +299,111 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 	if _, _, err := c.getJSON(ctx, token, fmt.Sprintf("%s/api/v4/projects/%s/merge_requests/%d/discussions?per_page=100", base, encodedPath, iid), &discussions); err != nil {
 		return CheckResult{}, RateBudget{}, err
 	}
+	// The same /discussions response covers both inline review threads and
+	// plain top-level MR comments: GitLab wraps every top-level comment as
+	// its own single-note "discussion" (individual_note: true) with
+	// resolvable false on that note, the same shape a resolvable-but-absent
+	// note has for a genuinely un-resolvable discussion — so "no note in
+	// this discussion is resolvable" is what marks it as a top-level
+	// comment rather than a review thread, no separate API call needed.
+	// System-generated notes (system: true — "requested review from",
+	// "assigned to", "enabled an automatic merge", CI/label/description
+	// changes, etc.) are also individual_note discussions with no
+	// resolvable note, but they're not comments at all: confirmed live, a
+	// merge request whose only new "discussions" were three system notes
+	// pinged COMMENT with nothing an agent could actually go read — a
+	// discussion needs at least one real (non-system) note to count.
 	for _, d := range discussions {
+		resolvable, unresolved, hasComment := false, false, false
 		for _, n := range d.Notes {
-			if n.Resolvable && !n.Resolved {
-				result.UnresolvedThreadIDs = append(result.UnresolvedThreadIDs, d.ID)
-				break
+			if n.Resolvable {
+				resolvable = true
+				if !n.Resolved {
+					unresolved = true
+				}
+			} else if !n.System {
+				hasComment = true
+			}
+		}
+		if unresolved {
+			result.UnresolvedThreadIDs = append(result.UnresolvedThreadIDs, d.ID)
+			// The newest few real notes, matching what GitHub fetches per thread.
+			var notes []ThreadComment
+			for _, n := range d.Notes {
+				if !n.System {
+					notes = append(notes, ThreadComment{ThreadID: d.ID, ID: fmt.Sprint(n.ID), Author: n.Author.Username, Href: fmt.Sprintf("%s#note_%d", mrURL, n.ID)})
+				}
+			}
+			if len(notes) > 3 {
+				notes = notes[len(notes)-3:]
+			}
+			for _, c := range notes {
+				result.ThreadComments = append(result.ThreadComments, c)
+				result.ThreadCommentIDs = append(result.ThreadCommentIDs, c.ID)
+			}
+		}
+		if !resolvable && hasComment {
+			for _, n := range slices.Backward(d.Notes) {
+				if !n.System {
+					result.TopLevelComments = append(result.TopLevelComments, TopLevelComment{
+						ID:     d.ID,
+						Href:   fmt.Sprintf("%s#note_%d", mrURL, n.ID),
+						Author: n.Author.Username,
+						Body:   n.Body,
+					})
+					break
+				}
 			}
 		}
 	}
 
+	result.ApplyCommentFilters(nil)
 	return result, budget, nil
+}
+
+// gitlabMRSearchResult is one entry from the merge_requests list endpoint,
+// used only by DiscoverBranchMR — the full gitlabMRResponse fields Check
+// needs aren't asked for here, since discovery only cares whether a match
+// exists at all.
+type gitlabMRSearchResult struct {
+	WebURL string `json:"web_url"`
+}
+
+// DiscoverBranchMR looks up whether host/projectPath has an open MR whose
+// source branch is branch — the auto-watch discovery path's GitLab leg.
+// GitLab has no aliased-batch query the way GitHub's GraphQL does, so this
+// stays one REST call per (host, projectPath, branch) triple, same
+// one-call-per-target shape Check already has. found is false — not an
+// error — for a project/branch with no open MR. A token that fails to
+// resolve for host, or resolves empty, is treated the same way rather than
+// as an error: the caller can't tell "not a GitLab host at all" apart from
+// "a GitLab host with nothing configured for it" any other way, and both
+// mean there's nothing this call can usefully do.
+func (c *GitLabChecker) DiscoverBranchMR(ctx context.Context, host, projectPath, branch string) (mrURL string, found bool, budget RateBudget, err error) {
+	if c.TokenFunc == nil {
+		return "", false, RateBudget{}, nil
+	}
+	token, tokenErr := c.token(ctx, host)
+	if tokenErr != nil || token == "" {
+		return "", false, RateBudget{}, nil
+	}
+
+	base := c.apiBaseOverride
+	if base == "" {
+		base = "https://" + host
+	}
+	q := url.Values{"source_branch": {branch}, "state": {"opened"}, "per_page": {"1"}}
+	endpoint := fmt.Sprintf("%s/api/v4/projects/%s/merge_requests?%s", base, url.PathEscape(projectPath), q.Encode())
+
+	var results []gitlabMRSearchResult
+	_, budget, err = c.getJSON(ctx, token, endpoint, &results)
+	if err != nil {
+		return "", false, RateBudget{}, err
+	}
+	if len(results) == 0 {
+		return "", false, budget, nil
+	}
+	return results[0].WebURL, true, budget, nil
 }
 
 func mapGitLabState(state string) string {
@@ -246,6 +415,55 @@ func mapGitLabState(state string) string {
 	default:
 		return "open"
 	}
+}
+
+// SelfUsername resolves and caches host's authenticated account's own
+// username — used by the scheduler to suppress notifying about a review
+// this same account (the human or an agent acting as them, since both
+// share one token) just left, which otherwise reads as the worker telling
+// you about your own action. A cache miss costs one GET
+// /api/v4/user using the same token Check already resolves for host; a
+// hit is free. token resolution failing or reporting empty (host not
+// configured) fails soft — "" with no error — the same way Check's own
+// empty-token short-circuit does, since there's nothing to look up an
+// identity against.
+func (c *GitLabChecker) SelfUsername(ctx context.Context, host string) (string, error) {
+	c.selfUsernameMu.Lock()
+	if u, ok := c.selfUsernames[host]; ok {
+		c.selfUsernameMu.Unlock()
+		return u, nil
+	}
+	c.selfUsernameMu.Unlock()
+
+	if c.TokenFunc == nil {
+		return "", nil
+	}
+	token, err := c.token(ctx, host)
+	if err != nil {
+		return "", err
+	}
+	if token == "" {
+		return "", nil
+	}
+
+	base := c.apiBaseOverride
+	if base == "" {
+		base = "https://" + host
+	}
+	var user struct {
+		Username string `json:"username"`
+	}
+	if _, _, err := c.getJSON(ctx, token, base+"/api/v4/user", &user); err != nil {
+		return "", err
+	}
+
+	c.selfUsernameMu.Lock()
+	if c.selfUsernames == nil {
+		c.selfUsernames = make(map[string]string)
+	}
+	c.selfUsernames[host] = user.Username
+	c.selfUsernameMu.Unlock()
+	return user.Username, nil
 }
 
 // getJSON issues a GET, decodes into out (out must be a pointer, or a
@@ -270,6 +488,9 @@ func (c *GitLabChecker) getJSON(ctx context.Context, token, url string, out any)
 	budget := parseGitLabRateHeaders(resp)
 
 	if err := checkHTTPStatus(resp); err != nil {
+		if isUnauthorized(err) {
+			c.forgetToken(token)
+		}
 		return nil, budget, fmt.Errorf("gitlab %s: %w", url, err)
 	}
 

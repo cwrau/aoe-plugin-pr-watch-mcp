@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	neturl "net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,9 +33,32 @@ func ParseGitHubPRURL(url string) (owner, repo string, number int, err error) {
 	return m[1], m[2], n, nil
 }
 
+// ParseGitHubRemoteURL resolves a git remote to (owner, repo), accepting
+// only an actual github.com remote — ok is false for any other host,
+// including a self-hosted GitHub Enterprise instance (not supported here,
+// same as ParseGitHubPRURL's hardcoded github.com). Used by the auto-watch
+// discovery path to turn a workspace checkout's `origin` remote into the
+// owner/repo CheckBatch/DiscoverBranchPRs need, without requiring the
+// checkout to already be registered.
+func ParseGitHubRemoteURL(remoteURL string) (owner, repo string, ok bool) {
+	host, path, ok := ParseGitRemoteURL(remoteURL)
+	if !ok || host != "github.com" {
+		return "", "", false
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
 type GitHubBudgets struct {
 	REST    RateBudget
 	GraphQL RateBudget
+	// GraphQLCost is how many GraphQL rate-limit points the batch's queries
+	// spent in total (summed over its requests), as GitHub reports per query.
+	// A PR costs several, not one; the scheduler paces by this.
+	GraphQLCost int
 }
 
 // GitHubChecker polls a batch of PRs' state via one aliased GitHub GraphQL
@@ -49,8 +76,63 @@ type GitHubBudgets struct {
 // dedicated polling call.
 type GitHubChecker struct {
 	HTTPClient *http.Client
-	Token      string
-	BaseURL    string // defaults to https://api.github.com; overridable for tests
+	// Token is the credential in use: set up front when the caller already
+	// has one, otherwise filled in from TokenFunc on first use. It is
+	// dropped again when GitHub answers 401, so the next request fetches a
+	// fresh one; never refetched otherwise. Read it through authToken.
+	Token string
+	// TokenFunc fetches a credential (typically a `gh auth token`
+	// subprocess); nil means Token is all there is.
+	TokenFunc func(ctx context.Context) (string, error)
+	BaseURL   string // defaults to https://api.github.com; overridable for tests
+
+	tokenMu sync.Mutex
+
+	// selfLoginOnce/selfLogin/selfLoginErr cache SelfLogin's result — the
+	// authenticated login never changes for the lifetime of one Token, and
+	// GitHubChecker is shared between the scheduler loop and the MCP HTTP
+	// handler's dismiss_review tool (see main.go), so this needs to be
+	// concurrency-safe; sync.Once gives that for free.
+	selfLoginOnce sync.Once
+	selfLogin     string
+	selfLoginErr  error
+}
+
+// authToken returns the cached credential, fetching it through TokenFunc
+// only when there is none. GitHubChecker is shared between the scheduler loop
+// and the MCP handler, hence the lock.
+func (c *GitHubChecker) authToken(ctx context.Context) (string, error) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	if c.Token != "" {
+		return c.Token, nil
+	}
+	if c.TokenFunc == nil {
+		return "", errors.New("github: no token configured")
+	}
+	token, err := c.TokenFunc(ctx)
+	if err != nil {
+		return "", fmt.Errorf("resolve github token: %w", err)
+	}
+	if token == "" {
+		return "", errors.New("github: no token available")
+	}
+	c.Token = token
+	return token, nil
+}
+
+// forgetToken drops used if it is still the cached credential, after GitHub
+// rejected it, so the next request fetches a fresh one. A no-op without a
+// TokenFunc: a fixed token has nothing to be replaced by.
+func (c *GitHubChecker) forgetToken(used string) {
+	if c.TokenFunc == nil {
+		return
+	}
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	if c.Token == used {
+		c.Token = ""
+	}
 }
 
 func (c *GitHubChecker) baseURL() string {
@@ -70,9 +152,11 @@ const githubPullRequestFieldsQuery = `      state
       mergedAt
       mergeable
       mergeQueueEntry { state position }
+      queueEvents: timelineItems(last: 2, itemTypes: [ADDED_TO_MERGE_QUEUE_EVENT, REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { __typename ... on RemovedFromMergeQueueEvent { reason } } }
       reviewCount: reviews { totalCount }
-      latestReview: reviews(last: 1) { nodes { author { login } state submittedAt url } }
-      reviewThreads(first: 100) { nodes { id isResolved } }
+      latestReview: reviews(last: 1) { nodes { author { login } state body submittedAt url } }
+      reviewThreads(first: 100) { nodes { id isResolved comments(last: 3) { nodes { id url author { login } } } } }
+      comments(last: 20) { nodes { id url body author { login } } }
       commits(last: 1) {
         nodes { commit { statusCheckRollup { state } } }
       }`
@@ -90,6 +174,16 @@ type githubPullRequestFields struct {
 		State    string `json:"state"` // "QUEUED" | "AWAITING_CHECKS" | "LOCKED" | "MERGEABLE" | "UNMERGEABLE"
 		Position int    `json:"position"`
 	} `json:"mergeQueueEntry"` // nil if the PR isn't (or is no longer) in the repo's merge queue
+	// QueueEvents are the PR's two latest merge queue timeline events,
+	// oldest first. When the newest is a removal, its reason says why the
+	// entry left the queue; when it is an add, any earlier removal belongs to
+	// a previous stint and says nothing about the current one.
+	QueueEvents struct {
+		Nodes []struct {
+			Typename string `json:"__typename"`
+			Reason   string `json:"reason"`
+		} `json:"nodes"`
+	} `json:"queueEvents"`
 	ReviewCount struct {
 		TotalCount int `json:"totalCount"`
 	} `json:"reviewCount"`
@@ -99,6 +193,7 @@ type githubPullRequestFields struct {
 				Login string `json:"login"`
 			} `json:"author"`
 			State       string `json:"state"`
+			Body        string `json:"body"`
 			SubmittedAt string `json:"submittedAt"`
 			URL         string `json:"url"`
 		} `json:"nodes"`
@@ -114,8 +209,36 @@ type githubPullRequestFields struct {
 		Nodes []struct {
 			ID         string `json:"id"`
 			IsResolved bool   `json:"isResolved"`
+			// Only the newest few comments per thread: enough to spot a
+			// reply, without paying GraphQL cost for whole long threads.
+			Comments struct {
+				Nodes []struct {
+					ID     string `json:"id"`
+					URL    string `json:"url"`
+					Author struct {
+						Login string `json:"login"`
+					} `json:"author"`
+				} `json:"nodes"`
+			} `json:"comments"`
 		} `json:"nodes"`
 	} `json:"reviewThreads"`
+	// Comments is the Conversation tab's own top-level comments — distinct
+	// from ReviewThreads (inline code comments) and reviews (formal review
+	// submissions). GitHub has no "resolvable" concept for these, so unlike
+	// ReviewThreads every one seen ever stays "current" (no isResolved to
+	// filter on) — last: 20 matches the same "good enough" precedent as
+	// reviews(last: 1) above, since only the most recent ones matter for
+	// detecting new activity.
+	Comments struct {
+		Nodes []struct {
+			ID     string `json:"id"`
+			URL    string `json:"url"`
+			Body   string `json:"body"`
+			Author struct {
+				Login string `json:"login"`
+			} `json:"author"`
+		} `json:"nodes"`
+	} `json:"comments"`
 	Commits struct {
 		Nodes []struct {
 			Commit struct {
@@ -155,15 +278,32 @@ type githubBatchGraphQLResponse struct {
 // RateBudget, the same "no signal yet" value ComputeInterval/HasHeadroom
 // already handle safely everywhere else.
 func (r *githubBatchGraphQLResponse) rateLimit() RateBudget {
-	var rl struct {
-		Limit     int    `json:"limit"`
-		Remaining int    `json:"remaining"`
-		ResetAt   string `json:"resetAt"`
-	}
-	if err := json.Unmarshal(r.Data["rateLimit"], &rl); err != nil {
+	rl, ok := r.rateLimitFields()
+	if !ok {
 		return RateBudget{}
 	}
 	return RateBudget{Limit: rl.Limit, Remaining: rl.Remaining, ResetAt: parseRFC3339OrZero(rl.ResetAt)}
+}
+
+// queryCost is the points GitHub charged for this query, 0 if not reported.
+func (r *githubBatchGraphQLResponse) queryCost() int {
+	rl, _ := r.rateLimitFields()
+	return rl.Cost
+}
+
+type githubRateLimitFields struct {
+	Limit     int    `json:"limit"`
+	Remaining int    `json:"remaining"`
+	ResetAt   string `json:"resetAt"`
+	Cost      int    `json:"cost"`
+}
+
+func (r *githubBatchGraphQLResponse) rateLimitFields() (githubRateLimitFields, bool) {
+	var rl githubRateLimitFields
+	if err := json.Unmarshal(r.Data["rateLimit"], &rl); err != nil {
+		return githubRateLimitFields{}, false
+	}
+	return rl, true
 }
 
 // pullRequestRaw returns the raw JSON for one aliased pullRequest entry
@@ -224,11 +364,24 @@ func buildCheckResult(pr githubPullRequestFields) CheckResult {
 		result.MergeQueueState = pr.MergeQueueEntry.State
 		result.MergeQueuePosition = pr.MergeQueueEntry.Position
 	}
+	if n := pr.QueueEvents.Nodes; len(n) > 0 && n[len(n)-1].Typename == "RemovedFromMergeQueueEvent" {
+		result.MergeQueueRemovalReason = n[len(n)-1].Reason
+	}
 	for _, t := range pr.ReviewThreads.Nodes {
 		if !t.IsResolved {
 			result.UnresolvedThreadIDs = append(result.UnresolvedThreadIDs, t.ID)
+			for _, c := range t.Comments.Nodes {
+				result.ThreadComments = append(result.ThreadComments, ThreadComment{ThreadID: t.ID, ID: c.ID, Author: c.Author.Login, Href: c.URL})
+				result.ThreadCommentIDs = append(result.ThreadCommentIDs, c.ID)
+			}
 		}
 	}
+	for _, c := range pr.Comments.Nodes {
+		// comments(last: N) is chronological ascending, so the final node
+		// is the newest — ApplyCommentFilters relies on that order.
+		result.TopLevelComments = append(result.TopLevelComments, TopLevelComment{ID: c.ID, Href: c.URL, Author: c.Author.Login, Body: c.Body})
+	}
+	result.ApplyCommentFilters(nil)
 	// A DISMISSED review carries no current signal — GitHub updates the
 	// review's own `state` in place when it's dismissed, rather than
 	// removing it from the list, but a dismissed review no longer counts
@@ -241,6 +394,7 @@ func buildCheckResult(pr githubPullRequestFields) CheckResult {
 		result.LatestReviewState = pr.LatestReview.Nodes[0].State
 		result.LatestReviewAt = parseRFC3339OrZero(pr.LatestReview.Nodes[0].SubmittedAt)
 		result.ReviewHref = pr.LatestReview.Nodes[0].URL
+		result.LatestReviewBody = pr.LatestReview.Nodes[0].Body
 	}
 	if pr.State == "MERGED" {
 		result.MergedAt = parseRFC3339OrZero(pr.MergedAt)
@@ -315,7 +469,7 @@ func buildGitHubBatchQuery(items []githubBatchItem) githubBatchQuery {
 		body.WriteString("  }\n")
 	}
 
-	query := fmt.Sprintf("query(%s) {\n%s  rateLimit { limit remaining resetAt }\n}", strings.Join(varDecls, ", "), body.String())
+	query := fmt.Sprintf("query(%s) {\n%s  rateLimit { limit remaining resetAt cost }\n}", strings.Join(varDecls, ", "), body.String())
 	return githubBatchQuery{query: query, variables: variables, urlByAlias: urlByAlias}
 }
 
@@ -330,15 +484,64 @@ type githubBatchEntry struct {
 	repo       string
 }
 
-// CheckBatch resolves every url's PR state in one GraphQL request (see
-// buildGitHubBatchQuery), then runs the action_required REST cross-check
-// per still-open result. A url missing from the returned map means its PR
-// (or repo) wasn't found in the response — the caller treats that as a
-// per-registration failure, same as any other check error, without
-// failing the rest of the batch. A whole-request failure (network error,
-// non-2xx, top-level GraphQL errors) fails the entire batch instead: there
-// is no per-PR data to fall back to in that case.
+// githubBatchChunkSize is how many PRs one GraphQL request asks for. GitHub
+// rejects a query that is too big with "Resource limits for this query
+// exceeded", and every PR here pulls in reviews, threads with comments,
+// comments, queue events and checks, so a single query for everything watched
+// stopped working once there were around a hundred registrations — and then
+// no PR was checked at all.
+const githubBatchChunkSize = 20
+
+// CheckBatch resolves every url's PR state in GraphQL requests of at most
+// githubBatchChunkSize PRs each (see buildGitHubBatchQuery), then runs the
+// action_required REST cross-check per still-open result. A url missing from
+// the returned map means its PR (or repo) wasn't found in the response, or
+// its request failed — the caller treats that as a per-registration failure,
+// same as any other check error, without failing the rest. Only when every
+// request fails (network error, non-2xx, top-level GraphQL errors) is the
+// error returned: there is no per-PR data to fall back to in that case.
 func (c *GitHubChecker) CheckBatch(ctx context.Context, urls []string) (map[string]CheckResult, GitHubBudgets, error) {
+	// A malformed URL is the caller's bug, not something a smaller query
+	// would fix, so it fails the call up front.
+	for _, u := range urls {
+		if _, _, _, err := ParseGitHubPRURL(u); err != nil {
+			return nil, GitHubBudgets{}, err
+		}
+	}
+	if len(urls) <= githubBatchChunkSize {
+		return c.checkBatchChunk(ctx, urls)
+	}
+	results := make(map[string]CheckResult, len(urls))
+	var budgets GitHubBudgets
+	var firstErr error
+	succeeded := 0
+	for start := 0; start < len(urls); start += githubBatchChunkSize {
+		chunk := urls[start:min(start+githubBatchChunkSize, len(urls))]
+		res, b, err := c.checkBatchChunk(ctx, chunk)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		succeeded++
+		maps.Copy(results, res)
+		budgets.GraphQLCost += b.GraphQLCost
+		if b.GraphQL.Limit > 0 {
+			budgets.GraphQL = b.GraphQL
+		}
+		if b.REST.Limit > 0 {
+			budgets.REST = b.REST
+		}
+	}
+	if succeeded == 0 {
+		return nil, GitHubBudgets{}, firstErr
+	}
+	return results, budgets, nil
+}
+
+// checkBatchChunk is one GraphQL request's worth of CheckBatch.
+func (c *GitHubChecker) checkBatchChunk(ctx context.Context, urls []string) (map[string]CheckResult, GitHubBudgets, error) {
 	items := make([]githubBatchItem, 0, len(urls))
 	itemByURL := make(map[string]githubBatchItem, len(urls))
 	for _, u := range urls {
@@ -387,7 +590,7 @@ func (c *GitHubChecker) CheckBatch(ctx context.Context, urls []string) (map[stri
 		}
 	}
 
-	budgets := GitHubBudgets{GraphQL: resp.rateLimit()}
+	budgets := GitHubBudgets{GraphQL: resp.rateLimit(), GraphQLCost: resp.queryCost()}
 
 	// Terminal PRs don't need the action_required cross-check — same
 	// early-out the single-PR path always had. The REST budget reported
@@ -409,6 +612,21 @@ func (c *GitHubChecker) CheckBatch(ctx context.Context, urls []string) (map[stri
 			if runs.actionRequired && result.CIBucket != "failure" {
 				result.CIBucket = "action_required"
 			}
+			// Confirmed live: agent-of-empires/agent-of-empires#4138 pinged
+			// CI failure with an already-empty CIDetail/CIHref (the earlier
+			// fix already refused to blame a cancelled run for those), but
+			// the top-level "failure" bucket itself still came straight
+			// from the rollup and still fired the ping — GitHub's
+			// statusCheckRollup reports FAILURE for a commit whose only
+			// non-success check was a force-push-cancelled run, same root
+			// cause one level up. Downgrading to "pending" here (not
+			// "success" — a cancelled run says nothing about whether the
+			// commit's checks would have passed) only fires when
+			// explainedByCancellation has already ruled out a genuine
+			// failure, a pending run, or an action_required gate.
+			if result.CIBucket == "failure" && runs.explainedByCancellation {
+				result.CIBucket = "pending"
+			}
 			switch result.CIBucket {
 			case "failure":
 				result.CIDetail = runs.failingRunName
@@ -423,6 +641,134 @@ func (c *GitHubChecker) CheckBatch(ctx context.Context, urls []string) (map[stri
 	budgets.REST = restBudget
 
 	return results, budgets, nil
+}
+
+// GitHubBranchQuery is one "does this branch have an open PR" question for
+// DiscoverBranchPRs.
+type GitHubBranchQuery struct {
+	Owner  string
+	Repo   string
+	Branch string
+	// HeadOwners, when set, restricts the match to a PR whose head repo is
+	// owned by one of these logins (compared case-insensitively). Needed when
+	// probing a repo the checkout does not push to, where an unrelated PR may
+	// share the branch name.
+	HeadOwners []string
+}
+
+// GitHubBranchKey is the map key DiscoverBranchPRs' result uses for one
+// query — exported so a caller can look a query back up in the result
+// without needing to reconstruct string formatting itself.
+func GitHubBranchKey(owner, repo, branch string) string {
+	return owner + "/" + repo + "@" + branch
+}
+
+// buildGitHubBranchDiscoveryQuery mirrors buildGitHubBatchQuery's repo-alias
+// grouping (a due branch lookup on a repo another due lookup or check
+// already touches doesn't cost a second `repository(...)` resolution), but
+// asks each aliased repo for `pullRequests(headRefName: ..., states: [OPEN])`
+// instead of a specific `pullRequest(number: ...)` — the query shape a
+// branch lookup needs is different enough from a known-PR-number lookup
+// that keeping them as separate builders (like FindReview/DismissReview are
+// already separate from CheckBatch) is clearer than parameterizing one
+// builder for both.
+func buildGitHubBranchDiscoveryQuery(items []GitHubBranchQuery) githubBatchQuery {
+	type repoGroup struct {
+		alias string
+		owner string
+		repo  string
+		items []GitHubBranchQuery
+	}
+	var groups []*repoGroup
+	byRepo := make(map[string]*repoGroup)
+	for _, it := range items {
+		key := it.Owner + "/" + it.Repo
+		g, ok := byRepo[key]
+		if !ok {
+			g = &repoGroup{alias: fmt.Sprintf("repo%d", len(groups)), owner: it.Owner, repo: it.Repo}
+			groups = append(groups, g)
+			byRepo[key] = g
+		}
+		g.items = append(g.items, it)
+	}
+
+	var varDecls []string
+	variables := make(map[string]any)
+	keyByAlias := make(map[string]string, len(items))
+	var body strings.Builder
+	for _, g := range groups {
+		ownerVar, repoVar := g.alias+"Owner", g.alias+"Repo"
+		varDecls = append(varDecls, "$"+ownerVar+": String!", "$"+repoVar+": String!")
+		variables[ownerVar] = g.owner
+		variables[repoVar] = g.repo
+		fmt.Fprintf(&body, "  %s: repository(owner: $%s, name: $%s) {\n", g.alias, ownerVar, repoVar)
+		for i, it := range g.items {
+			branchAlias := fmt.Sprintf("branch%d", i)
+			branchVar := g.alias + branchAlias + "Ref"
+			varDecls = append(varDecls, "$"+branchVar+": String!")
+			variables[branchVar] = it.Branch
+			keyByAlias[g.alias+"."+branchAlias] = GitHubBranchKey(it.Owner, it.Repo, it.Branch)
+			fmt.Fprintf(&body, "    %s: pullRequests(headRefName: $%s, states: [OPEN], first: 10) { nodes { url headRepositoryOwner { login } } }\n", branchAlias, branchVar)
+		}
+		body.WriteString("  }\n")
+	}
+
+	query := fmt.Sprintf("query(%s) {\n%s  rateLimit { limit remaining resetAt }\n}", strings.Join(varDecls, ", "), body.String())
+	return githubBatchQuery{query: query, variables: variables, urlByAlias: keyByAlias}
+}
+
+// DiscoverBranchPRs resolves, for each query, whether an open PR already
+// exists whose head is that branch — the auto-watch discovery path's only
+// real API call: one aliased GraphQL request covering every due branch
+// across however many distinct repos, same dedup-by-repo shape CheckBatch
+// already uses. The result map only contains an entry for a query that
+// actually found an open PR (keyed by GitHubBranchKey); a query with no
+// match is simply absent, not a zero-value entry — this mirrors CheckBatch's
+// own "missing means not found" contract for a batch response.
+func (c *GitHubChecker) DiscoverBranchPRs(ctx context.Context, items []GitHubBranchQuery) (map[string]string, RateBudget, error) {
+	if len(items) == 0 {
+		return map[string]string{}, RateBudget{}, nil
+	}
+	bq := buildGitHubBranchDiscoveryQuery(items)
+	resp, err := c.queryBatchGraphQL(ctx, bq)
+	if err != nil {
+		return nil, RateBudget{}, err
+	}
+
+	ownersByKey := make(map[string][]string, len(items))
+	for _, it := range items {
+		ownersByKey[GitHubBranchKey(it.Owner, it.Repo, it.Branch)] = it.HeadOwners
+	}
+	results := make(map[string]string, len(items))
+	for alias, key := range bq.urlByAlias {
+		repoAlias, branchAlias, ok := strings.Cut(alias, ".")
+		if !ok {
+			continue
+		}
+		raw, ok := resp.pullRequestRaw(repoAlias, branchAlias)
+		if !ok || len(raw) == 0 || string(raw) == "null" {
+			continue
+		}
+		var nodes struct {
+			Nodes []struct {
+				URL                 string `json:"url"`
+				HeadRepositoryOwner *struct {
+					Login string `json:"login"`
+				} `json:"headRepositoryOwner"`
+			} `json:"nodes"`
+		}
+		if err := json.Unmarshal(raw, &nodes); err != nil {
+			continue
+		}
+		owners := ownersByKey[key]
+		for _, n := range nodes.Nodes {
+			if len(owners) == 0 || (n.HeadRepositoryOwner != nil && slices.ContainsFunc(owners, func(o string) bool { return strings.EqualFold(o, n.HeadRepositoryOwner.Login) })) {
+				results[key] = n.URL
+				break
+			}
+		}
+	}
+	return results, resp.rateLimit(), nil
 }
 
 // ReviewLookup is one review resolved by FindReview, carrying just what
@@ -553,6 +899,31 @@ func (c *GitHubChecker) RequestReviewer(ctx context.Context, pullRequestID, logi
 	}, nil)
 }
 
+const githubViewerLoginQuery = `query { viewer { login } }`
+
+// SelfLogin resolves and caches the authenticated account's own login —
+// used by the scheduler to suppress notifying about a REVIEW this same
+// account (the human or an agent acting as them, since both share one
+// token) just left, which otherwise reads as the worker telling you about
+// your own action. Resolved once per GitHubChecker (a fresh GraphQL call
+// the first time, a cached value every call after — the login never
+// changes for the lifetime of one Token), not once per poll.
+func (c *GitHubChecker) SelfLogin(ctx context.Context) (string, error) {
+	c.selfLoginOnce.Do(func() {
+		var resp struct {
+			Viewer struct {
+				Login string `json:"login"`
+			} `json:"viewer"`
+		}
+		if err := c.doGraphQL(ctx, githubViewerLoginQuery, nil, &resp); err != nil {
+			c.selfLoginErr = err
+			return
+		}
+		c.selfLogin = resp.Viewer.Login
+	})
+	return c.selfLogin, c.selfLoginErr
+}
+
 // doGraphQL posts one query or mutation and decodes its `data` field into
 // data (skipped if nil, for mutations the caller only needs success/failure
 // from). Shared by FindReview/DismissReview/RequestReviewer/userID rather
@@ -570,7 +941,11 @@ func (c *GitHubChecker) doGraphQL(ctx context.Context, query string, variables m
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "bearer "+c.Token)
+	token, err := c.authToken(ctx)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.HTTPClient.Do(req)
@@ -580,6 +955,9 @@ func (c *GitHubChecker) doGraphQL(ctx context.Context, query string, variables m
 	defer func() { _ = resp.Body.Close() }()
 
 	if err := checkHTTPStatus(resp); err != nil {
+		if isUnauthorized(err) {
+			c.forgetToken(token)
+		}
 		return fmt.Errorf("github graphql: %w", err)
 	}
 
@@ -619,7 +997,11 @@ func (c *GitHubChecker) queryBatchGraphQL(ctx context.Context, bq githubBatchQue
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "bearer "+c.Token)
+	token, err := c.authToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.HTTPClient.Do(req)
@@ -629,6 +1011,9 @@ func (c *GitHubChecker) queryBatchGraphQL(ctx context.Context, bq githubBatchQue
 	defer func() { _ = resp.Body.Close() }()
 
 	if err := checkHTTPStatus(resp); err != nil {
+		if isUnauthorized(err) {
+			c.forgetToken(token)
+		}
 		return nil, fmt.Errorf("github graphql batch: %w", err)
 	}
 
@@ -649,6 +1034,7 @@ func (c *GitHubChecker) queryBatchGraphQL(ctx context.Context, bq githubBatchQue
 type githubActionsRunsResponse struct {
 	WorkflowRuns []struct {
 		Name       string `json:"name"`
+		Status     string `json:"status"` // "queued" | "in_progress" | "completed" — see explainedByCancellation's use of it
 		Conclusion string `json:"conclusion"`
 		HTMLURL    string `json:"html_url"`
 	} `json:"workflow_runs"`
@@ -677,16 +1063,32 @@ type actionsRunsResult struct {
 	actionRequiredHref string
 	failingRunName     string
 	failingRunHref     string
+	// explainedByCancellation is true when this SHA's Actions runs fully
+	// account for a "failure" rollup as nothing but noise: at least one run
+	// was cancelled, none has a genuine failure or action_required
+	// conclusion, and none is still queued/in_progress (a run still running
+	// might yet fail, so it's never safe to explain away until every run is
+	// terminal). See CheckBatch's use of this for why "cancelled" alone is
+	// required rather than "every run succeeded" — a rollup FAILURE with
+	// zero cancelled runs at all means something outside Actions (a
+	// different status-check provider) is the real cause, which this REST
+	// call can't see and must never paper over.
+	explainedByCancellation bool
 }
 
 // trueFailureConclusions are workflow_runs[].conclusion values that mean
 // the run itself actually failed — distinct from action_required (gated,
 // not failed) and from "skipped"/"neutral" (neither indicates a problem
-// worth surfacing as the reason CI looks red).
+// worth surfacing as the reason CI looks red). "cancelled" is deliberately
+// excluded: it means the run was superseded or aborted (most commonly a
+// `concurrency: cancel-in-progress` workflow cancelling the previous run
+// the moment a new commit lands), not that anything in it actually broke —
+// confirmed live: a force-push mid-run cancelled a CodeQL run, and it got
+// cited as "the failing job" in a CI-failure ping even though nothing had
+// failed, sending the reader to a log that only ever said "cancelled".
 var trueFailureConclusions = map[string]bool{
 	"failure":         true,
 	"timed_out":       true,
-	"cancelled":       true,
 	"startup_failure": true,
 }
 
@@ -706,7 +1108,11 @@ func (c *GitHubChecker) checkActionRequired(ctx context.Context, owner, repo, he
 	if err != nil {
 		return RateBudget{}, actionsRunsResult{}, err
 	}
-	req.Header.Set("Authorization", "bearer "+c.Token)
+	token, err := c.authToken(ctx)
+	if err != nil {
+		return RateBudget{}, actionsRunsResult{}, err
+	}
+	req.Header.Set("Authorization", "bearer "+token)
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -717,6 +1123,9 @@ func (c *GitHubChecker) checkActionRequired(ctx context.Context, owner, repo, he
 	budget := parseGitHubRESTRateHeaders(resp)
 
 	if err := checkHTTPStatus(resp); err != nil {
+		if isUnauthorized(err) {
+			c.forgetToken(token)
+		}
 		return budget, actionsRunsResult{}, fmt.Errorf("github actions runs: %w", err)
 	}
 
@@ -725,6 +1134,7 @@ func (c *GitHubChecker) checkActionRequired(ctx context.Context, owner, repo, he
 		return budget, actionsRunsResult{}, fmt.Errorf("decode github actions runs response: %w", err)
 	}
 	var result actionsRunsResult
+	var anyCancelled, anyNonTerminal bool
 	for _, run := range out.WorkflowRuns {
 		if run.Conclusion == "action_required" {
 			result.actionRequired = true
@@ -737,7 +1147,14 @@ func (c *GitHubChecker) checkActionRequired(ctx context.Context, owner, repo, he
 			result.failingRunName = run.Name
 			result.failingRunHref = run.HTMLURL
 		}
+		if run.Conclusion == "cancelled" {
+			anyCancelled = true
+		}
+		if run.Status != "completed" {
+			anyNonTerminal = true
+		}
 	}
+	result.explainedByCancellation = len(out.WorkflowRuns) > 0 && anyCancelled && !anyNonTerminal && !result.actionRequired && result.failingRunName == ""
 	return budget, result, nil
 }
 
@@ -759,7 +1176,23 @@ func checkHTTPStatus(resp *http.Response) error {
 		return nil
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxHTTPErrorBodyBytes))
-	return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	return &httpStatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(body))}
+}
+
+// httpStatusError is a non-2xx response, typed so callers can tell a
+// rejected credential (401) from other failures.
+type httpStatusError struct {
+	Code int
+	Body string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("unexpected status %d: %s", e.Code, e.Body)
+}
+
+func isUnauthorized(err error) bool {
+	e, ok := errors.AsType[*httpStatusError](err)
+	return ok && e.Code == http.StatusUnauthorized
 }
 
 func parseGitHubRESTRateHeaders(resp *http.Response) RateBudget {

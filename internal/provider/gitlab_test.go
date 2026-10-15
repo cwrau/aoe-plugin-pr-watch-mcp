@@ -394,6 +394,72 @@ func TestGitLabCheckerServerErrorOnApprovals(t *testing.T) {
 // real, working token to an arbitrary pr_url's host — because the token
 // was resolved once globally instead of per-host — is exactly the leak
 // this closes: the handler below fails the test if it's ever hit at all.
+func TestSelfUsernameReturnsAuthenticatedUsername(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/user", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"username": "alice"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{
+		HTTPClient:      srv.Client(),
+		TokenFunc:       func(context.Context, string) (string, error) { return "test-token", nil },
+		apiBaseOverride: srv.URL,
+	}
+	got, err := c.SelfUsername(t.Context(), "gitlab.corp.example")
+	if err != nil {
+		t.Fatalf("SelfUsername() error = %v", err)
+	}
+	if got != "alice" {
+		t.Errorf("SelfUsername() = %q, want %q", got, "alice")
+	}
+}
+
+func TestSelfUsernameCachesPerHost(t *testing.T) {
+	var calls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/user", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_ = json.NewEncoder(w).Encode(map[string]any{"username": "alice"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{
+		HTTPClient:      srv.Client(),
+		TokenFunc:       func(context.Context, string) (string, error) { return "test-token", nil },
+		apiBaseOverride: srv.URL,
+	}
+	for range 3 {
+		if _, err := c.SelfUsername(t.Context(), "gitlab.corp.example"); err != nil {
+			t.Fatalf("SelfUsername() error = %v", err)
+		}
+	}
+	if calls != 1 {
+		t.Errorf("requests = %d, want 1 (cached after the first call)", calls)
+	}
+}
+
+func TestSelfUsernameNoTokenForHostReturnsEmptyNotError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected HTTP request made with no token configured: %s %s", r.Method, r.URL)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{
+		HTTPClient:      srv.Client(),
+		TokenFunc:       func(context.Context, string) (string, error) { return "", nil },
+		apiBaseOverride: srv.URL,
+	}
+	got, err := c.SelfUsername(t.Context(), "not-a-configured-host.example.com")
+	if err != nil || got != "" {
+		t.Errorf("SelfUsername() = (%q, %v), want (\"\", nil) for an unconfigured host", got, err)
+	}
+}
+
 func TestGitLabCheckerNoTokenForHostMakesNoRequest(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -493,6 +559,105 @@ func TestGitLabCheckerNoNotesFetchWithoutApprovals(t *testing.T) {
 	}
 }
 
+// TestGitLabCheckerTopLevelCommentsFromIndividualNoteDiscussions verifies a
+// plain top-level MR comment — a "discussion" wrapping a single note whose
+// resolvable is false, GitLab's shape for individual_note comments — is
+// tracked separately from UnresolvedThreadIDs (which stays scoped to
+// discussions carrying at least one resolvable note), reusing the same
+// /discussions response rather than a dedicated API call.
+func TestGitLabCheckerTopLevelCommentsFromIndividualNoteDiscussions(t *testing.T) {
+	mux := http.NewServeMux()
+	setRateHeaders := func(w http.ResponseWriter) {
+		w.Header().Set("RateLimit-Limit", "2000")
+		w.Header().Set("RateLimit-Remaining", "1999")
+		w.Header().Set("RateLimit-Reset", "9999999999")
+	}
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"state": "opened", "pipeline": nil, "head_pipeline": nil})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": []map[string]any{}})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"id": "thread1", "notes": []map[string]any{{"id": 1, "resolvable": true, "resolved": false}}},
+			{"id": "note2", "notes": []map[string]any{{"id": 2, "resolvable": false, "resolved": false, "body": "looks good to me", "author": map[string]any{"username": "alice"}}}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if !slices.Equal(result.UnresolvedThreadIDs, []string{"thread1"}) {
+		t.Errorf("Check() result.UnresolvedThreadIDs = %v, want [thread1] only (note2 is a top-level comment, not a review thread)", result.UnresolvedThreadIDs)
+	}
+	if !slices.Equal(result.TopLevelCommentIDs, []string{"note2"}) {
+		t.Errorf("Check() result.TopLevelCommentIDs = %v, want [note2] only", result.TopLevelCommentIDs)
+	}
+	wantHref := "https://gitlab.corp.example/team/project/-/merge_requests/17#note_2"
+	if result.LatestCommentHref != wantHref {
+		t.Errorf("Check() result.LatestCommentHref = %q, want %q", result.LatestCommentHref, wantHref)
+	}
+	if result.LatestCommentAuthor != "alice" {
+		t.Errorf("Check() result.LatestCommentAuthor = %q, want alice", result.LatestCommentAuthor)
+	}
+	want := []TopLevelComment{{ID: "note2", Href: wantHref, Author: "alice", Body: "looks good to me"}}
+	if !slices.Equal(result.TopLevelComments, want) {
+		t.Errorf("Check() result.TopLevelComments = %+v, want %+v (raw comments with bodies, for filter rules)", result.TopLevelComments, want)
+	}
+}
+
+// TestGitLabCheckerSystemNotesNeverCountAsTopLevelComments is a regression
+// test: confirmed live, a real GitLab MR
+// pinged COMMENT "3 new comment(s)" for three discussions that were all
+// GitLab system notes ("requested review from @st and @mw", "assigned to
+// @alice", "enabled an automatic merge...") — none of them a real comment an
+// agent could go read. A system note is an individual_note discussion with
+// no resolvable note, same shape as a real top-level comment, so it must be
+// excluded explicitly rather than inferred from resolvable alone.
+func TestGitLabCheckerSystemNotesNeverCountAsTopLevelComments(t *testing.T) {
+	mux := http.NewServeMux()
+	setRateHeaders := func(w http.ResponseWriter) {
+		w.Header().Set("RateLimit-Limit", "2000")
+		w.Header().Set("RateLimit-Remaining", "1999")
+		w.Header().Set("RateLimit-Reset", "9999999999")
+	}
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"state": "opened", "pipeline": nil, "head_pipeline": nil})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": []map[string]any{}})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"id": "d1", "notes": []map[string]any{{"id": 1, "system": true, "resolvable": false, "body": "requested review from @st and @mw"}}},
+			{"id": "d2", "notes": []map[string]any{{"id": 2, "system": true, "resolvable": false, "body": "assigned to @alice"}}},
+			{"id": "d3", "notes": []map[string]any{{"id": 3, "system": true, "resolvable": false, "body": "enabled an automatic merge"}}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if len(result.TopLevelCommentIDs) != 0 || result.LatestCommentHref != "" {
+		t.Errorf("Check() result = %+v, want no top-level comments (every discussion here is a system note)", result)
+	}
+}
+
 // TestGitLabCheckerFailingJobName verifies CIDetail is populated from
 // /pipelines/:id/jobs when the pipeline bucket is a failure.
 func TestGitLabCheckerFailingJobName(t *testing.T) {
@@ -589,5 +754,169 @@ func TestGitLabCheckerPassesCheckContextToTokenFunc(t *testing.T) {
 	}
 	if !sawCancelledCtx {
 		t.Error("TokenFunc did not observe Check's cancelled context, so the token subprocess would outlive the poll's deadline")
+	}
+}
+
+func TestDiscoverBranchMRFindsOpenMR(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("source_branch"); got != "feature-x" {
+			t.Errorf("source_branch query param = %q, want feature-x", got)
+		}
+		if got := r.URL.Query().Get("state"); got != "opened" {
+			t.Errorf("state query param = %q, want opened", got)
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"web_url": "https://gitlab.corp.example/team/project/-/merge_requests/9"}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{
+		HTTPClient:      srv.Client(),
+		TokenFunc:       func(context.Context, string) (string, error) { return "test-token", nil },
+		apiBaseOverride: srv.URL,
+	}
+	mrURL, found, _, err := c.DiscoverBranchMR(t.Context(), "gitlab.corp.example", "team/project", "feature-x")
+	if err != nil {
+		t.Fatalf("DiscoverBranchMR() error = %v", err)
+	}
+	if !found || mrURL != "https://gitlab.corp.example/team/project/-/merge_requests/9" {
+		t.Errorf("DiscoverBranchMR() = (%q, %v), want the discovered MR url", mrURL, found)
+	}
+}
+
+func TestDiscoverBranchMRNoOpenMRReportsNotFound(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{
+		HTTPClient:      srv.Client(),
+		TokenFunc:       func(context.Context, string) (string, error) { return "test-token", nil },
+		apiBaseOverride: srv.URL,
+	}
+	_, found, _, err := c.DiscoverBranchMR(t.Context(), "gitlab.corp.example", "team/project", "no-mr-yet")
+	if err != nil {
+		t.Fatalf("DiscoverBranchMR() error = %v", err)
+	}
+	if found {
+		t.Error("DiscoverBranchMR() found = true, want false for a branch with no open MR")
+	}
+}
+
+func TestDiscoverBranchMRNoTokenForHostMakesNoRequest(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected HTTP request made with no token configured: %s %s", r.Method, r.URL)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{
+		HTTPClient:      srv.Client(),
+		TokenFunc:       func(context.Context, string) (string, error) { return "", nil },
+		apiBaseOverride: srv.URL,
+	}
+	_, found, _, err := c.DiscoverBranchMR(t.Context(), "not-a-configured-host.example.com", "team/project", "feature-x")
+	if err != nil || found {
+		t.Errorf("DiscoverBranchMR() = (found=%v, err=%v), want (false, nil) rather than an error for an unconfigured host", found, err)
+	}
+}
+
+// An MR that needs two approvals and has one must not read as approved: the
+// badge turned green for a single approval while GitLab still said
+// not_approved. The state carries the progress instead.
+func TestGitLabCheckerPartialApprovalIsNotReportedAsApproved(t *testing.T) {
+	mux := http.NewServeMux()
+	setRateHeaders := func(w http.ResponseWriter) {
+		w.Header().Set("RateLimit-Limit", "2000")
+		w.Header().Set("RateLimit-Remaining", "1999")
+		w.Header().Set("RateLimit-Reset", "9999999999")
+	}
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"state": "opened", "pipeline": nil, "head_pipeline": nil})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"approved": false, "approvals_required": 2, "approvals_left": 1,
+			"approved_by": []map[string]any{{}},
+		})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/notes", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"system": true, "body": "approved this merge request", "created_at": "2026-09-20T12:00:00Z", "author": map[string]any{"username": "st"}},
+		})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if result.LatestReviewState != "APPROVED 1/2" {
+		t.Errorf("LatestReviewState = %q, want %q for 1 of 2 required approvals", result.LatestReviewState, "APPROVED 1/2")
+	}
+	if result.LatestReviewer != "st" || result.ReviewCount != 1 {
+		t.Errorf("result = %+v, want reviewer st and ReviewCount 1 still recorded so the approval pings", result)
+	}
+}
+
+func TestGitLabCheckerTracksCommentsOfUnresolvedThreads(t *testing.T) {
+	mux := http.NewServeMux()
+	setRateHeaders := func(w http.ResponseWriter) {
+		w.Header().Set("RateLimit-Limit", "2000")
+		w.Header().Set("RateLimit-Remaining", "1999")
+		w.Header().Set("RateLimit-Reset", "9999999999")
+	}
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"state": "opened", "pipeline": nil, "head_pipeline": nil})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": []map[string]any{}})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+		setRateHeaders(w)
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"id": "d1", "notes": []map[string]any{
+				{"id": 11, "system": false, "resolvable": true, "resolved": false, "body": "a", "author": map[string]any{"username": "alice"}},
+				{"id": 12, "system": false, "resolvable": true, "resolved": false, "body": "b", "author": map[string]any{"username": "bob"}},
+			}},
+			{"id": "d2", "notes": []map[string]any{
+				{"id": 21, "system": false, "resolvable": true, "resolved": true, "body": "c", "author": map[string]any{"username": "alice"}},
+			}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+	mr := "https://gitlab.corp.example/team/project/-/merge_requests/17"
+	result, _, err := c.Check(t.Context(), mr)
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	want := []ThreadComment{
+		{ThreadID: "d1", ID: "11", Author: "alice", Href: mr + "#note_11"},
+		{ThreadID: "d1", ID: "12", Author: "bob", Href: mr + "#note_12"},
+	}
+	if !slices.Equal(result.ThreadComments, want) {
+		t.Errorf("ThreadComments = %+v, want %+v (only the unresolved discussion's notes)", result.ThreadComments, want)
+	}
+	if !slices.Equal(result.ThreadCommentIDs, []string{"11", "12"}) {
+		t.Errorf("ThreadCommentIDs = %v, want [11 12]", result.ThreadCommentIDs)
 	}
 }

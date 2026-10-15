@@ -194,6 +194,55 @@ func TestGitHubCheckerUnresolvedEmptyWithoutReviewThreads(t *testing.T) {
 	}
 }
 
+func TestGitHubCheckerTopLevelCommentsTracked(t *testing.T) {
+	body := strings.Replace(graphqlOpenSuccessBody,
+		`"commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }] }`,
+		`"comments": { "nodes": [{ "id": "c1", "url": "https://github.com/o/r/pull/1#issuecomment-1", "body": "first", "author": { "login": "alice" } }, { "id": "c2", "url": "https://github.com/o/r/pull/1#issuecomment-2", "body": "second", "author": { "login": "bob" } }] },
+      "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }] }`,
+		1)
+	srv := fakeGitHubServer(t, body, 0)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	got := results[url]
+	if !slices.Equal(got.TopLevelCommentIDs, []string{"c1", "c2"}) {
+		t.Errorf("CheckBatch() result.TopLevelCommentIDs = %v, want [c1 c2]", got.TopLevelCommentIDs)
+	}
+	if got.LatestCommentHref != "https://github.com/o/r/pull/1#issuecomment-2" {
+		t.Errorf("CheckBatch() result.LatestCommentHref = %q, want the last node's url (comments(last: N) is chronological ascending)", got.LatestCommentHref)
+	}
+	if got.LatestCommentAuthor != "bob" {
+		t.Errorf("CheckBatch() result.LatestCommentAuthor = %q, want the last node's author (bob)", got.LatestCommentAuthor)
+	}
+	want := []TopLevelComment{
+		{ID: "c1", Href: "https://github.com/o/r/pull/1#issuecomment-1", Author: "alice", Body: "first"},
+		{ID: "c2", Href: "https://github.com/o/r/pull/1#issuecomment-2", Author: "bob", Body: "second"},
+	}
+	if !slices.Equal(got.TopLevelComments, want) {
+		t.Errorf("CheckBatch() result.TopLevelComments = %+v, want %+v (raw comments with bodies, for filter rules)", got.TopLevelComments, want)
+	}
+}
+
+func TestGitHubCheckerTopLevelCommentsEmptyWithoutComments(t *testing.T) {
+	srv := fakeGitHubServer(t, graphqlOpenSuccessBody, 0)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	if len(results[url].TopLevelCommentIDs) != 0 || results[url].LatestCommentHref != "" {
+		t.Errorf("CheckBatch() result = %+v, want empty TopLevelCommentIDs/LatestCommentHref when the PR has no top-level comments", results[url])
+	}
+}
+
 func TestGitHubCheckerCIDetailFromFailingRun(t *testing.T) {
 	body := strings.Replace(graphqlPendingRollupBody, `"state": "PENDING"`, `"state": "FAILURE"`, 1)
 	mux := http.NewServeMux()
@@ -222,6 +271,189 @@ func TestGitHubCheckerCIDetailFromFailingRun(t *testing.T) {
 	}
 	if results[url].CIBucket != "failure" || results[url].CIDetail != "build" {
 		t.Errorf("CheckBatch() result = %+v, want CIBucket failure, CIDetail build", results[url])
+	}
+}
+
+// TestGitHubCheckerNeverCitesCancelledRunAsCIDetail is a regression test:
+// confirmed live — a force-push mid-run cancelled a CodeQL run (via a
+// `concurrency: cancel-in-progress` workflow), and it got cited as "the
+// failing job" in a CI-failure ping even though nothing had actually
+// failed there; the run that really failed elsewhere is what CIDetail must
+// name instead.
+func TestGitHubCheckerNeverCitesCancelledRunAsCIDetail(t *testing.T) {
+	body := strings.Replace(graphqlPendingRollupBody, `"state": "PENDING"`, `"state": "FAILURE"`, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	})
+	mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "4999")
+		w.Header().Set("X-RateLimit-Reset", "9999999999")
+		runs := map[string]any{"workflow_runs": []map[string]any{
+			{"name": "CodeQL", "conclusion": "cancelled"},
+			{"name": "build", "conclusion": "failure"},
+		}}
+		_ = json.NewEncoder(w).Encode(runs)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	if results[url].CIDetail != "build" {
+		t.Errorf("CheckBatch() result = %+v, want CIDetail %q (never the merely-cancelled CodeQL run)", results[url], "build")
+	}
+}
+
+// TestGitHubCheckerCIDetailEmptyWhenOnlyCancelledRunsExist covers the case
+// where a real failing run genuinely isn't in this page at all (e.g. it's
+// a non-Actions status check the /actions/runs endpoint can't see) —
+// CIDetail/CIHref must stay empty rather than naming a cancelled run as if
+// it explained the failure.
+func TestGitHubCheckerCIDetailEmptyWhenOnlyCancelledRunsExist(t *testing.T) {
+	body := strings.Replace(graphqlPendingRollupBody, `"state": "PENDING"`, `"state": "FAILURE"`, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	})
+	mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "4999")
+		w.Header().Set("X-RateLimit-Reset", "9999999999")
+		runs := map[string]any{"workflow_runs": []map[string]any{
+			{"name": "CodeQL", "conclusion": "cancelled"},
+		}}
+		_ = json.NewEncoder(w).Encode(runs)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	if results[url].CIDetail != "" || results[url].CIHref != "" {
+		t.Errorf("CheckBatch() result = %+v, want empty CIDetail/CIHref rather than naming the cancelled run", results[url])
+	}
+}
+
+// TestGitHubCheckerDowngradesFailureExplainedByCancellation is a regression
+// test: confirmed live, agent-of-empires/agent-of-empires#4138 pinged CI
+// failure — with an already-empty CIDetail/CIHref, since the earlier fix
+// stopped blaming a cancelled run for those — because GitHub's rollup
+// itself reports FAILURE for a commit whose only non-success run was
+// cancelled (superseded by a force-push). When every run for this SHA is
+// terminal, none genuinely failed, none is action_required, and at least
+// one is cancelled, the bucket itself must downgrade too, not just
+// CIDetail/CIHref.
+func TestGitHubCheckerDowngradesFailureExplainedByCancellation(t *testing.T) {
+	body := strings.Replace(graphqlPendingRollupBody, `"state": "PENDING"`, `"state": "FAILURE"`, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	})
+	mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "4999")
+		w.Header().Set("X-RateLimit-Reset", "9999999999")
+		runs := map[string]any{"workflow_runs": []map[string]any{
+			{"name": "CodeQL", "status": "completed", "conclusion": "cancelled"},
+			{"name": "PR Title Check", "status": "completed", "conclusion": "success"},
+		}}
+		_ = json.NewEncoder(w).Encode(runs)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	if results[url].CIBucket != "pending" {
+		t.Errorf("CheckBatch() result.CIBucket = %q, want pending (fully explained by the cancelled run, nothing genuinely failed)", results[url].CIBucket)
+	}
+}
+
+// TestGitHubCheckerKeepsFailureWithoutAnyCancelledRun guards against
+// over-eager downgrading: a rollup FAILURE with every Actions run
+// succeeding (no cancelled run at all) means something outside Actions — a
+// different status-check provider this REST call can't see — is the real
+// cause, so it must never be papered over just because Actions itself looks
+// clean.
+func TestGitHubCheckerKeepsFailureWithoutAnyCancelledRun(t *testing.T) {
+	body := strings.Replace(graphqlPendingRollupBody, `"state": "PENDING"`, `"state": "FAILURE"`, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	})
+	mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "4999")
+		w.Header().Set("X-RateLimit-Reset", "9999999999")
+		runs := map[string]any{"workflow_runs": []map[string]any{
+			{"name": "PR Title Check", "status": "completed", "conclusion": "success"},
+		}}
+		_ = json.NewEncoder(w).Encode(runs)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	if results[url].CIBucket != "failure" {
+		t.Errorf("CheckBatch() result.CIBucket = %q, want failure kept as-is (nothing cancelled, so nothing here explains the rollup's FAILURE)", results[url].CIBucket)
+	}
+}
+
+// TestGitHubCheckerKeepsFailureWhileARunIsStillInProgress guards the other
+// direction: a run still queued/in_progress might yet fail, so a cancelled
+// run elsewhere can't be trusted to fully explain the rollup until every
+// run is terminal.
+func TestGitHubCheckerKeepsFailureWhileARunIsStillInProgress(t *testing.T) {
+	body := strings.Replace(graphqlPendingRollupBody, `"state": "PENDING"`, `"state": "FAILURE"`, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	})
+	mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "4999")
+		w.Header().Set("X-RateLimit-Reset", "9999999999")
+		runs := map[string]any{"workflow_runs": []map[string]any{
+			{"name": "CodeQL", "status": "completed", "conclusion": "cancelled"},
+			{"name": "Tests", "status": "in_progress", "conclusion": ""},
+		}}
+		_ = json.NewEncoder(w).Encode(runs)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	if results[url].CIBucket != "failure" {
+		t.Errorf("CheckBatch() result.CIBucket = %q, want failure kept as-is (Tests is still in_progress, might yet fail)", results[url].CIBucket)
 	}
 }
 
@@ -624,6 +856,79 @@ func TestGitHubCheckerBatchesMultiplePRsIntoOneGraphQLRequest(t *testing.T) {
 	}
 }
 
+func TestDiscoverBranchPRsFindsOpenPR(t *testing.T) {
+	srv := dispatchGraphQLServer(t, map[string]string{
+		"pullRequests(headRefName:": `{"data": {
+			"repo0": {"branch0": {"nodes": [{"url": "https://github.com/o/r/pull/9"}]}},
+			"rateLimit": {"limit": 5000, "remaining": 4999, "resetAt": "2026-09-20T23:00:00Z"}
+		}}`,
+	})
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	results, budget, err := c.DiscoverBranchPRs(t.Context(), []GitHubBranchQuery{{Owner: "o", Repo: "r", Branch: "feature-x"}})
+	if err != nil {
+		t.Fatalf("DiscoverBranchPRs() error = %v", err)
+	}
+	if budget.Remaining != 4999 {
+		t.Errorf("budget.Remaining = %d, want 4999", budget.Remaining)
+	}
+	key := GitHubBranchKey("o", "r", "feature-x")
+	if got := results[key]; got != "https://github.com/o/r/pull/9" {
+		t.Errorf("results[%q] = %q, want the discovered PR URL", key, got)
+	}
+}
+
+func TestDiscoverBranchPRsOmitsBranchesWithNoOpenPR(t *testing.T) {
+	srv := dispatchGraphQLServer(t, map[string]string{
+		"pullRequests(headRefName:": `{"data": {
+			"repo0": {"branch0": {"nodes": []}},
+			"rateLimit": {"limit": 5000, "remaining": 4999, "resetAt": "2026-09-20T23:00:00Z"}
+		}}`,
+	})
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	results, _, err := c.DiscoverBranchPRs(t.Context(), []GitHubBranchQuery{{Owner: "o", Repo: "r", Branch: "no-pr-yet"}})
+	if err != nil {
+		t.Fatalf("DiscoverBranchPRs() error = %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("results = %v, want empty for a branch with no open PR", results)
+	}
+}
+
+func TestDiscoverBranchPRsBatchesAcrossRepos(t *testing.T) {
+	var graphqlCalls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		graphqlCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data": {
+			"repo0": {"branch0": {"nodes": [{"url": "https://github.com/o/r/pull/1"}]}},
+			"repo1": {"branch0": {"nodes": []}},
+			"rateLimit": {"limit": 5000, "remaining": 4998, "resetAt": "2026-09-20T23:00:00Z"}
+		}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	results, _, err := c.DiscoverBranchPRs(t.Context(), []GitHubBranchQuery{
+		{Owner: "o", Repo: "r", Branch: "feature-x"},
+		{Owner: "x", Repo: "y", Branch: "feature-z"},
+	})
+	if err != nil {
+		t.Fatalf("DiscoverBranchPRs() error = %v", err)
+	}
+	if graphqlCalls != 1 {
+		t.Errorf("graphql requests = %d, want 1 (one batched call across both repos)", graphqlCalls)
+	}
+	if len(results) != 1 || results[GitHubBranchKey("o", "r", "feature-x")] != "https://github.com/o/r/pull/1" {
+		t.Errorf("results = %v, want just o/r's discovered PR", results)
+	}
+}
+
 // dispatchGraphQLServer serves POST /graphql, picking a canned response body
 // by matching a substring against the request's query text — each of
 // FindReview/DismissReview/RequestReviewer/userID sends a distinctly-shaped
@@ -650,6 +955,44 @@ func dispatchGraphQLServer(t *testing.T, byQuerySubstring map[string]string) *ht
 		t.Fatalf("no canned response matches query: %s", body.Query)
 	})
 	return httptest.NewServer(mux)
+}
+
+func TestSelfLoginReturnsAuthenticatedLogin(t *testing.T) {
+	srv := dispatchGraphQLServer(t, map[string]string{
+		"viewer { login }": `{"data": {"viewer": {"login": "alice"}}}`,
+	})
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	got, err := c.SelfLogin(t.Context())
+	if err != nil {
+		t.Fatalf("SelfLogin() error = %v", err)
+	}
+	if got != "alice" {
+		t.Errorf("SelfLogin() = %q, want %q", got, "alice")
+	}
+}
+
+func TestSelfLoginCachesAcrossCalls(t *testing.T) {
+	var calls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data": {"viewer": {"login": "alice"}}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	for range 3 {
+		if _, err := c.SelfLogin(t.Context()); err != nil {
+			t.Fatalf("SelfLogin() error = %v", err)
+		}
+	}
+	if calls != 1 {
+		t.Errorf("graphql requests = %d, want 1 (cached after the first call)", calls)
+	}
 }
 
 func TestFindReviewMatchesByURL(t *testing.T) {
@@ -750,5 +1093,122 @@ func TestRequestReviewerUnknownUserErrors(t *testing.T) {
 	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
 	if err := c.RequestReviewer(t.Context(), "PR_1", "ghost"); err == nil {
 		t.Error("RequestReviewer() error = nil, want an error for an unresolvable login")
+	}
+}
+
+func TestGitHubCheckerTracksCommentsOfUnresolvedThreads(t *testing.T) {
+	body := strings.Replace(graphqlOpenSuccessBody,
+		`"commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }] }`,
+		`"reviewThreads": { "nodes": [
+        { "id": "t1", "isResolved": false, "comments": { "nodes": [
+          { "id": "c1", "url": "https://github.com/o/r/pull/1#discussion_r1", "author": { "login": "alice" } },
+          { "id": "c2", "url": "https://github.com/o/r/pull/1#discussion_r2", "author": { "login": "bob" } } ] } },
+        { "id": "t2", "isResolved": true, "comments": { "nodes": [
+          { "id": "c3", "url": "https://github.com/o/r/pull/1#discussion_r3", "author": { "login": "alice" } } ] } }
+      ] },
+      "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }] }`,
+		1)
+	srv := fakeGitHubServer(t, body, 0)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	want := []ThreadComment{
+		{ThreadID: "t1", ID: "c1", Author: "alice", Href: "https://github.com/o/r/pull/1#discussion_r1"},
+		{ThreadID: "t1", ID: "c2", Author: "bob", Href: "https://github.com/o/r/pull/1#discussion_r2"},
+	}
+	if !slices.Equal(results[url].ThreadComments, want) {
+		t.Errorf("ThreadComments = %+v, want %+v (only the unresolved thread's comments)", results[url].ThreadComments, want)
+	}
+	if !slices.Equal(results[url].ThreadCommentIDs, []string{"c1", "c2"}) {
+		t.Errorf("ThreadCommentIDs = %v, want [c1 c2]", results[url].ThreadCommentIDs)
+	}
+}
+
+// Probing an upstream repo for a fork's branch: PRs there that come from
+// somebody else's fork under the same branch name must not be adopted.
+func TestDiscoverBranchPRsFiltersByHeadOwner(t *testing.T) {
+	srv := dispatchGraphQLServer(t, map[string]string{
+		"pullRequests(headRefName:": `{"data": {
+			"repo0": {"branch0": {"nodes": [
+				{"url": "https://github.com/up/r/pull/3", "headRepositoryOwner": {"login": "stranger"}},
+				{"url": "https://github.com/up/r/pull/9", "headRepositoryOwner": {"login": "Me"}}
+			]}},
+			"repo1": {"branch0": {"nodes": [
+				{"url": "https://github.com/up/other/pull/4", "headRepositoryOwner": {"login": "stranger"}}
+			]}},
+			"rateLimit": {"limit": 5000, "remaining": 4999, "resetAt": "2026-09-20T23:00:00Z"}
+		}}`,
+	})
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	results, _, err := c.DiscoverBranchPRs(t.Context(), []GitHubBranchQuery{
+		{Owner: "up", Repo: "r", Branch: "feature-x", HeadOwners: []string{"me", "up"}},
+		{Owner: "up", Repo: "other", Branch: "feature-x", HeadOwners: []string{"me", "up"}},
+	})
+	if err != nil {
+		t.Fatalf("DiscoverBranchPRs() error = %v", err)
+	}
+	if got := results[GitHubBranchKey("up", "r", "feature-x")]; got != "https://github.com/up/r/pull/9" {
+		t.Errorf("up/r result = %q, want our own PR (#9, head owner matched case-insensitively), not the stranger's #3", got)
+	}
+	if got, ok := results[GitHubBranchKey("up", "other", "feature-x")]; ok {
+		t.Errorf("up/other result = %q, want none: its only PR is a stranger's", got)
+	}
+}
+
+func TestGitHubCheckerReadsWhyTheEntryLeftTheMergeQueue(t *testing.T) {
+	cases := []struct {
+		name   string
+		nodes  string
+		reason string
+	}{
+		{"removed as merged", `[{"__typename": "AddedToMergeQueueEvent"}, {"__typename": "RemovedFromMergeQueueEvent", "reason": "merged"}]`, "merged"},
+		{"removed as invalidated", `[{"__typename": "AddedToMergeQueueEvent"}, {"__typename": "RemovedFromMergeQueueEvent", "reason": "invalidated"}]`, "invalidated"},
+		// Re-queued after an earlier removal: that old reason says nothing
+		// about the current stint, so it must not be reported.
+		{"queued again after a removal", `[{"__typename": "RemovedFromMergeQueueEvent", "reason": "build_failure"}, {"__typename": "AddedToMergeQueueEvent"}]`, ""},
+		{"never queued", `[]`, ""},
+	}
+	for _, c := range cases {
+		body := strings.Replace(graphqlOpenSuccessBody,
+			`"commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }] }`,
+			`"queueEvents": { "nodes": `+c.nodes+` },
+      "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }] }`,
+			1)
+		srv := fakeGitHubServer(t, body, 0)
+		ch := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+		url := "https://github.com/o/r/pull/1"
+		results, _, err := ch.CheckBatch(t.Context(), []string{url})
+		srv.Close()
+		if err != nil {
+			t.Fatalf("%s: CheckBatch() error = %v", c.name, err)
+		}
+		if got := results[url].MergeQueueRemovalReason; got != c.reason {
+			t.Errorf("%s: MergeQueueRemovalReason = %q, want %q", c.name, got, c.reason)
+		}
+	}
+}
+
+func TestGitHubCheckerReadsTheLatestReviewBody(t *testing.T) {
+	body := strings.Replace(graphqlOpenSuccessBody,
+		`"state": "APPROVED" }] }`,
+		`"state": "COMMENTED", "body": "Please look at the retry logic." }] }`, 1)
+	srv := fakeGitHubServer(t, body, 0)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	if got := results[url].LatestReviewBody; got != "Please look at the retry logic." {
+		t.Errorf("LatestReviewBody = %q, want the review's text", got)
 	}
 }
