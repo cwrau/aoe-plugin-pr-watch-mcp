@@ -1148,3 +1148,64 @@ func TestSilentFirstPollIsSetOnInsertOnlyAndCleared(t *testing.T) {
 		t.Error("re-Add with the flag re-armed a polled registration")
 	}
 }
+
+func TestPersonaAndReviewFlowStateRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	r := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "s1", Provider: "github", NextDueAt: time.Now(), CreatedAt: time.Now(), Persona: PersonaReviewer}
+	if err := s.Add(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, _ := s.Get(ctx, r.PRURL, "s1")
+	if !ok || got.Persona != PersonaReviewer {
+		t.Fatalf("Get() persona = %q", got.Persona)
+	}
+
+	if err := s.UpdateState(ctx, r.PRURL, "s1", StateUpdate{
+		CIBucket: "none", NextDueAt: time.Now(), HeadSHA: "abc", IsDraft: true,
+		RequestedReviewers: []string{"alice", "bob"}, SelfReviewState: "APPROVED",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ = s.Get(ctx, r.PRURL, "s1")
+	if got.HeadSHA != "abc" || !got.IsDraft || !slices.Equal(got.RequestedReviewers, []string{"alice", "bob"}) || got.SelfReviewState != "APPROVED" {
+		t.Errorf("review flow state = %+v", got)
+	}
+	list, _ := s.List(ctx)
+	if len(list) != 1 || list[0].HeadSHA != "abc" || list[0].Persona != PersonaReviewer {
+		t.Errorf("List() = %+v", list)
+	}
+
+	// Registering again with another persona switches it in place.
+	r.Persona = PersonaAuthor
+	if err := s.Add(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ = s.Get(ctx, r.PRURL, "s1")
+	if got.Persona != PersonaAuthor || got.HeadSHA != "abc" {
+		t.Errorf("after re-Add: persona = %q headSHA = %q, want the persona switched and state kept", got.Persona, got.HeadSHA)
+	}
+}
+
+func TestEffectiveEventFilter(t *testing.T) {
+	author := Registration{}
+	if got := author.EffectiveEventFilter(); len(got) != 0 {
+		t.Errorf("author default = %v, want empty (every non-opt-in kind)", got)
+	}
+	reviewer := Registration{Persona: PersonaReviewer}
+	got := reviewer.EffectiveEventFilter()
+	for _, want := range []string{"REVIEW", "COMMENT", "PUSH", "REVIEW_REQUESTED", "READY_FOR_REVIEW", "THREAD_RESOLVED", "MERGED", "CLOSED", "REOPENED"} {
+		if !slices.Contains(got, want) {
+			t.Errorf("reviewer default lacks %s: %v", want, got)
+		}
+	}
+	for _, not := range []string{"CI", "CI_RECOVERED", "CI_SUCCESS", "CONFLICT", "MERGE_QUEUE"} {
+		if slices.Contains(got, not) {
+			t.Errorf("reviewer default has %s: %v", not, got)
+		}
+	}
+	explicit := Registration{Persona: PersonaReviewer, EventFilter: []string{"MERGED"}}
+	if got := explicit.EffectiveEventFilter(); !slices.Equal(got, []string{"MERGED"}) {
+		t.Errorf("explicit events = %v, want them to win", got)
+	}
+}

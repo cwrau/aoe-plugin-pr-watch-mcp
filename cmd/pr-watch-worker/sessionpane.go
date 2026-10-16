@@ -192,13 +192,14 @@ func sessionPaneBlocks(r registry.Registration) []any {
 		// Same event.Kind gating as the home-pane and row-badge: each badge
 		// only shows if this registration's own EventFilter includes its
 		// matching kind (or the filter is empty, meaning every kind).
-		if eventFilterShows(r.EventFilter, "CI") {
+		filter := r.EffectiveEventFilter()
+		if eventFilterShows(filter, "CI") {
 			if ci, ok := ciBadge(r.CIBucket); ok {
 				badges = append(badges, ci)
 			}
 		}
-		if eventFilterShows(r.EventFilter, "REVIEW") {
-			badges = append(badges, reviewBadge(r.LatestReviewState))
+		if eventFilterShows(filter, "REVIEW") {
+			badges = append(badges, reviewBadgeFor(r))
 		}
 	}
 

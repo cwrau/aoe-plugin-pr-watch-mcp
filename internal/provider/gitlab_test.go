@@ -977,3 +977,37 @@ func TestGitLabCheckerWorksWithoutTheApprovalsAPI(t *testing.T) {
 		})
 	}
 }
+
+func TestGitLabCheckerReadsReviewFlowFields(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"state": "opened", "title": "t", "draft": true, "sha": "0123456789abcdef",
+			"reviewers": []map[string]any{{"username": "alice"}, {"username": "bob"}},
+			"pipeline":  map[string]any{"status": "success"},
+		})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": []map[string]any{}, "user_has_approved": true})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "tok", nil }, apiBaseOverride: srv.URL}
+	r, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if r.HeadSHA != "0123456789abcdef" || !r.IsDraft {
+		t.Errorf("head/draft = %q/%v", r.HeadSHA, r.IsDraft)
+	}
+	if !slices.Equal(r.RequestedReviewers, []string{"alice", "bob"}) {
+		t.Errorf("RequestedReviewers = %v", r.RequestedReviewers)
+	}
+	if r.SelfReviewState != "APPROVED" {
+		t.Errorf("SelfReviewState = %q, want APPROVED from user_has_approved", r.SelfReviewState)
+	}
+}

@@ -485,6 +485,10 @@ func stateUpdateFromReg(reg registry.Registration, nextDueAt time.Time) registry
 		MergeQueueState:     reg.MergeQueueState,
 		MergeQueuePosition:  reg.MergeQueuePosition,
 		Blocked:             reg.Blocked,
+		HeadSHA:             reg.HeadSHA,
+		IsDraft:             reg.IsDraft,
+		RequestedReviewers:  reg.RequestedReviewers,
+		SelfReviewState:     reg.SelfReviewState,
 	}
 }
 
@@ -510,6 +514,9 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 		LatestReviewState:   reg.LatestReviewState,
 		LatestReviewer:      reg.LatestReviewer,
 		ReviewHref:          reg.ReviewHref,
+		HeadSHA:             reg.HeadSHA,
+		IsDraft:             reg.IsDraft,
+		RequestedReviewers:  reg.RequestedReviewers,
 	}
 	// The session's own replies are not news to it. They stay in
 	// result.ThreadCommentIDs, so they still count as seen next time.
@@ -567,7 +574,8 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 	// logged above or how the terminal-status handling below behaves — a
 	// PR/MR that's actually merged moves to StatusMerged for every session
 	// watching it regardless of whether that session asked to hear about it.
-	notifyEvents := filterEvents(events, reg.EventFilter)
+	notifyEvents := filterEvents(events, reg.EffectiveEventFilter())
+	notifyEvents = filterReviewRequests(notifyEvents, prev, result, selfAuthor)
 	if len(events) > 0 && len(notifyEvents) == 0 {
 		s.log().Info("ping suppressed", "pr_url", reg.PRURL, "session_id", reg.SessionID, "reason", "filter", "events", len(events))
 	}
@@ -659,6 +667,15 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 		MergeQueueState:     result.MergeQueueState,
 		MergeQueuePosition:  result.MergeQueuePosition,
 		Blocked:             result.Blocked,
+		HeadSHA:             reg.HeadSHA,
+		IsDraft:             reg.IsDraft,
+		RequestedReviewers:  reg.RequestedReviewers,
+		SelfReviewState:     result.SelfReviewState,
+	}
+	// A result that carries no head (a finished GitLab MR's early return)
+	// keeps the stored baseline rather than erasing it.
+	if result.HeadSHA != "" {
+		update.HeadSHA, update.IsDraft, update.RequestedReviewers = result.HeadSHA, result.IsDraft, result.RequestedReviewers
 	}
 	if err := s.Store.UpdateState(pctx, reg.PRURL, reg.SessionID, update); err != nil {
 		s.log().Error("persist new state", "pr_url", reg.PRURL, "error", err)
@@ -779,6 +796,27 @@ func (s *Scheduler) selfAuthor(ctx context.Context, reg registry.Registration) s
 // Event.Message. Same "at most one of this kind per poll" reasoning as
 // REVIEW's result.LatestReviewer check below applies to
 // result.LatestCommentAuthor.
+// filterReviewRequests narrows REVIEW_REQUESTED to the requests that are for
+// the worker's own account (the session reviewing on your behalf): a request
+// for someone else is not news to it. The message then says "you". Without a
+// known own account nothing can be told to be for it, so the events go.
+func filterReviewRequests(events []provider.Event, prev provider.PrevState, result provider.CheckResult, self string) []provider.Event {
+	var out []provider.Event
+	for _, ev := range events {
+		if ev.Kind != "REVIEW_REQUESTED" {
+			out = append(out, ev)
+			continue
+		}
+		if self == "" || !slices.ContainsFunc(result.RequestedReviewers, func(r string) bool { return strings.EqualFold(r, self) }) ||
+			slices.ContainsFunc(prev.RequestedReviewers, func(r string) bool { return strings.EqualFold(r, self) }) {
+			continue
+		}
+		ev.Message = "review requested from you"
+		out = append(out, ev)
+	}
+	return out
+}
+
 func filterSelfAuthored(events []provider.Event, result provider.CheckResult, selfAuthor string) []provider.Event {
 	if selfAuthor == "" {
 		return events

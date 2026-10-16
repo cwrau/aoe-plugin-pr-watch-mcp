@@ -110,3 +110,25 @@ func TestRegisterStartsSilentUnlessReportExisting(t *testing.T) {
 		t.Errorf("report_existing register: FirstPollSilent = (%v, %v), want false", silent, err)
 	}
 }
+
+func TestRegisterStoresPersonaAndRejectsUnknownOnes(t *testing.T) {
+	store := openTestStore(t)
+	srv := httptest.NewServer(NewHandler(store, &fakeGitHubReviewClient{}, &fakeSessionValidator{}, &fakeUIPusher{}))
+	t.Cleanup(srv.Close)
+	ctx := context.Background()
+
+	callTool(t, srv, "register", map[string]any{"pr_urls": []string{"https://github.com/o/r/pull/1"}, "session_id": "sess1", "persona": "reviewer"})
+	callTool(t, srv, "register", map[string]any{"pr_urls": []string{"https://github.com/o/r/pull/2"}, "session_id": "sess1"})
+	callToolExpectError(t, srv, "register", map[string]any{"pr_urls": []string{"https://github.com/o/r/pull/3"}, "session_id": "sess1", "persona": "boss"})
+	callTool(t, srv, "register", map[string]any{"pr_urls": []string{"https://github.com/o/r/pull/4"}, "session_id": "sess1", "events": []string{"PUSH", "REVIEW_REQUESTED", "READY_FOR_REVIEW", "DRAFTED", "THREAD_RESOLVED"}})
+
+	if got, _, _ := store.Get(ctx, "https://github.com/o/r/pull/1", "sess1"); got.Persona != "reviewer" {
+		t.Errorf("persona = %q, want reviewer", got.Persona)
+	}
+	if got, _, _ := store.Get(ctx, "https://github.com/o/r/pull/2", "sess1"); got.Persona != "author" {
+		t.Errorf("default persona = %q, want author", got.Persona)
+	}
+	if _, ok, _ := store.Get(ctx, "https://github.com/o/r/pull/3", "sess1"); ok {
+		t.Error("a registration with an unknown persona was stored")
+	}
+}

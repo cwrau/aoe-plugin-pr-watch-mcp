@@ -745,3 +745,65 @@ func TestRowBadgePayloadIsUntouchedWhenItFits(t *testing.T) {
 		}
 	}
 }
+
+func reviewerReg(mut func(*registry.Registration)) registry.Registration {
+	r := registry.Registration{
+		PRURL: "https://github.com/org/repo/pull/7", SessionID: "sess1", Provider: "github", Persona: registry.PersonaReviewer,
+		Title: "Fix it", CIBucket: "failure", HasConflict: true, MergeQueueState: "QUEUED", MergeQueuePosition: 2,
+		LatestReviewState: "CHANGES_REQUESTED", LatestReviewer: "bob",
+	}
+	if mut != nil {
+		mut(&r)
+	}
+	return r
+}
+
+// A reviewer's badge is the plain PR chip plus one review chip about the
+// reviewer's own progress: nothing about CI, conflicts, the merge queue or
+// other people's verdicts.
+func TestReviewerBadgeShowsOnlyThePRAndOwnReviewProgress(t *testing.T) {
+	items := buildRowBadgePayloads([]registry.Registration{reviewerReg(nil)})["sess1"].Items
+	if len(items) != 2 {
+		t.Fatalf("chips = %+v, want the eye and one review chip", items)
+	}
+	eye, review := items[0], items[1]
+	if eye.Icon != "eye" || eye.Tone != "neutral" || strings.Contains(eye.Tooltip, "conflict") || strings.Contains(eye.Tooltip, "queue") {
+		t.Errorf("eye = %+v, want the plain PR chip without conflict or queue state", eye)
+	}
+	if review.Text != "in progress" || review.Tone != "info" {
+		t.Errorf("review = %+v, want in progress until the reviewer approves", review)
+	}
+}
+
+func TestReviewerReviewChipTracksOwnApprovalOnly(t *testing.T) {
+	approved := buildRowBadgePayloads([]registry.Registration{reviewerReg(func(r *registry.Registration) { r.SelfReviewState = "APPROVED" })})["sess1"].Items
+	if got := approved[len(approved)-1]; got.Text != "approved" || got.Tone != "success" {
+		t.Errorf("own approval chip = %+v", got)
+	}
+
+	// Someone else approving is not the reviewer's own approval.
+	others := buildRowBadgePayloads([]registry.Registration{reviewerReg(func(r *registry.Registration) { r.LatestReviewState = "APPROVED" })})["sess1"].Items
+	if got := others[len(others)-1]; got.Text != "in progress" {
+		t.Errorf("chip with only another's approval = %+v, want in progress", got)
+	}
+
+	changes := buildRowBadgePayloads([]registry.Registration{reviewerReg(func(r *registry.Registration) { r.SelfReviewState = "CHANGES_REQUESTED" })})["sess1"].Items
+	if got := changes[len(changes)-1]; got.Text != "in progress" || !strings.Contains(got.Tooltip, "CHANGES_REQUESTED") {
+		t.Errorf("own changes-requested chip = %+v, want in progress naming it", got)
+	}
+}
+
+// Conflict and queue colouring on the eye chip follows the events filter like
+// the other chips, so a watch that is not told about conflicts does not wear
+// one.
+func TestEyeChipHonoursTheEventsFilterForConflictAndQueue(t *testing.T) {
+	r := registry.Registration{PRURL: "https://github.com/org/repo/pull/7", SessionID: "sess1", Provider: "github", HasConflict: true, MergeQueueState: "QUEUED", EventFilter: []string{"MERGED"}}
+	eye := buildRowBadgePayloads([]registry.Registration{r})["sess1"].Items[0]
+	if eye.Tone != "neutral" {
+		t.Errorf("eye tone = %q, want neutral for a watch that does not follow conflicts or the queue", eye.Tone)
+	}
+	r.EventFilter = nil
+	if eye := buildRowBadgePayloads([]registry.Registration{r})["sess1"].Items[0]; eye.Tone != "danger" {
+		t.Errorf("unfiltered eye tone = %q, want danger for the conflict", eye.Tone)
+	}
+}

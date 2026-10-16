@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -379,5 +380,43 @@ func TestBuildHomePanePayloadSectionCountMatchesRegistrations(t *testing.T) {
 	}
 	if len(sec.Children) != 2 {
 		t.Errorf("section.Children len = %d, want 2", len(sec.Children))
+	}
+}
+
+func TestReviewerRowsShowNoCIOrConflictAndOwnReviewProgress(t *testing.T) {
+	reg := registry.Registration{
+		PRURL: "https://github.com/org/repo/pull/7", SessionID: "sess1", Provider: "github", Persona: registry.PersonaReviewer,
+		Status: registry.StatusWatching, CIBucket: "failure", HasConflict: true, LatestReviewState: "APPROVED",
+	}
+	texts := func(badges []rowBadge) []string {
+		var out []string
+		for _, b := range badges {
+			out = append(out, b.Text)
+		}
+		return out
+	}
+	want := []string{"GH", "in progress"}
+
+	home := buildHomePanePayload([]registry.Registration{reg}, func(string) string { return "" })
+	prRow := home.Blocks[0].(sectionBlock).Children[0].(columnsBlock).Children[0].(rowBlock)
+	if got := texts(prRow.Badges); !slices.Equal(got, want) {
+		t.Errorf("home pane badges = %v, want %v", got, want)
+	}
+
+	var sessionRow rowBlock
+	for _, b := range sessionPaneBlocks(reg) {
+		if r, ok := b.(rowBlock); ok && len(r.Badges) > 0 {
+			sessionRow = r
+			break
+		}
+	}
+	if got := texts(sessionRow.Badges); !slices.Equal(got, []string{"in progress"}) {
+		t.Errorf("session pane badges = %v, want just the review progress", got)
+	}
+
+	reg.SelfReviewState = "APPROVED"
+	prRow = buildHomePanePayload([]registry.Registration{reg}, func(string) string { return "" }).Blocks[0].(sectionBlock).Children[0].(columnsBlock).Children[0].(rowBlock)
+	if got := texts(prRow.Badges); !slices.Equal(got, []string{"GH", "approved"}) {
+		t.Errorf("home pane badges after own approval = %v", got)
 	}
 }

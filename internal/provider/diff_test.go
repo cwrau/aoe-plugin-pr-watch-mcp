@@ -670,3 +670,89 @@ func TestDiffCIRecoveryFiresBothSuccessKinds(t *testing.T) {
 		t.Errorf("Diff() = %+v, want CI_RECOVERED and CI_SUCCESS", got)
 	}
 }
+
+// The review-flow events need a stored baseline (a head commit); without one
+// none of them can fire, resolved threads included.
+func TestDiffReviewFlowEventsNeedABaseline(t *testing.T) {
+	prev := PrevState{UnresolvedThreadIDs: []string{"t1"}, RequestedReviewers: nil}
+	cur := CheckResult{State: "open", HeadSHA: "bbb", IsDraft: true, RequestedReviewers: []string{"me"}}
+	if got := Diff(prev, cur); len(got) != 0 {
+		t.Errorf("Diff() without baseline = %+v, want nothing", got)
+	}
+}
+
+func kinds(events []Event) []string {
+	var out []string
+	for _, e := range events {
+		out = append(out, e.Kind)
+	}
+	return out
+}
+
+func TestDiffPushFiresWhenTheHeadMoves(t *testing.T) {
+	prev := PrevState{HeadSHA: "aaaaaaa111"}
+	got := Diff(prev, CheckResult{State: "open", HeadSHA: "bbbbbbb222", HeadAuthor: "alice"})
+	if len(got) != 1 || got[0].Kind != "PUSH" || got[0].Message != "new commits by alice, head now bbbbbbb" {
+		t.Fatalf("Diff() = %+v, want one PUSH naming the author and the short head", got)
+	}
+
+	got = Diff(prev, CheckResult{State: "open", HeadSHA: "bbbbbbb222", ForcePushed: true})
+	if len(got) != 1 || got[0].Message != "force-push, head now bbbbbbb" {
+		t.Errorf("force-push Diff() = %+v", got)
+	}
+
+	if got := Diff(prev, CheckResult{State: "open", HeadSHA: "aaaaaaa111"}); len(got) != 0 {
+		t.Errorf("unchanged head produced %+v", got)
+	}
+	// No baseline yet (a row from before this tracking, or its first poll):
+	// the head being "new" is no news.
+	if got := Diff(PrevState{}, CheckResult{State: "open", HeadSHA: "bbbbbbb222"}); len(got) != 0 {
+		t.Errorf("unknown baseline produced %+v", got)
+	}
+}
+
+func TestDiffDraftTransitions(t *testing.T) {
+	base := PrevState{HeadSHA: "aaa"}
+	cur := CheckResult{State: "open", HeadSHA: "aaa"}
+
+	prevDraft := base
+	prevDraft.IsDraft = true
+	if got := kinds(Diff(prevDraft, cur)); len(got) != 1 || got[0] != "READY_FOR_REVIEW" {
+		t.Errorf("draft -> ready kinds = %v", got)
+	}
+	cur.IsDraft = true
+	if got := kinds(Diff(base, cur)); len(got) != 1 || got[0] != "DRAFTED" {
+		t.Errorf("ready -> draft kinds = %v", got)
+	}
+	if got := Diff(prevDraft, cur); len(got) != 0 {
+		t.Errorf("still a draft produced %+v", got)
+	}
+	// Baseline unknown: no transition can be claimed.
+	if got := Diff(PrevState{IsDraft: true}, CheckResult{State: "open", HeadSHA: "aaa"}); len(got) != 0 {
+		t.Errorf("unknown baseline produced %+v", got)
+	}
+}
+
+func TestDiffReviewRequestedNamesNewlyRequestedReviewers(t *testing.T) {
+	prev := PrevState{HeadSHA: "aaa", RequestedReviewers: []string{"bob"}}
+	got := Diff(prev, CheckResult{State: "open", HeadSHA: "aaa", RequestedReviewers: []string{"bob", "carol", "dave"}})
+	if len(got) != 1 || got[0].Kind != "REVIEW_REQUESTED" || got[0].Message != "review requested from carol, dave" {
+		t.Fatalf("Diff() = %+v", got)
+	}
+	if got := Diff(prev, CheckResult{State: "open", HeadSHA: "aaa", RequestedReviewers: []string{"bob"}}); len(got) != 0 {
+		t.Errorf("same requests produced %+v", got)
+	}
+}
+
+func TestDiffThreadResolved(t *testing.T) {
+	prev := PrevState{HeadSHA: "aaa", UnresolvedThreadIDs: []string{"t1", "t2", "t3"}}
+	got := Diff(prev, CheckResult{State: "open", HeadSHA: "aaa", UnresolvedThreadIDs: []string{"t3"}})
+	if len(got) != 1 || got[0].Kind != "THREAD_RESOLVED" || got[0].Message != "2 thread(s) resolved, 1 unresolved left" {
+		t.Fatalf("Diff() = %+v", got)
+	}
+	// A resolve and a new thread in one window: both are reported.
+	got = Diff(prev, CheckResult{State: "open", HeadSHA: "aaa", UnresolvedThreadIDs: []string{"t2", "t3", "t4"}})
+	if k := kinds(got); len(k) != 2 {
+		t.Errorf("resolve + new thread kinds = %v, want COMMENT and THREAD_RESOLVED", k)
+	}
+}

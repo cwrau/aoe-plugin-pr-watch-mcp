@@ -72,6 +72,7 @@ func Diff(prev PrevState, cur CheckResult) []Event {
 	if cur.HasConflict && !prev.HasConflict {
 		events = append(events, Event{Kind: "CONFLICT", Message: "has a merge conflict with its target branch"})
 	}
+	events = append(events, reviewFlowEvents(prev, cur)...)
 	// A review that was there last check and isn't anymore, with nothing
 	// newer replacing it (that's the REVIEW case above instead) — GitHub's
 	// branch-protection "dismiss stale approvals on push" and GitLab's
@@ -90,6 +91,47 @@ func Diff(prev PrevState, cur CheckResult) []Event {
 			Message: fmt.Sprintf("%s's %s review was dismissed", prev.LatestReviewer, prev.LatestReviewState),
 			Href:    prev.ReviewHref,
 		})
+	}
+	return events
+}
+
+// reviewFlowEvents are the events a reviewer follows: new commits, a review
+// being requested, the draft flag flipping, and threads getting resolved.
+// All are opt-in (see OptInEventKinds). Without a stored head there is no
+// baseline for the first three, so they stay silent until one poll has
+// recorded it.
+func reviewFlowEvents(prev PrevState, cur CheckResult) []Event {
+	var events []Event
+	if prev.HeadSHA != "" && cur.HeadSHA != "" {
+		if cur.HeadSHA != prev.HeadSHA {
+			what := "new commits"
+			switch {
+			case cur.ForcePushed:
+				what = "force-push"
+			case cur.HeadAuthor != "":
+				what += " by " + cur.HeadAuthor
+			}
+			short := cur.HeadSHA
+			if len(short) > 7 {
+				short = short[:7]
+			}
+			events = append(events, Event{Kind: "PUSH", Message: fmt.Sprintf("%s, head now %s", what, short)})
+		}
+		if prev.IsDraft && !cur.IsDraft {
+			events = append(events, Event{Kind: "READY_FOR_REVIEW", Message: "is ready for review"})
+		}
+		if !prev.IsDraft && cur.IsDraft {
+			events = append(events, Event{Kind: "DRAFTED", Message: "is a draft again"})
+		}
+		if added := newIDsIn(prev.RequestedReviewers, cur.RequestedReviewers); len(added) > 0 {
+			events = append(events, Event{Kind: "REVIEW_REQUESTED", Message: "review requested from " + strings.Join(added, ", ")})
+		}
+		if gone := newIDsIn(cur.UnresolvedThreadIDs, prev.UnresolvedThreadIDs); len(gone) > 0 {
+			events = append(events, Event{
+				Kind:    "THREAD_RESOLVED",
+				Message: fmt.Sprintf("%d thread(s) resolved, %d unresolved left", len(gone), len(cur.UnresolvedThreadIDs)),
+			})
+		}
 	}
 	return events
 }

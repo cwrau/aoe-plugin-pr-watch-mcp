@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -60,6 +61,43 @@ type Registration struct {
 	ThreadCommentIDs    []string  // IDs of the comments in unresolved threads as of the last check; compared by identity to spot a reply in an existing thread
 	ThreadCommentsKnown bool      // false until a first check has stored ThreadCommentIDs: without a baseline every existing reply would look new
 	EventFilter         []string  // provider.Event Kind values (e.g. "MERGED") this session wants notified; empty/nil means every kind. Set at register time; a later register call for the same (pr_url, session_id) with a different filter just replaces it.
+
+	// Persona is who the session is on this PR/MR (PersonaAuthor, the default
+	// when empty, or PersonaReviewer). It only sets what is notified and shown
+	// when EventFilter is empty, see EffectiveEventFilter.
+	Persona string
+	// Review-flow state, the baseline for PUSH, READY_FOR_REVIEW/DRAFTED,
+	// REVIEW_REQUESTED and the reviewer's own review chip.
+	HeadSHA            string
+	IsDraft            bool
+	RequestedReviewers []string
+	SelfReviewState    string // the worker's own account's latest review state; empty if none
+}
+
+const (
+	PersonaAuthor   = "author"   // watches its own PR/MR: CI, conflicts and reviews matter
+	PersonaReviewer = "reviewer" // reviews someone else's PR/MR: new commits and review requests matter, CI does not
+)
+
+// reviewerEvents is a reviewer session's default event set: what happens to
+// the PR/MR from the reviewing seat. CI, conflicts and merge queue are the
+// author's business.
+var reviewerEvents = []string{
+	"REVIEW", "REVIEW_DISMISSED", "COMMENT", "PUSH", "REVIEW_REQUESTED",
+	"READY_FOR_REVIEW", "DRAFTED", "THREAD_RESOLVED", "REOPENED", "MERGED", "CLOSED",
+}
+
+// EffectiveEventFilter is the event filter that applies: the explicit one the
+// session registered with, else its persona's default. Empty means every kind
+// except the opt-in ones, as ever.
+func (r Registration) EffectiveEventFilter() []string {
+	if len(r.EventFilter) > 0 {
+		return r.EventFilter
+	}
+	if r.Persona == PersonaReviewer {
+		return slices.Clone(reviewerEvents)
+	}
+	return nil
 }
 
 type Store struct {
@@ -104,6 +142,11 @@ CREATE TABLE IF NOT EXISTS registrations (
 	thread_comment_ids TEXT NOT NULL DEFAULT 'null',
 	closed_at INTEGER NOT NULL DEFAULT 0,
 	silent_first_poll INTEGER NOT NULL DEFAULT 0,
+	persona TEXT NOT NULL DEFAULT '',
+	head_sha TEXT NOT NULL DEFAULT '',
+	is_draft INTEGER NOT NULL DEFAULT 0,
+	requested_reviewers TEXT NOT NULL DEFAULT '[]',
+	self_review_state TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (pr_url, session_id)
 );
 
@@ -204,6 +247,11 @@ var columnMigrations = []string{
 	// 1 until the first poll has been taken as the baseline, see
 	// Registration.SilentFirstPoll. Not part of registrationColumns either.
 	`ALTER TABLE registrations ADD COLUMN silent_first_poll INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE registrations ADD COLUMN persona TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE registrations ADD COLUMN head_sha TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE registrations ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE registrations ADD COLUMN requested_reviewers TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE registrations ADD COLUMN self_review_state TEXT NOT NULL DEFAULT ''`,
 }
 
 // autoDiscoveryColumnMigrations add the columns auto_discovery gained after
@@ -320,10 +368,10 @@ func (s *Store) Close() error { return s.db.Close() }
 // resumes being watched.
 func (s *Store) Add(ctx context.Context, r Registration) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, ci_detail, ci_href, review_href, unresolved_thread_ids, top_level_comment_ids, latest_comment_href, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked, dismissed_review_href, event_filter, silent_first_poll)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(pr_url, session_id) DO UPDATE SET next_due_at = excluded.next_due_at, status = excluded.status, event_filter = excluded.event_filter
-	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.CIDetail, r.CIHref, r.ReviewHref, marshalStrings(r.UnresolvedThreadIDs), marshalStrings(r.TopLevelCommentIDs), r.LatestCommentHref, r.LatestReviewState, r.LatestReviewer, unixOrZero(r.LatestReviewAt), r.Title, r.Description, StatusWatching, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix(), unixOrZero(r.MergedAt), boolToInt(r.HasConflict), r.MergeQueueState, r.MergeQueuePosition, boolToInt(r.Blocked), r.DismissedReviewHref, marshalStrings(r.EventFilter), boolToInt(r.SilentFirstPoll))
+		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, ci_detail, ci_href, review_href, unresolved_thread_ids, top_level_comment_ids, latest_comment_href, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked, dismissed_review_href, event_filter, silent_first_poll, persona)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(pr_url, session_id) DO UPDATE SET next_due_at = excluded.next_due_at, status = excluded.status, event_filter = excluded.event_filter, persona = excluded.persona
+	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.CIDetail, r.CIHref, r.ReviewHref, marshalStrings(r.UnresolvedThreadIDs), marshalStrings(r.TopLevelCommentIDs), r.LatestCommentHref, r.LatestReviewState, r.LatestReviewer, unixOrZero(r.LatestReviewAt), r.Title, r.Description, StatusWatching, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix(), unixOrZero(r.MergedAt), boolToInt(r.HasConflict), r.MergeQueueState, r.MergeQueuePosition, boolToInt(r.Blocked), r.DismissedReviewHref, marshalStrings(r.EventFilter), boolToInt(r.SilentFirstPoll), r.Persona)
 	if err != nil {
 		return fmt.Errorf("add registration: %w", err)
 	}
@@ -365,9 +413,9 @@ func (s *Store) Get(ctx context.Context, prURL, sessionID string) (Registration,
 
 	var r Registration
 	var nextDue, created, latestReviewAt, mergedAt int64
-	var archived, hasConflict, blocked, ciWasFailing int
-	var unresolvedThreadIDs, topLevelCommentIDs, eventFilter, threadCommentIDs string
-	if err := row.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &ciWasFailing, &r.CIDetail, &r.CIHref, &r.ReviewHref, &unresolvedThreadIDs, &topLevelCommentIDs, &r.LatestCommentHref, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt, &hasConflict, &r.MergeQueueState, &r.MergeQueuePosition, &blocked, &r.DismissedReviewHref, &eventFilter, &threadCommentIDs); err != nil {
+	var archived, hasConflict, blocked, ciWasFailing, isDraft int
+	var unresolvedThreadIDs, topLevelCommentIDs, eventFilter, threadCommentIDs, requestedReviewers string
+	if err := row.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &ciWasFailing, &r.CIDetail, &r.CIHref, &r.ReviewHref, &unresolvedThreadIDs, &topLevelCommentIDs, &r.LatestCommentHref, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt, &hasConflict, &r.MergeQueueState, &r.MergeQueuePosition, &blocked, &r.DismissedReviewHref, &eventFilter, &threadCommentIDs, &r.Persona, &r.HeadSHA, &isDraft, &requestedReviewers, &r.SelfReviewState); err != nil {
 		if err == sql.ErrNoRows {
 			return Registration{}, false, nil
 		}
@@ -385,6 +433,8 @@ func (s *Store) Get(ctx context.Context, prURL, sessionID string) (Registration,
 	r.TopLevelCommentIDs = unmarshalStrings(topLevelCommentIDs)
 	r.EventFilter = unmarshalStrings(eventFilter)
 	r.ThreadCommentIDs, r.ThreadCommentsKnown = unmarshalBaseline(threadCommentIDs)
+	r.IsDraft = isDraft != 0
+	r.RequestedReviewers = unmarshalStrings(requestedReviewers)
 	return r, true, nil
 }
 
@@ -523,6 +573,10 @@ type StateUpdate struct {
 	MergeQueueState     string
 	MergeQueuePosition  int
 	Blocked             bool
+	HeadSHA             string
+	IsDraft             bool
+	RequestedReviewers  []string
+	SelfReviewState     string
 }
 
 // UpdateState persists one poll result for sessionID's own registration on
@@ -532,8 +586,8 @@ type StateUpdate struct {
 // whichever session's row the scheduler processes last in a tick clobber
 // every other session's row sharing that PR/MR.
 func (s *Store) UpdateState(ctx context.Context, prURL, sessionID string, u StateUpdate) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE registrations SET review_count = ?, ci_bucket = ?, ci_was_failing = ?, ci_detail = ?, ci_href = ?, review_href = ?, unresolved_thread_ids = ?, top_level_comment_ids = ?, latest_comment_href = ?, latest_review_state = ?, latest_reviewer = ?, latest_review_at = ?, title = ?, description = ?, next_due_at = ?, has_conflict = ?, merge_queue_state = ?, merge_queue_position = ?, blocked = ?, thread_comment_ids = ? WHERE pr_url = ? AND session_id = ?`,
-		u.ReviewCount, u.CIBucket, boolToInt(u.CIWasFailing), u.CIDetail, u.CIHref, u.ReviewHref, marshalStrings(u.UnresolvedThreadIDs), marshalStrings(u.TopLevelCommentIDs), u.LatestCommentHref, u.LatestReviewState, u.LatestReviewer, unixOrZero(u.LatestReviewAt), u.Title, u.Description, u.NextDueAt.Unix(), boolToInt(u.HasConflict), u.MergeQueueState, u.MergeQueuePosition, boolToInt(u.Blocked), marshalBaseline(u.ThreadCommentIDs, u.ThreadCommentsKnown), prURL, sessionID)
+	_, err := s.db.ExecContext(ctx, `UPDATE registrations SET review_count = ?, ci_bucket = ?, ci_was_failing = ?, ci_detail = ?, ci_href = ?, review_href = ?, unresolved_thread_ids = ?, top_level_comment_ids = ?, latest_comment_href = ?, latest_review_state = ?, latest_reviewer = ?, latest_review_at = ?, title = ?, description = ?, next_due_at = ?, has_conflict = ?, merge_queue_state = ?, merge_queue_position = ?, blocked = ?, thread_comment_ids = ?, head_sha = ?, is_draft = ?, requested_reviewers = ?, self_review_state = ? WHERE pr_url = ? AND session_id = ?`,
+		u.ReviewCount, u.CIBucket, boolToInt(u.CIWasFailing), u.CIDetail, u.CIHref, u.ReviewHref, marshalStrings(u.UnresolvedThreadIDs), marshalStrings(u.TopLevelCommentIDs), u.LatestCommentHref, u.LatestReviewState, u.LatestReviewer, unixOrZero(u.LatestReviewAt), u.Title, u.Description, u.NextDueAt.Unix(), boolToInt(u.HasConflict), u.MergeQueueState, u.MergeQueuePosition, boolToInt(u.Blocked), marshalBaseline(u.ThreadCommentIDs, u.ThreadCommentsKnown), u.HeadSHA, boolToInt(u.IsDraft), marshalStrings(u.RequestedReviewers), u.SelfReviewState, prURL, sessionID)
 	if err != nil {
 		return fmt.Errorf("update state: %w", err)
 	}
@@ -625,9 +679,9 @@ func scanAll(rows *sql.Rows) ([]Registration, error) {
 	for rows.Next() {
 		var r Registration
 		var nextDue, created, latestReviewAt, mergedAt int64
-		var archived, hasConflict, blocked, ciWasFailing int
-		var unresolvedThreadIDs, topLevelCommentIDs, eventFilter, threadCommentIDs string
-		if err := rows.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &ciWasFailing, &r.CIDetail, &r.CIHref, &r.ReviewHref, &unresolvedThreadIDs, &topLevelCommentIDs, &r.LatestCommentHref, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt, &hasConflict, &r.MergeQueueState, &r.MergeQueuePosition, &blocked, &r.DismissedReviewHref, &eventFilter, &threadCommentIDs); err != nil {
+		var archived, hasConflict, blocked, ciWasFailing, isDraft int
+		var unresolvedThreadIDs, topLevelCommentIDs, eventFilter, threadCommentIDs, requestedReviewers string
+		if err := rows.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &ciWasFailing, &r.CIDetail, &r.CIHref, &r.ReviewHref, &unresolvedThreadIDs, &topLevelCommentIDs, &r.LatestCommentHref, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt, &hasConflict, &r.MergeQueueState, &r.MergeQueuePosition, &blocked, &r.DismissedReviewHref, &eventFilter, &threadCommentIDs, &r.Persona, &r.HeadSHA, &isDraft, &requestedReviewers, &r.SelfReviewState); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
 		r.NextDueAt = time.Unix(nextDue, 0)
@@ -642,6 +696,8 @@ func scanAll(rows *sql.Rows) ([]Registration, error) {
 		r.TopLevelCommentIDs = unmarshalStrings(topLevelCommentIDs)
 		r.EventFilter = unmarshalStrings(eventFilter)
 		r.ThreadCommentIDs, r.ThreadCommentsKnown = unmarshalBaseline(threadCommentIDs)
+		r.IsDraft = isDraft != 0
+		r.RequestedReviewers = unmarshalStrings(requestedReviewers)
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
@@ -661,7 +717,7 @@ func boolToInt(b bool) int {
 // scan order, shared by every SELECT * from registrations — Get, List, and
 // DueBefore must agree on exactly this order or Scan silently assigns the
 // wrong value to the wrong field.
-const registrationColumns = `pr_url, session_id, provider, review_count, ci_bucket, ci_was_failing, ci_detail, ci_href, review_href, unresolved_thread_ids, top_level_comment_ids, latest_comment_href, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked, dismissed_review_href, event_filter, thread_comment_ids`
+const registrationColumns = `pr_url, session_id, provider, review_count, ci_bucket, ci_was_failing, ci_detail, ci_href, review_href, unresolved_thread_ids, top_level_comment_ids, latest_comment_href, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked, dismissed_review_href, event_filter, thread_comment_ids, persona, head_sha, is_draft, requested_reviewers, self_review_state`
 
 // marshalStrings encodes a string slice as a JSON array for storage — "[]"
 // for an empty/nil slice rather than "null", so unmarshalStrings never has

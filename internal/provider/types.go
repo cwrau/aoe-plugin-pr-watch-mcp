@@ -24,6 +24,14 @@ type PrevState struct {
 	// replies are not reported until one check has stored it.
 	ThreadCommentIDs    []string
 	ThreadCommentsKnown bool
+
+	// HeadSHA, IsDraft and RequestedReviewers are the baseline for PUSH,
+	// READY_FOR_REVIEW/DRAFTED and REVIEW_REQUESTED. An empty HeadSHA means no
+	// baseline has been stored yet, and none of those events can fire: with
+	// nothing to compare against, the current values would all look new.
+	HeadSHA            string
+	IsDraft            bool
+	RequestedReviewers []string
 }
 
 // CheckResult is one provider's raw poll result for a single PR/MR.
@@ -53,6 +61,12 @@ type CheckResult struct {
 	MergeQueuePosition      int               // this entry's position in the merge queue; meaningless when MergeQueueState == ""
 	MergeQueueRemovalReason string            // GitHub's recorded reason the PR left the merge queue ("merged", "invalidated", ...) when its latest queue event is a removal; empty if it is still queued, was never queued, or the removal is not recorded yet
 	Blocked                 bool              // GitLab only: true if blocked on an unmerged merge request dependency (always false for GitHub, which has no such dependency feature)
+	HeadSHA                 string            // the head commit of the PR/MR's source branch; empty if the provider did not report it
+	HeadAuthor              string            // login of the newest commit's author, when the provider says; empty otherwise
+	ForcePushed             bool              // true if the head was last moved by a force-push (GitHub only)
+	IsDraft                 bool              // true while the PR/MR is a draft
+	RequestedReviewers      []string          // logins/usernames a review is currently requested from (teams are not listed)
+	SelfReviewState         string            // the worker's own account's latest review state ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"), empty if it has none or it was dismissed; GitLab only ever reports "APPROVED"
 }
 
 // ThreadComment is one comment inside an unresolved review thread.
@@ -81,10 +95,17 @@ func (r *CheckResult) ExcludeThreadCommentsBy(author string) {
 
 // OptInEventKinds are the event kinds a registration only gets when its events
 // filter names them: an empty filter means every kind except these.
-var OptInEventKinds = map[string]bool{"CI_SUCCESS": true}
+var OptInEventKinds = map[string]bool{
+	"CI_SUCCESS":       true,
+	"PUSH":             true,
+	"REVIEW_REQUESTED": true,
+	"READY_FOR_REVIEW": true,
+	"DRAFTED":          true,
+	"THREAD_RESOLVED":  true,
+}
 
 type Event struct {
-	Kind    string // "REVIEW" | "REVIEW_DISMISSED" | "COMMENT" | "CI" | "CI_RECOVERED" | "CI_SUCCESS" | "CONFLICT" | "MERGED" | "CLOSED" | "REOPENED" | "MERGE_QUEUE"
+	Kind    string // "REVIEW" | "REVIEW_DISMISSED" | "COMMENT" | "CI" | "CI_RECOVERED" | "CI_SUCCESS" | "CONFLICT" | "MERGED" | "CLOSED" | "REOPENED" | "MERGE_QUEUE" | "PUSH" | "REVIEW_REQUESTED" | "READY_FOR_REVIEW" | "DRAFTED" | "THREAD_RESOLVED"
 	Message string
 	Href    string // link to the source of this event (comment, review, or CI job/run); empty if none applies
 }

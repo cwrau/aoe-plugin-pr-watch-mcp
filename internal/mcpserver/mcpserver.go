@@ -20,7 +20,8 @@ type registerInput struct {
 	ReportExisting bool     `json:"report_existing,omitempty" jsonschema:"optional: send a ping for the activity the PR/MR already has (reviews, comments, failing CI, conflict) on the first poll; by default that first poll is only recorded as the baseline and stays silent, and later changes ping as usual"`
 	PRURLs         []string `json:"pr_urls" jsonschema:"one or more GitHub PR or GitLab MR URLs to watch — a single-element list registers just one, same as before"`
 	SessionID      string   `json:"session_id" jsonschema:"the calling AoE session's id — pass $AOE_ARTIFACT_DIR's raw value directly, its basename is extracted automatically, no need to run basename yourself"`
-	Events         []string `json:"events,omitempty" jsonschema:"optional: only notify for these event kinds (REVIEW, REVIEW_DISMISSED, COMMENT, CI, CI_RECOVERED, CI_SUCCESS, CONFLICT, MERGED, CLOSED, REOPENED, MERGE_QUEUE), e.g. [\"MERGED\"] to only hear about the merge; omit for every kind. Applies to every URL in pr_urls alike. Re-registering the same pr_url/session_id with a different events list just replaces the filter, same as register's other idempotent-refresh behavior."`
+	Events         []string `json:"events,omitempty" jsonschema:"optional: only notify for these event kinds (REVIEW, REVIEW_DISMISSED, COMMENT, CI, CI_RECOVERED, CI_SUCCESS, CONFLICT, MERGED, CLOSED, REOPENED, MERGE_QUEUE, PUSH, REVIEW_REQUESTED, READY_FOR_REVIEW, DRAFTED, THREAD_RESOLVED), e.g. [\"MERGED\"] to only hear about the merge; omit for the persona's default kinds. Applies to every URL in pr_urls alike. Re-registering the same pr_url/session_id with a different events list just replaces the filter, same as register's other idempotent-refresh behavior."`
+	Persona        string   `json:"persona,omitempty" jsonschema:"optional: author (default: you watch your own PR/MR, so CI, conflicts, reviews and comments matter) or reviewer (you review someone else's PR/MR: new commits, review requests for you, draft changes and resolved threads matter, CI and conflicts do not, and the row badge shows only the PR and your own review progress). Only sets the default events and badge; an explicit events list always wins."`
 }
 
 // registerResult is one pr_urls entry's own outcome — register never fails
@@ -147,6 +148,11 @@ var validEventKinds = map[string]bool{
 	"MERGED":           true,
 	"CLOSED":           true,
 	"MERGE_QUEUE":      true,
+	"PUSH":             true,
+	"REVIEW_REQUESTED": true,
+	"READY_FOR_REVIEW": true,
+	"DRAFTED":          true,
+	"THREAD_RESOLVED":  true,
 }
 
 // validateEventFilter rejects an events list containing anything Diff could
@@ -155,7 +161,7 @@ var validEventKinds = map[string]bool{
 func validateEventFilter(events []string) error {
 	for _, kind := range events {
 		if !validEventKinds[kind] {
-			return fmt.Errorf("events entry %q is not a recognized event kind (REVIEW, REVIEW_DISMISSED, COMMENT, CI, CI_RECOVERED, CI_SUCCESS, CONFLICT, MERGED, CLOSED, REOPENED, MERGE_QUEUE)", kind)
+			return fmt.Errorf("events entry %q is not a recognized event kind (REVIEW, REVIEW_DISMISSED, COMMENT, CI, CI_RECOVERED, CI_SUCCESS, CONFLICT, MERGED, CLOSED, REOPENED, MERGE_QUEUE, PUSH, REVIEW_REQUESTED, READY_FOR_REVIEW, DRAFTED, THREAD_RESOLVED)", kind)
 		}
 	}
 	return nil
@@ -219,6 +225,13 @@ func NewHandler(store *registry.Store, gh GitHubReviewClient, sessions SessionVa
 			if err := validateEventFilter(in.Events); err != nil {
 				return nil, registerOutput{}, err
 			}
+			switch in.Persona {
+			case "":
+				in.Persona = registry.PersonaAuthor
+			case registry.PersonaAuthor, registry.PersonaReviewer:
+			default:
+				return nil, registerOutput{}, fmt.Errorf("persona %q is not recognized (author, reviewer)", in.Persona)
+			}
 
 			// Every URL is attempted regardless of an earlier one failing —
 			// one malformed pr_url in a batch must not sink the rest, same
@@ -249,6 +262,7 @@ func NewHandler(store *registry.Store, gh GitHubReviewClient, sessions SessionVa
 					// Existing activity is already visible on the PR; only a
 					// caller that asks gets it pinged as a backlog.
 					SilentFirstPoll: !in.ReportExisting,
+					Persona:         in.Persona,
 				}
 				if err := store.Add(ctx, reg); err != nil {
 					results = append(results, registerResult{PRURL: prURL, Error: err.Error()})

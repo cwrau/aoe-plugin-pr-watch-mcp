@@ -159,16 +159,17 @@ func registrationColumns(reg registry.Registration, titleOf func(string) string)
 	// comment): shown when reg.EventFilter is empty (the default, every
 	// kind), or when its matching kind is explicitly in the filter.
 	badges := []rowBadge{providerBadge(reg.Provider)}
-	if reg.HasConflict && eventFilterShows(reg.EventFilter, "CONFLICT") {
+	filter := reg.EffectiveEventFilter()
+	if reg.HasConflict && eventFilterShows(filter, "CONFLICT") {
 		badges = append(badges, conflictBadge())
 	}
-	if eventFilterShows(reg.EventFilter, "CI") {
+	if eventFilterShows(filter, "CI") {
 		if ci, ok := ciBadge(reg.CIBucket); ok {
 			badges = append(badges, ci)
 		}
 	}
-	if eventFilterShows(reg.EventFilter, "REVIEW") {
-		badges = append(badges, reviewBadge(reg.LatestReviewState))
+	if eventFilterShows(filter, "REVIEW") {
+		badges = append(badges, reviewBadgeFor(reg))
 	}
 
 	return columnsBlock{
@@ -230,6 +231,17 @@ func ciBadge(bucket string) (rowBadge, bool) {
 	default:
 		return rowBadge{}, false
 	}
+}
+
+// reviewBadgeFor is a registration's review badge: the latest review for an
+// author, the reviewer's own progress ("in progress" until its own account
+// approved) for a reviewer.
+func reviewBadgeFor(r registry.Registration) rowBadge {
+	if r.Persona == registry.PersonaReviewer {
+		chip, _ := reviewerReviewChip(r)
+		return rowBadge{Text: chip.Text, Tone: chip.Tone}
+	}
+	return reviewBadge(r.LatestReviewState)
 }
 
 func reviewBadge(state string) rowBadge {
