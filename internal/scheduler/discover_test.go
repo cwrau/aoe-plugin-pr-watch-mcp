@@ -457,8 +457,8 @@ func TestDiscoverTickFindsPRInUpstreamRepoOfAForkCheckout(t *testing.T) {
 	if primary == nil || extra == nil {
 		t.Fatalf("lastDiscoverItems = %+v, want both the origin repo and the upstream repo probed", gh.lastDiscoverItems)
 	}
-	if !slices.Equal(primary.HeadOwners, []string{"me"}) {
-		t.Errorf("origin query HeadOwners = %v, want just the origin's own owner [me]: a stranger's fork PR with the same branch name is not this checkout's", primary.HeadOwners)
+	if !slices.Equal(primary.HeadOwners, []string{"me", "up"}) {
+		t.Errorf("origin query HeadOwners = %v, want the checkout's own remote owners [me up]: a stranger's fork PR with the same branch name is not this checkout's", primary.HeadOwners)
 	}
 	if len(extra.HeadOwners) != 2 {
 		t.Errorf("upstream query HeadOwners = %v, want the checkout's remote owners [me up]", extra.HeadOwners)
@@ -546,4 +546,27 @@ func TestDiscoveryRunsEvenWhenThePollContextIsSpent(t *testing.T) {
 	}
 
 	getReg(t, store, "https://github.com/o/r/pull/9", "sess1")
+}
+
+// The mirror image of a fork checkout: origin is the upstream repo and the
+// fork is another remote. The PR lives in origin's repo but its head is the
+// fork, so the origin query must accept the fork's owner, and still nobody
+// else's.
+func TestGitHubQueriesForAcceptTheForksOwnerOnTheUpstreamOrigin(t *testing.T) {
+	target := registry.AutoDiscoveryTarget{
+		RemoteKey: "up/r", Branch: "feat/x",
+		ExtraRemoteKeys: []string{"me/r-fork"}, HeadOwners: []string{"up", "me"},
+	}
+	queries := githubQueriesFor(target)
+	if len(queries) != 2 {
+		t.Fatalf("queries = %+v, want origin and the fork repo", queries)
+	}
+	if q := queries[0]; q.Owner != "up" || !slices.Equal(q.HeadOwners, []string{"up", "me"}) {
+		t.Errorf("origin query = %+v, want head owners [up me]", q)
+	}
+
+	plain := githubQueriesFor(registry.AutoDiscoveryTarget{RemoteKey: "up/r", Branch: "feat/x"})
+	if len(plain) != 1 || !slices.Equal(plain[0].HeadOwners, []string{"up"}) {
+		t.Errorf("no-fork queries = %+v, want only the origin's own owner", plain)
+	}
 }

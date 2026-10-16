@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"time"
 
@@ -207,15 +208,23 @@ func (s *Scheduler) discoverGitHub(ctx context.Context, due []registry.AutoDisco
 	}
 }
 
-// githubQueriesFor is the branch lookups for one target: the repo the
-// checkout pushes to, restricted to PRs from that repo itself (anyone can
+// githubQueriesFor is the branch lookups for one target: the repo of the
+// origin remote, then each extra remote's repo. Every one is restricted to PRs
+// whose head repo is owned by one of the checkout's own remotes: anyone can
 // open a PR from their own fork under the same branch name, and it is not
-// this session's), then each extra remote's repo restricted to PRs from the
-// checkout's own remote owners.
+// this session's. The origin's own owner is always among them, and a checkout
+// whose origin is the upstream and which pushes to a fork remote adds the
+// fork's owner, so the PR in the upstream repo is still found.
 func githubQueriesFor(t registry.AutoDiscoveryTarget) []provider.GitHubBranchQuery {
 	var out []provider.GitHubBranchQuery
 	if owner, repo, ok := strings.Cut(t.RemoteKey, "/"); ok {
-		out = append(out, provider.GitHubBranchQuery{Owner: owner, Repo: repo, Branch: t.Branch, HeadOwners: []string{owner}})
+		owners := []string{owner}
+		for _, o := range t.HeadOwners {
+			if !slices.ContainsFunc(owners, func(x string) bool { return strings.EqualFold(x, o) }) {
+				owners = append(owners, o)
+			}
+		}
+		out = append(out, provider.GitHubBranchQuery{Owner: owner, Repo: repo, Branch: t.Branch, HeadOwners: owners})
 	}
 	for _, key := range t.ExtraRemoteKeys {
 		if owner, repo, ok := strings.Cut(key, "/"); ok {
