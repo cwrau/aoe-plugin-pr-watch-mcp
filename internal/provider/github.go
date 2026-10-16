@@ -153,13 +153,17 @@ const githubPullRequestFieldsQuery = `      state
       mergeable
       mergeQueueEntry { state position }
       queueEvents: timelineItems(last: 2, itemTypes: [ADDED_TO_MERGE_QUEUE_EVENT, REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { __typename ... on RemovedFromMergeQueueEvent { reason } } }
+      isDraft
+      reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on User { login } } } }
+      viewerLatestReview { state }
+      pushEvents: timelineItems(last: 1, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) { nodes { ... on HeadRefForcePushedEvent { afterCommit { oid } } } }
       reviewDecision
       reviewCount: reviews { totalCount }
       latestReview: reviews(last: 1) { nodes { author { login } state body submittedAt url } }
       reviewThreads(first: 100) { nodes { id isResolved comments(last: 3) { nodes { id url author { login } } } } }
       comments(last: 20) { nodes { id url body author { login } } }
       commits(last: 1) {
-        nodes { commit { statusCheckRollup { state } } }
+        nodes { commit { author { name user { login } } statusCheckRollup { state } } }
       }`
 
 // githubPullRequestFields is the shape of one aliased pullRequest entry in
@@ -244,9 +248,39 @@ type githubPullRequestFields struct {
 			} `json:"author"`
 		} `json:"nodes"`
 	} `json:"comments"`
+	IsDraft bool `json:"isDraft"`
+	// ReviewRequests are the open review requests; a team request has no
+	// login (only users are listed, since team membership is not known here).
+	ReviewRequests struct {
+		Nodes []struct {
+			RequestedReviewer struct {
+				Typename string `json:"__typename"`
+				Login    string `json:"login"`
+			} `json:"requestedReviewer"`
+		} `json:"nodes"`
+	} `json:"reviewRequests"`
+	// ViewerLatestReview is the worker's own account's latest review.
+	ViewerLatestReview *struct {
+		State string `json:"state"`
+	} `json:"viewerLatestReview"`
+	// PushEvents is the newest force-push of the head branch: it is the
+	// current head's doing only while its afterCommit is the head itself.
+	PushEvents struct {
+		Nodes []struct {
+			AfterCommit struct {
+				Oid string `json:"oid"`
+			} `json:"afterCommit"`
+		} `json:"nodes"`
+	} `json:"pushEvents"`
 	Commits struct {
 		Nodes []struct {
 			Commit struct {
+				Author struct {
+					Name string `json:"name"`
+					User *struct {
+						Login string `json:"login"`
+					} `json:"user"`
+				} `json:"author"`
 				StatusCheckRollup *struct {
 					State string `json:"state"`
 				} `json:"statusCheckRollup"`
@@ -364,6 +398,28 @@ func buildCheckResult(pr githubPullRequestFields) CheckResult {
 		Description: pr.Body,
 		ReviewCount: pr.ReviewCount.TotalCount,
 		HasConflict: pr.Mergeable == "CONFLICTING",
+		HeadSHA:     pr.HeadRefOid,
+		IsDraft:     pr.IsDraft,
+	}
+	for _, n := range pr.ReviewRequests.Nodes {
+		if n.RequestedReviewer.Login != "" {
+			result.RequestedReviewers = append(result.RequestedReviewers, n.RequestedReviewer.Login)
+		}
+	}
+	// A dismissed review no longer counts as the account's verdict.
+	if v := pr.ViewerLatestReview; v != nil && v.State != "DISMISSED" {
+		result.SelfReviewState = v.State
+	}
+	if n := pr.Commits.Nodes; len(n) > 0 {
+		author := n[0].Commit.Author
+		if author.User != nil && author.User.Login != "" {
+			result.HeadAuthor = author.User.Login
+		} else {
+			result.HeadAuthor = author.Name
+		}
+	}
+	if n := pr.PushEvents.Nodes; len(n) > 0 && pr.HeadRefOid != "" && n[0].AfterCommit.Oid == pr.HeadRefOid {
+		result.ForcePushed = true
 	}
 	if pr.MergeQueueEntry != nil {
 		result.MergeQueueState = pr.MergeQueueEntry.State

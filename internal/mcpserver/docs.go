@@ -24,6 +24,13 @@ Events (the kind is the first word of the line):
 - MERGE_QUEUE: GitHub only; the PR was dequeued without merging, most often a failed merge-group check.
 - MERGED, CLOSED: terminal. Always arrive alone. The session's row badge records the outcome permanently; do not rename the session.
 - REOPENED: a closed PR/MR is open again and back to normal watching.
+- Review-flow events, opt-in (only sent when named in the events filter, or by the reviewer persona's defaults):
+  - PUSH: the head commit moved ("new commits by <author>, head now <sha>", "force-push, ..." after a force-push). The re-review signal.
+  - REVIEW_REQUESTED: a review was requested from the worker's own account ("review requested from you"). Requests for other people never ping.
+  - READY_FOR_REVIEW / DRAFTED: the PR/MR left or went back to draft.
+  - THREAD_RESOLVED: review threads were resolved ("N thread(s) resolved, M unresolved left").
+
+Personas: register takes persona "author" (default; you watch your own PR/MR) or "reviewer" (you review someone else's). The reviewer defaults to REVIEW, REVIEW_DISMISSED, COMMENT, PUSH, REVIEW_REQUESTED, READY_FOR_REVIEW, DRAFTED, THREAD_RESOLVED, REOPENED, MERGED and CLOSED, so no CI, conflict or merge queue pings, and its row badge shows only the PR chip and a review chip reading "in progress" until the worker's own account has approved. Auto-discovered watches are always author. An explicit events list overrides the persona's default.
 
 Pings are one-line summaries only: they carry no review text, log or link. Before reacting, fetch the real content (gh pr view --json reviews,comments, gh api repos/{owner}/{repo}/pulls/{number}/comments, gh run view --log-failed, glab api projects/:id/merge_requests/:iid/discussions, ...). Before concluding "nothing to act on", query the unresolved review threads directly: an unresolved thread blocks the merge and a badge is not proof.
 
@@ -37,7 +44,9 @@ Usually not needed: the worker auto-discovers the open PR/MR on the session's ow
 
 pr_urls takes several URLs at once; each gets its own outcome in results ({pr_url, registered, error?}) and one bad URL does not block the rest. session_id is the raw value of $AOE_ARTIFACT_DIR; resolve it first, the literal variable name matches no session and is rejected.
 
-events restricts which kinds ping the session: REVIEW, REVIEW_DISMISSED, COMMENT, CI, CI_RECOVERED, CI_SUCCESS, CONFLICT, MERGED, CLOSED, REOPENED, MERGE_QUEUE. Omit it for every kind except the opt-in CI_SUCCESS, which only fires when named. Auto-discovery always registers unfiltered. Never narrow the filter unprompted; use it when told to be quiet until e.g. the merge (["MERGED"]).
+events restricts which kinds ping the session: REVIEW, REVIEW_DISMISSED, COMMENT, CI, CI_RECOVERED, CI_SUCCESS, CONFLICT, MERGED, CLOSED, REOPENED, MERGE_QUEUE, PUSH, REVIEW_REQUESTED, READY_FOR_REVIEW, DRAFTED, THREAD_RESOLVED. Omit it for the persona's defaults: every kind except the opt-in ones (CI_SUCCESS, PUSH, REVIEW_REQUESTED, READY_FOR_REVIEW, DRAFTED, THREAD_RESOLVED), which only fire when named. Auto-discovery always registers unfiltered.
+
+persona: "author" (default) for watching your own PR/MR, "reviewer" when you review someone else's. A reviewer is pinged about reviews, comments, new commits (PUSH), review requests for you, draft changes, resolved threads and the merge, but not about CI, conflicts or the merge queue, and its row badge shows just the PR and a review chip that reads "in progress" until you have approved. An explicit events list overrides the persona's default set. Never narrow the filter unprompted; use it when told to be quiet until e.g. the merge (["MERGED"]).
 
 A new watch starts silent: the first poll only records what the PR/MR already has (reviews, comments, failing CI, conflict) as the baseline, and only later changes ping. Set report_existing to get that existing activity as a one-time ping instead. Auto-discovered watches always start silent.
 

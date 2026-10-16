@@ -90,7 +90,12 @@ type gitlabMRResponse struct {
 	MergedAt            string `json:"merged_at"`
 	HasConflicts        bool   `json:"has_conflicts"`
 	DetailedMergeStatus string `json:"detailed_merge_status"` // "merge_request_blocked" means blocked on an unmerged MR dependency (Premium/Ultimate feature; always some other value on Free)
-	Pipeline            *struct {
+	Draft               bool   `json:"draft"`
+	SHA                 string `json:"sha"` // the source branch's head commit
+	Reviewers           []struct {
+		Username string `json:"username"`
+	} `json:"reviewers"`
+	Pipeline *struct {
 		ID     int    `json:"id"`
 		Status string `json:"status"`
 		WebURL string `json:"web_url"`
@@ -107,6 +112,7 @@ type gitlabApprovalsResponse struct {
 	Approved          *bool             `json:"approved"`
 	ApprovalsRequired int               `json:"approvals_required"`
 	ApprovalsLeft     int               `json:"approvals_left"`
+	UserHasApproved   bool              `json:"user_has_approved"` // the token's own account has approved
 }
 
 // reviewState is the state to report for the latest approval: plain APPROVED
@@ -238,7 +244,10 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 	}
 	mrData := mr.(*gitlabMRResponse)
 
-	result := CheckResult{State: mapGitLabState(mrData.State), Title: mrData.Title, Description: mrData.Description, HasConflict: mrData.HasConflicts, Blocked: mrData.DetailedMergeStatus == "merge_request_blocked"}
+	result := CheckResult{State: mapGitLabState(mrData.State), Title: mrData.Title, Description: mrData.Description, HasConflict: mrData.HasConflicts, Blocked: mrData.DetailedMergeStatus == "merge_request_blocked", HeadSHA: mrData.SHA, IsDraft: mrData.Draft}
+	for _, r := range mrData.Reviewers {
+		result.RequestedReviewers = append(result.RequestedReviewers, r.Username)
+	}
 	if result.State == "merged" || result.State == "closed" {
 		if result.State == "merged" {
 			result.MergedAt = parseRFC3339OrZero(mrData.MergedAt)
@@ -284,6 +293,9 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 		approvals = gitlabApprovalsResponse{}
 	}
 	result.ReviewCount = len(approvals.ApprovedBy)
+	if approvals.UserHasApproved {
+		result.SelfReviewState = "APPROVED"
+	}
 
 	if result.ReviewCount > 0 {
 		var notes []gitlabNote

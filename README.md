@@ -86,6 +86,29 @@ group/project!17: MERGED
 | `MERGE_QUEUE`      | GitHub: the PR was removed from the merge queue without merging.                                     |
 | `MERGED`, `CLOSED` | Terminal. Always sent alone, and the row badge records the outcome.                                  |
 | `REOPENED`         | A closed PR/MR is open again.                                                                        |
+| `PUSH`             | **Opt-in.** The head commit moved: "new commits by alice, head now abc1234", or "force-push, ...".   |
+| `REVIEW_REQUESTED` | **Opt-in.** A review was requested from *your* account. Requests for other people never ping.        |
+| `READY_FOR_REVIEW` | **Opt-in.** The PR/MR left draft.                                                                    |
+| `DRAFTED`          | **Opt-in.** The PR/MR went back to draft.                                                            |
+| `THREAD_RESOLVED`  | **Opt-in.** Review threads were resolved: "2 thread(s) resolved, 1 unresolved left".                 |
+
+### Personas
+
+`register` takes `persona`: `author` (the default) for watching your own
+PR/MR, or `reviewer` for reviewing someone else's. The persona only picks the
+defaults, and an explicit `events` list always wins.
+
+- **author**: everything above except the opt-in kinds, as before.
+- **reviewer**: `REVIEW`, `REVIEW_DISMISSED`, `COMMENT`, `PUSH`,
+  `REVIEW_REQUESTED`, `READY_FOR_REVIEW`, `DRAFTED`, `THREAD_RESOLVED`,
+  `REOPENED`, `MERGED` and `CLOSED`. No CI, conflict or merge queue pings. The
+  row badge, home pane and session pane show only the PR and a review chip that
+  reads **in progress** until your own account approved, then **approved**.
+  Another reviewer's approval does not count.
+
+Auto-discovered watches are always `author`. The review-flow events have no
+baseline until a poll has stored the PR's head commit, so a new watch never
+floods you with them.
 
 What stays silent on purpose:
 
@@ -111,7 +134,7 @@ steps; it should not act on feedback automatically.
 
 | Tool             | Purpose                                                                                                         |
 | ---------------- | --------------------------------------------------------------------------------------------------------------- |
-| `register`       | Watch one or more PR/MR URLs for a session. Optional `events` filter and `report_existing`. Idempotent.         |
+| `register`       | Watch one or more PR/MR URLs for a session. Optional `events`, `persona` and `report_existing`. Idempotent.     |
 | `unregister`     | Stop specific URLs, or everything a session owns when `pr_urls` is omitted. Rows move to `stopped`, not deleted. |
 | `list`           | Registrations across all sessions, optionally filtered by `session_id` and `status`.                           |
 | `dismiss_review` | Clear a GitHub review's badge: real dismissal, else re-request the reviewer, else hide locally.                |

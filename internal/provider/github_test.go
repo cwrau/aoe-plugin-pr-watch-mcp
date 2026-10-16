@@ -1248,3 +1248,56 @@ func TestGitHubCheckerPartialApprovalFromReviewDecision(t *testing.T) {
 		})
 	}
 }
+
+func TestGitHubCheckerReadsReviewFlowFields(t *testing.T) {
+	body := `{"data": {"repo0": {"pr0": {
+	  "state": "OPEN", "title": "t", "headRefOid": "0123456789abcdef", "isDraft": true,
+	  "reviewRequests": {"nodes": [
+	    {"requestedReviewer": {"__typename": "User", "login": "alice"}},
+	    {"requestedReviewer": {"__typename": "Team"}},
+	    {"requestedReviewer": {"__typename": "User", "login": "bob"}}
+	  ]},
+	  "viewerLatestReview": {"state": "APPROVED"},
+	  "pushEvents": {"nodes": [{"afterCommit": {"oid": "0123456789abcdef"}}]},
+	  "reviewCount": {"totalCount": 0}, "latestReview": {"nodes": []},
+	  "commits": {"nodes": [{"commit": {"author": {"user": {"login": "carol"}, "name": "Carol C"}}}]}
+	}}, "rateLimit": {"limit": 5000, "remaining": 4998, "resetAt": "2026-09-20T23:00:00Z"}}}`
+	srv := fakeGitHubServer(t, body, 0)
+	defer srv.Close()
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	r := results[url]
+	if r.HeadSHA != "0123456789abcdef" || r.HeadAuthor != "carol" || !r.ForcePushed || !r.IsDraft {
+		t.Errorf("head/draft fields = %+v", r)
+	}
+	if !slices.Equal(r.RequestedReviewers, []string{"alice", "bob"}) {
+		t.Errorf("RequestedReviewers = %v, want the users only", r.RequestedReviewers)
+	}
+	if r.SelfReviewState != "APPROVED" {
+		t.Errorf("SelfReviewState = %q", r.SelfReviewState)
+	}
+}
+
+func TestGitHubCheckerForcePushIsOnlyTheCurrentHead(t *testing.T) {
+	body := `{"data": {"repo0": {"pr0": {
+	  "state": "OPEN", "title": "t", "headRefOid": "newer", "isDraft": false,
+	  "pushEvents": {"nodes": [{"afterCommit": {"oid": "older"}}]},
+	  "viewerLatestReview": {"state": "DISMISSED"},
+	  "reviewCount": {"totalCount": 0}, "latestReview": {"nodes": []}, "commits": {"nodes": []}
+	}}, "rateLimit": {"limit": 5000, "remaining": 4998, "resetAt": "2026-09-20T23:00:00Z"}}}`
+	srv := fakeGitHubServer(t, body, 0)
+	defer srv.Close()
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	if r := results[url]; r.ForcePushed || r.SelfReviewState != "" {
+		t.Errorf("result = %+v, want no force-push (a later head) and no self review (dismissed)", r)
+	}
+}

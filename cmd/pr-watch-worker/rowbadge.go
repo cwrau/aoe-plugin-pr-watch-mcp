@@ -327,6 +327,16 @@ func badgeChipsFor(r registry.Registration, compact bool) []badgeChip {
 		// comment), so a session that registered with e.g. events:
 		// ["MERGED"] only gets the eye chip here — same principle as the
 		// home-pane's badges.
+		// The eye chip's conflict and queue colouring is those events' badge,
+		// so it follows the events filter too: a watch (a reviewer's, say) not
+		// told about conflicts or the queue does not wear them.
+		filter := r.EffectiveEventFilter()
+		if !eventFilterShows(filter, "CONFLICT") {
+			r.HasConflict, r.Blocked = false, false
+		}
+		if !eventFilterShows(filter, "MERGE_QUEUE") {
+			r.MergeQueueState, r.MergeQueuePosition = "", 0
+		}
 		eye := badgeChip{
 			Icon:    "eye",
 			Tone:    mainChipTone(r),
@@ -344,7 +354,7 @@ func badgeChipsFor(r registry.Registration, compact bool) []badgeChip {
 			eye.Tooltip += "; review " + r.LatestReviewState
 		}
 		chips := []badgeChip{eye}
-		if eventFilterShows(r.EventFilter, "CI") && (!compact || compactCIChip(r.CIBucket)) {
+		if eventFilterShows(filter, "CI") && (!compact || compactCIChip(r.CIBucket)) {
 			if ci, ok := ciBadge(r.CIBucket); ok {
 				chips = append(chips, badgeChip{
 					Text:    ci.Text,
@@ -354,7 +364,13 @@ func badgeChipsFor(r registry.Registration, compact bool) []badgeChip {
 				})
 			}
 		}
-		if eventFilterShows(r.EventFilter, "REVIEW") && (!compact || compactReviewChip(r.LatestReviewState)) {
+		if r.Persona == registry.PersonaReviewer {
+			// A reviewer's review chip is its own progress: in progress until
+			// its own account has approved. Quiet in compact mode once done.
+			if chip, inProgress := reviewerReviewChip(r); inProgress || !compact {
+				chips = append(chips, chip)
+			}
+		} else if eventFilterShows(filter, "REVIEW") && (!compact || compactReviewChip(r.LatestReviewState)) {
 			review := reviewBadge(r.LatestReviewState)
 			chips = append(chips, badgeChip{
 				Text:    review.Text,
@@ -365,6 +381,22 @@ func badgeChipsFor(r registry.Registration, compact bool) []badgeChip {
 		}
 		return chips
 	}
+}
+
+// reviewerReviewChip is the review chip of a reviewer-persona watch: "in
+// progress" (info) until the worker's own account has approved, then
+// "approved" (success). Only its own verdict counts, never another reviewer's
+// approval; the second result is whether the review is still in progress.
+func reviewerReviewChip(r registry.Registration) (badgeChip, bool) {
+	href := hrefOr(r.ReviewHref, r.PRURL)
+	if r.SelfReviewState == "APPROVED" {
+		return badgeChip{Text: "approved", Tone: "success", Tooltip: "you approved this", Href: href}, false
+	}
+	tooltip := "your review is in progress"
+	if r.SelfReviewState != "" {
+		tooltip += "; you last: " + r.SelfReviewState
+	}
+	return badgeChip{Text: "in progress", Tone: "info", Tooltip: tooltip, Href: href}, true
 }
 
 // mainChipTone colors the eye chip, most urgent condition first: a merge
