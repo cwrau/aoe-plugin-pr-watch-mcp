@@ -1209,3 +1209,104 @@ func TestEffectiveEventFilter(t *testing.T) {
 		t.Errorf("explicit events = %v, want them to win", got)
 	}
 }
+
+func newSub(session string) Subscription {
+	return Subscription{
+		SessionID: session, Provider: "github", Host: "github.com", ScopeKind: "repo", ScopePath: "o/r",
+		Filters: `{"review_requested":"me"}`, Persona: PersonaReviewer, EventFilter: []string{"PUSH"},
+		ReportExisting: true, MaxWatches: 7, ReleaseWhenUnmatched: true, CreatedAt: time.Now(),
+	}
+}
+
+func TestSubscriptionRoundTripAndScanBookkeeping(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	id, err := s.AddSubscription(ctx, newSub("s1"))
+	if err != nil || id == "" {
+		t.Fatalf("AddSubscription() = (%q, %v)", id, err)
+	}
+	got, ok, err := s.GetSubscription(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("GetSubscription() = (%v, %v)", ok, err)
+	}
+	if got.SessionID != "s1" || got.ScopePath != "o/r" || got.Filters != `{"review_requested":"me"}` || got.Persona != PersonaReviewer ||
+		!slices.Equal(got.EventFilter, []string{"PUSH"}) || !got.ReportExisting || got.MaxWatches != 7 || !got.ReleaseWhenUnmatched ||
+		got.Status != SubscriptionActive || got.Scanned {
+		t.Errorf("subscription = %+v", got)
+	}
+
+	due, _ := s.DueSubscriptions(ctx, time.Now())
+	if len(due) != 1 || due[0].ID != id {
+		t.Fatalf("DueSubscriptions() = %+v, want the new one due at once", due)
+	}
+	if err := s.RecordScan(ctx, id, time.Now(), time.Now().Add(time.Hour), "boom"); err != nil {
+		t.Fatal(err)
+	}
+	if due, _ := s.DueSubscriptions(ctx, time.Now()); len(due) != 0 {
+		t.Errorf("DueSubscriptions() after scheduling an hour out = %+v", due)
+	}
+	got, _, _ = s.GetSubscription(ctx, id)
+	if got.LastError != "boom" || got.Scanned {
+		t.Errorf("after a failed scan: %+v, want the error kept and the first scan not counted", got)
+	}
+	if err := s.RecordScan(ctx, id, time.Now(), time.Now().Add(time.Hour), ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ = s.GetSubscription(ctx, id); !got.Scanned || got.LastError != "" {
+		t.Errorf("after a good scan: %+v", got)
+	}
+	all, _ := s.ListSubscriptions(ctx)
+	if len(all) != 1 {
+		t.Errorf("ListSubscriptions() = %d rows", len(all))
+	}
+}
+
+func TestStopSubscriptionStopsItsWatchesOnly(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	id, _ := s.AddSubscription(ctx, newSub("s1"))
+	other, _ := s.AddSubscription(ctx, newSub("s2"))
+	mk := func(url, session, sub string) {
+		r := Registration{PRURL: url, SessionID: session, Provider: "github", NextDueAt: time.Now(), CreatedAt: time.Now(), SubscriptionID: sub}
+		if err := s.Add(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("https://github.com/o/r/pull/1", "s1", id)
+	mk("https://github.com/o/r/pull/2", "s1", id)
+	mk("https://github.com/o/r/pull/3", "s1", "") // registered by hand
+	mk("https://github.com/o/r/pull/1", "s2", other)
+
+	if n, _ := s.CountSubscriptionWatches(ctx, id); n != 2 {
+		t.Errorf("CountSubscriptionWatches() = %d, want 2", n)
+	}
+	if ok, _ := s.StopSubscription(ctx, id, "s2"); ok {
+		t.Error("another session stopped the subscription")
+	}
+	if ok, err := s.StopSubscription(ctx, id, "s1"); err != nil || !ok {
+		t.Fatalf("StopSubscription() = (%v, %v)", ok, err)
+	}
+	for url, want := range map[string]string{
+		"https://github.com/o/r/pull/1": StatusStopped,
+		"https://github.com/o/r/pull/2": StatusStopped,
+		"https://github.com/o/r/pull/3": StatusWatching,
+	} {
+		got, _, _ := s.Get(ctx, url, "s1")
+		if got.Status != want {
+			t.Errorf("s1 %s status = %q, want %q", url, got.Status, want)
+		}
+	}
+	if got, _, _ := s.Get(ctx, "https://github.com/o/r/pull/1", "s2"); got.Status != StatusWatching {
+		t.Error("another subscription's watch was stopped")
+	}
+	if sub, _, _ := s.GetSubscription(ctx, id); sub.Status != SubscriptionStopped {
+		t.Errorf("status = %q", sub.Status)
+	}
+	if due, _ := s.DueSubscriptions(ctx, time.Now()); len(due) != 1 || due[0].ID != other {
+		t.Errorf("DueSubscriptions() = %+v, want only the other one", due)
+	}
+	urls, _ := s.SubscriptionWatchURLs(ctx, other)
+	if len(urls) != 1 {
+		t.Errorf("SubscriptionWatchURLs() = %v", urls)
+	}
+}

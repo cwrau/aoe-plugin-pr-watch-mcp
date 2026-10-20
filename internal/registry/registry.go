@@ -72,6 +72,9 @@ type Registration struct {
 	IsDraft            bool
 	RequestedReviewers []string
 	SelfReviewState    string // the worker's own account's latest review state; empty if none
+	// SubscriptionID is the subscription that registered this watch, empty
+	// for one registered by hand. Set when the row is inserted, never changed.
+	SubscriptionID string
 }
 
 const (
@@ -147,7 +150,32 @@ CREATE TABLE IF NOT EXISTS registrations (
 	is_draft INTEGER NOT NULL DEFAULT 0,
 	requested_reviewers TEXT NOT NULL DEFAULT '[]',
 	self_review_state TEXT NOT NULL DEFAULT '',
+	subscription_id TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (pr_url, session_id)
+);
+
+-- subscriptions are watch scopes (a repo, an org or group, a platform) plus
+-- filters: the scheduler scans them and registers each match as a normal
+-- watch tagged with the subscription's id. See subscriptions.go.
+CREATE TABLE IF NOT EXISTS subscriptions (
+	id TEXT PRIMARY KEY,
+	session_id TEXT NOT NULL,
+	provider TEXT NOT NULL,
+	host TEXT NOT NULL,
+	scope_kind TEXT NOT NULL,
+	scope_path TEXT NOT NULL DEFAULT '',
+	filters TEXT NOT NULL DEFAULT '{}',
+	persona TEXT NOT NULL DEFAULT '',
+	event_filter TEXT NOT NULL DEFAULT '[]',
+	report_existing INTEGER NOT NULL DEFAULT 0,
+	max_watches INTEGER NOT NULL DEFAULT 25,
+	release_when_unmatched INTEGER NOT NULL DEFAULT 0,
+	status TEXT NOT NULL DEFAULT 'active',
+	created_at INTEGER NOT NULL,
+	next_scan_at INTEGER NOT NULL DEFAULT 0,
+	last_scan_at INTEGER NOT NULL DEFAULT 0,
+	scanned INTEGER NOT NULL DEFAULT 0,
+	last_error TEXT NOT NULL DEFAULT ''
 );
 
 -- auto_discovery tracks, per (session_id, source_path) checkout, which
@@ -252,6 +280,7 @@ var columnMigrations = []string{
 	`ALTER TABLE registrations ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE registrations ADD COLUMN requested_reviewers TEXT NOT NULL DEFAULT '[]'`,
 	`ALTER TABLE registrations ADD COLUMN self_review_state TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE registrations ADD COLUMN subscription_id TEXT NOT NULL DEFAULT ''`,
 }
 
 // autoDiscoveryColumnMigrations add the columns auto_discovery gained after
@@ -368,10 +397,10 @@ func (s *Store) Close() error { return s.db.Close() }
 // resumes being watched.
 func (s *Store) Add(ctx context.Context, r Registration) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, ci_detail, ci_href, review_href, unresolved_thread_ids, top_level_comment_ids, latest_comment_href, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked, dismissed_review_href, event_filter, silent_first_poll, persona)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO registrations (pr_url, session_id, provider, review_count, ci_bucket, ci_detail, ci_href, review_href, unresolved_thread_ids, top_level_comment_ids, latest_comment_href, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked, dismissed_review_href, event_filter, silent_first_poll, persona, subscription_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(pr_url, session_id) DO UPDATE SET next_due_at = excluded.next_due_at, status = excluded.status, event_filter = excluded.event_filter, persona = excluded.persona
-	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.CIDetail, r.CIHref, r.ReviewHref, marshalStrings(r.UnresolvedThreadIDs), marshalStrings(r.TopLevelCommentIDs), r.LatestCommentHref, r.LatestReviewState, r.LatestReviewer, unixOrZero(r.LatestReviewAt), r.Title, r.Description, StatusWatching, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix(), unixOrZero(r.MergedAt), boolToInt(r.HasConflict), r.MergeQueueState, r.MergeQueuePosition, boolToInt(r.Blocked), r.DismissedReviewHref, marshalStrings(r.EventFilter), boolToInt(r.SilentFirstPoll), r.Persona)
+	`, r.PRURL, r.SessionID, r.Provider, r.ReviewCount, r.CIBucket, r.CIDetail, r.CIHref, r.ReviewHref, marshalStrings(r.UnresolvedThreadIDs), marshalStrings(r.TopLevelCommentIDs), r.LatestCommentHref, r.LatestReviewState, r.LatestReviewer, unixOrZero(r.LatestReviewAt), r.Title, r.Description, StatusWatching, r.NextDueAt.Unix(), boolToInt(r.Archived), r.CreatedAt.Unix(), unixOrZero(r.MergedAt), boolToInt(r.HasConflict), r.MergeQueueState, r.MergeQueuePosition, boolToInt(r.Blocked), r.DismissedReviewHref, marshalStrings(r.EventFilter), boolToInt(r.SilentFirstPoll), r.Persona, r.SubscriptionID)
 	if err != nil {
 		return fmt.Errorf("add registration: %w", err)
 	}
@@ -415,7 +444,7 @@ func (s *Store) Get(ctx context.Context, prURL, sessionID string) (Registration,
 	var nextDue, created, latestReviewAt, mergedAt int64
 	var archived, hasConflict, blocked, ciWasFailing, isDraft int
 	var unresolvedThreadIDs, topLevelCommentIDs, eventFilter, threadCommentIDs, requestedReviewers string
-	if err := row.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &ciWasFailing, &r.CIDetail, &r.CIHref, &r.ReviewHref, &unresolvedThreadIDs, &topLevelCommentIDs, &r.LatestCommentHref, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt, &hasConflict, &r.MergeQueueState, &r.MergeQueuePosition, &blocked, &r.DismissedReviewHref, &eventFilter, &threadCommentIDs, &r.Persona, &r.HeadSHA, &isDraft, &requestedReviewers, &r.SelfReviewState); err != nil {
+	if err := row.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &ciWasFailing, &r.CIDetail, &r.CIHref, &r.ReviewHref, &unresolvedThreadIDs, &topLevelCommentIDs, &r.LatestCommentHref, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt, &hasConflict, &r.MergeQueueState, &r.MergeQueuePosition, &blocked, &r.DismissedReviewHref, &eventFilter, &threadCommentIDs, &r.Persona, &r.HeadSHA, &isDraft, &requestedReviewers, &r.SelfReviewState, &r.SubscriptionID); err != nil {
 		if err == sql.ErrNoRows {
 			return Registration{}, false, nil
 		}
@@ -681,7 +710,7 @@ func scanAll(rows *sql.Rows) ([]Registration, error) {
 		var nextDue, created, latestReviewAt, mergedAt int64
 		var archived, hasConflict, blocked, ciWasFailing, isDraft int
 		var unresolvedThreadIDs, topLevelCommentIDs, eventFilter, threadCommentIDs, requestedReviewers string
-		if err := rows.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &ciWasFailing, &r.CIDetail, &r.CIHref, &r.ReviewHref, &unresolvedThreadIDs, &topLevelCommentIDs, &r.LatestCommentHref, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt, &hasConflict, &r.MergeQueueState, &r.MergeQueuePosition, &blocked, &r.DismissedReviewHref, &eventFilter, &threadCommentIDs, &r.Persona, &r.HeadSHA, &isDraft, &requestedReviewers, &r.SelfReviewState); err != nil {
+		if err := rows.Scan(&r.PRURL, &r.SessionID, &r.Provider, &r.ReviewCount, &r.CIBucket, &ciWasFailing, &r.CIDetail, &r.CIHref, &r.ReviewHref, &unresolvedThreadIDs, &topLevelCommentIDs, &r.LatestCommentHref, &r.LatestReviewState, &r.LatestReviewer, &latestReviewAt, &r.Title, &r.Description, &r.Status, &nextDue, &archived, &created, &mergedAt, &hasConflict, &r.MergeQueueState, &r.MergeQueuePosition, &blocked, &r.DismissedReviewHref, &eventFilter, &threadCommentIDs, &r.Persona, &r.HeadSHA, &isDraft, &requestedReviewers, &r.SelfReviewState, &r.SubscriptionID); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
 		r.NextDueAt = time.Unix(nextDue, 0)
@@ -717,7 +746,7 @@ func boolToInt(b bool) int {
 // scan order, shared by every SELECT * from registrations — Get, List, and
 // DueBefore must agree on exactly this order or Scan silently assigns the
 // wrong value to the wrong field.
-const registrationColumns = `pr_url, session_id, provider, review_count, ci_bucket, ci_was_failing, ci_detail, ci_href, review_href, unresolved_thread_ids, top_level_comment_ids, latest_comment_href, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked, dismissed_review_href, event_filter, thread_comment_ids, persona, head_sha, is_draft, requested_reviewers, self_review_state`
+const registrationColumns = `pr_url, session_id, provider, review_count, ci_bucket, ci_was_failing, ci_detail, ci_href, review_href, unresolved_thread_ids, top_level_comment_ids, latest_comment_href, latest_review_state, latest_reviewer, latest_review_at, title, description, status, next_due_at, archived, created_at, merged_at, has_conflict, merge_queue_state, merge_queue_position, blocked, dismissed_review_href, event_filter, thread_comment_ids, persona, head_sha, is_draft, requested_reviewers, self_review_state, subscription_id`
 
 // marshalStrings encodes a string slice as a JSON array for storage — "[]"
 // for an empty/nil slice rather than "null", so unmarshalStrings never has
