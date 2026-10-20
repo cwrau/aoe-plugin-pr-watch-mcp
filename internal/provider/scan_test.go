@@ -145,7 +145,7 @@ func TestBuildGitLabSearch(t *testing.T) {
 		q := got[0].Query
 		for k, want := range map[string]string{
 			"state": "opened", "reviewer_username": "alice", "assignee_id": "None", "labels": "a,b", "not[labels]": "wip",
-			"draft": "no", "target_branch": "main", "approved_by_usernames": "carol", "updated_after": "2026-10-19T12:00:00Z",
+			"draft": "no", "target_branch": "main", "approved_by_usernames[]": "carol", "updated_after": "2026-10-19T12:00:00Z",
 		} {
 			if q.Get(k) != want {
 				t.Errorf("%s: %s = %q, want %q", c.scope.Kind, k, q.Get(k), want)

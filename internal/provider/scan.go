@@ -399,7 +399,8 @@ func BuildGitLabSearches(scope ScanScope, f ScanFilters, self string, now time.T
 		if err != nil {
 			return nil, err
 		}
-		base.Set("approved_by_usernames", login)
+		// The API takes an array here: a bare approved_by_usernames is a 400.
+		base.Set("approved_by_usernames[]", login)
 	}
 	if len(f.Labels) > 0 {
 		base.Set("labels", strings.Join(f.Labels, ","))
