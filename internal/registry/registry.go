@@ -175,7 +175,18 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 	next_scan_at INTEGER NOT NULL DEFAULT 0,
 	last_scan_at INTEGER NOT NULL DEFAULT 0,
 	scanned INTEGER NOT NULL DEFAULT 0,
-	last_error TEXT NOT NULL DEFAULT ''
+	last_error TEXT NOT NULL DEFAULT '',
+	mode TEXT NOT NULL DEFAULT 'watch'
+);
+
+-- subscription_matches are the PRs/MRs a notify-mode subscription has told its
+-- session about: nothing is watched, this is only what is needed to tell a
+-- new match from a known one and to notice a draft flip.
+CREATE TABLE IF NOT EXISTS subscription_matches (
+	subscription_id TEXT NOT NULL,
+	pr_url TEXT NOT NULL,
+	draft INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (subscription_id, pr_url)
 );
 
 -- auto_discovery tracks, per (session_id, source_path) checkout, which
@@ -288,6 +299,8 @@ var columnMigrations = []string{
 var autoDiscoveryColumnMigrations = []string{
 	`ALTER TABLE auto_discovery ADD COLUMN extra_remote_keys TEXT NOT NULL DEFAULT '[]'`,
 	`ALTER TABLE auto_discovery ADD COLUMN head_owners TEXT NOT NULL DEFAULT '[]'`,
+	// Columns subscriptions gained after the table first shipped.
+	`ALTER TABLE subscriptions ADD COLUMN mode TEXT NOT NULL DEFAULT 'watch'`,
 }
 
 func migrateAutoDiscoveryColumns(db *sql.DB) error {

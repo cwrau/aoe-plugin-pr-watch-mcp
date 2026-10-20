@@ -12,6 +12,12 @@ import (
 const (
 	SubscriptionActive  = "active"
 	SubscriptionStopped = "stopped"
+
+	// SubscriptionModeWatch registers every match as a watch (the default).
+	// SubscriptionModeNotify only tells the session about matches and a few
+	// status changes and registers nothing: the session decides what to follow.
+	SubscriptionModeWatch  = "watch"
+	SubscriptionModeNotify = "notify"
 )
 
 // Subscription is a watch scope: a repo, an org/group or a platform plus
@@ -36,9 +42,10 @@ type Subscription struct {
 	LastScanAt           time.Time
 	Scanned              bool // at least one scan has succeeded
 	LastError            string
+	Mode                 string // SubscriptionModeWatch (also when empty) or SubscriptionModeNotify
 }
 
-const subscriptionColumns = `id, session_id, provider, host, scope_kind, scope_path, filters, persona, event_filter, report_existing, max_watches, release_when_unmatched, status, created_at, next_scan_at, last_scan_at, scanned, last_error`
+const subscriptionColumns = `id, session_id, provider, host, scope_kind, scope_path, filters, persona, event_filter, report_existing, max_watches, release_when_unmatched, status, created_at, next_scan_at, last_scan_at, scanned, last_error, mode`
 
 func newSubscriptionID() (string, error) {
 	var b [6]byte
@@ -59,9 +66,13 @@ func (s *Store) AddSubscription(ctx context.Context, sub Subscription) (string, 
 	if filters == "" {
 		filters = "{}"
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO subscriptions (`+subscriptionColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	mode := sub.Mode
+	if mode == "" {
+		mode = SubscriptionModeWatch
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO subscriptions (`+subscriptionColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, sub.SessionID, sub.Provider, sub.Host, sub.ScopeKind, sub.ScopePath, filters, sub.Persona, marshalStrings(sub.EventFilter),
-		boolToInt(sub.ReportExisting), sub.MaxWatches, boolToInt(sub.ReleaseWhenUnmatched), SubscriptionActive, sub.CreatedAt.Unix(), 0, 0, 0, "")
+		boolToInt(sub.ReportExisting), sub.MaxWatches, boolToInt(sub.ReleaseWhenUnmatched), SubscriptionActive, sub.CreatedAt.Unix(), 0, 0, 0, "", mode)
 	if err != nil {
 		return "", fmt.Errorf("add subscription: %w", err)
 	}
@@ -76,7 +87,7 @@ func scanSubscription(row rowScanner) (Subscription, error) {
 	var reportExisting, release, scanned int
 	var created, next, last int64
 	if err := row.Scan(&sub.ID, &sub.SessionID, &sub.Provider, &sub.Host, &sub.ScopeKind, &sub.ScopePath, &sub.Filters, &sub.Persona, &eventFilter,
-		&reportExisting, &sub.MaxWatches, &release, &sub.Status, &created, &next, &last, &scanned, &sub.LastError); err != nil {
+		&reportExisting, &sub.MaxWatches, &release, &sub.Status, &created, &next, &last, &scanned, &sub.LastError, &sub.Mode); err != nil {
 		return Subscription{}, err
 	}
 	sub.EventFilter = unmarshalStrings(eventFilter)
@@ -170,6 +181,9 @@ func (s *Store) stopSubscription(ctx context.Context, id, sessionID string) (boo
 	if _, err := tx.ExecContext(ctx, `UPDATE registrations SET status = ? WHERE subscription_id = ? AND status = ?`, StatusStopped, id, StatusWatching); err != nil {
 		return false, fmt.Errorf("stop subscription watches: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM subscription_matches WHERE subscription_id = ?`, id); err != nil {
+		return false, fmt.Errorf("clear subscription matches: %w", err)
+	}
 	return true, tx.Commit()
 }
 
@@ -215,4 +229,43 @@ func (s *Store) SubscriptionWatchURLs(ctx context.Context, id string) ([]string,
 		urls = append(urls, u)
 	}
 	return urls, rows.Err()
+}
+
+// SetTrackedMatch records that a notify-mode subscription has told its session
+// about prURL, and whether it was a draft then; it updates an existing entry.
+func (s *Store) SetTrackedMatch(ctx context.Context, subscriptionID, prURL string, draft bool) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO subscription_matches (subscription_id, pr_url, draft) VALUES (?, ?, ?)
+		ON CONFLICT(subscription_id, pr_url) DO UPDATE SET draft = excluded.draft`, subscriptionID, prURL, boolToInt(draft))
+	if err != nil {
+		return fmt.Errorf("track match: %w", err)
+	}
+	return nil
+}
+
+// TrackedMatches returns the PR/MR URLs a notify-mode subscription has told
+// its session about, mapped to whether each was a draft at the last scan.
+func (s *Store) TrackedMatches(ctx context.Context, subscriptionID string) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT pr_url, draft FROM subscription_matches WHERE subscription_id = ?`, subscriptionID)
+	if err != nil {
+		return nil, fmt.Errorf("tracked matches: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := make(map[string]bool)
+	for rows.Next() {
+		var u string
+		var draft int
+		if err := rows.Scan(&u, &draft); err != nil {
+			return nil, err
+		}
+		out[u] = draft != 0
+	}
+	return out, rows.Err()
+}
+
+// DeleteTrackedMatch forgets prURL for the subscription.
+func (s *Store) DeleteTrackedMatch(ctx context.Context, subscriptionID, prURL string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM subscription_matches WHERE subscription_id = ? AND pr_url = ?`, subscriptionID, prURL); err != nil {
+		return fmt.Errorf("untrack match: %w", err)
+	}
+	return nil
 }

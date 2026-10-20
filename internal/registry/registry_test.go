@@ -1310,3 +1310,53 @@ func TestStopSubscriptionStopsItsWatchesOnly(t *testing.T) {
 		t.Errorf("SubscriptionWatchURLs() = %v", urls)
 	}
 }
+
+func TestSubscriptionModeAndTrackedMatches(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+
+	watchSub := newSub("s1")
+	wid, _ := s.AddSubscription(ctx, watchSub)
+	if got, _, _ := s.GetSubscription(ctx, wid); got.Mode != SubscriptionModeWatch {
+		t.Errorf("default mode = %q, want %q", got.Mode, SubscriptionModeWatch)
+	}
+
+	notify := newSub("s1")
+	notify.Mode = SubscriptionModeNotify
+	nid, err := s.AddSubscription(ctx, notify)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ := s.GetSubscription(ctx, nid); got.Mode != SubscriptionModeNotify {
+		t.Errorf("mode = %q, want notify", got.Mode)
+	}
+
+	if err := s.SetTrackedMatch(ctx, nid, "https://github.com/o/r/pull/1", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTrackedMatch(ctx, nid, "https://github.com/o/r/pull/2", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTrackedMatch(ctx, nid, "https://github.com/o/r/pull/1", false); err != nil { // updates in place
+		t.Fatal(err)
+	}
+	got, err := s.TrackedMatches(ctx, nid)
+	if err != nil || len(got) != 2 || got["https://github.com/o/r/pull/1"] || got["https://github.com/o/r/pull/2"] {
+		t.Errorf("TrackedMatches() = (%v, %v), want two entries, neither a draft", got, err)
+	}
+	if other, _ := s.TrackedMatches(ctx, wid); len(other) != 0 {
+		t.Errorf("another subscription tracks %v", other)
+	}
+	if err := s.DeleteTrackedMatch(ctx, nid, "https://github.com/o/r/pull/2"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.TrackedMatches(ctx, nid); len(got) != 1 {
+		t.Errorf("after delete: %v", got)
+	}
+	if ok, err := s.StopSubscription(ctx, nid, "s1"); err != nil || !ok {
+		t.Fatalf("StopSubscription() = (%v, %v)", ok, err)
+	}
+	if got, _ := s.TrackedMatches(ctx, nid); len(got) != 0 {
+		t.Errorf("a stopped subscription still tracks %v", got)
+	}
+}
