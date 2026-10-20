@@ -46,7 +46,7 @@ func TestServerInstructionsExplainPingsAndEvents(t *testing.T) {
 			t.Errorf("instructions do not mention event kind %q", kind)
 		}
 	}
-	for _, want := range []string{"[pr-watch]", "auto-discover", "Never act", "30 days", "Opt-in"} {
+	for _, want := range []string{"[pr-watch]", "auto-discover", "Never act", "30 days", "Opt-in", "MATCHED", "subscribe", "untrusted"} {
 		if !strings.Contains(instructions, want) {
 			t.Errorf("instructions do not mention %q", want)
 		}
@@ -84,8 +84,8 @@ func TestEveryToolDescriptionIsSubstantial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools() error = %v", err)
 	}
-	if len(tools.Tools) != 4 {
-		t.Fatalf("tool count = %d, want 4", len(tools.Tools))
+	if len(tools.Tools) != 7 {
+		t.Fatalf("tool count = %d, want 7", len(tools.Tools))
 	}
 	for _, tool := range tools.Tools {
 		if len(tool.Description) < 150 {

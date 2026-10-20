@@ -110,6 +110,45 @@ Auto-discovered watches are always `author`. The review-flow events have no
 baseline until a poll has stored the PR's head commit, so a new watch never
 floods you with them.
 
+### Watching a repo, an org or a whole platform
+
+`subscribe` watches a scope instead of one PR/MR: a repo, an org or GitLab
+group, or a whole platform such as `github.com`. The worker searches the scope
+for open PRs/MRs matching your filters and registers each match as an ordinary
+watch (reviewer persona by default, silent first poll). You get one `MATCHED`
+ping per new match:
+
+```text
+[pr-watch] owner/repo#12: MATCHED new PR by alice (https://github.com/owner/repo/pull/12)
+```
+
+The ping carries ref, author and URL, **never the title**: on a platform watch
+anyone can open a PR with a hostile title, which would be a prompt injection
+straight into the agent. Agents are told to fetch details themselves and treat
+PR text as untrusted.
+
+- **Scope** is a URL: `https://github.com/owner/repo`, `https://github.com/org`,
+  `https://github.com`, a GitLab project, group or host. For GitLab the API
+  tells project from group. A **platform** scope needs a person filter, because
+  without one it would watch every open PR on the platform.
+- **Filters** (all optional, `me` is your own account): `review_requested`
+  (a login or a GitHub team), `assignee`, `authors`, `authors_not`, `involved`
+  and `mentioned` (GitHub), `reviewed_by`, `review_status` (GitHub), `labels`,
+  `labels_not`, `draft`, `base_branch`, `branch` and `branch_not` (globs),
+  `repos` and `repos_not` (globs, for org and platform scopes) and
+  `updated_within` (`14d`). A filter a provider cannot express is rejected, not
+  silently dropped.
+- **Lifecycle:** the first scan registers what already matches without a
+  ping (`report_existing` announces it instead). A PR that stops matching, say
+  because you approved it, stays watched until merged or closed
+  (`release_when_unmatched` stops it instead). `max_watches` caps the watches a
+  subscription keeps (25, or 10 for a platform; 100 at most) and overflow is
+  reported once. Your own PRs are skipped for the reviewer persona. Unsubscribing, or the
+  session going away, stops the registered watches.
+- **Cost:** one search per distinct query every two minutes (identical
+  subscriptions share it), 1 GraphQL point per GitHub search, plus the usual
+  polling of the registered watches.
+
 What stays silent on purpose:
 
 - **Partial approvals.** One approval of two required (GitLab approval rules,
@@ -138,6 +177,9 @@ steps; it should not act on feedback automatically.
 | `unregister`     | Stop specific URLs, or everything a session owns when `pr_urls` is omitted. Rows move to `stopped`, not deleted. |
 | `list`           | Registrations across all sessions, optionally filtered by `session_id` and `status`.                           |
 | `dismiss_review` | Clear a GitHub review's badge: real dismissal, else re-request the reviewer, else hide locally.                |
+| `subscribe`      | Watch a repo, org/group or platform with filters; every match becomes a watch and a `MATCHED` ping.            |
+| `unsubscribe`    | Stop a subscription and the watches it registered.                                                              |
+| `subscriptions`  | List subscriptions with their filters, watch counts and last scan.                                              |
 
 Every `session_id` takes the bare session id or the raw `$AOE_ARTIFACT_DIR`
 value. A registration belongs to the session that made it; several sessions

@@ -190,7 +190,11 @@ func detectProvider(prURL string) (string, error) {
 // per the handler's factory function, per the SDK's NewStreamableHTTPHandler
 // contract; it's cheap since all real state lives in store, not the server
 // value.
-func NewHandler(store *registry.Store, gh GitHubReviewClient, sessions SessionValidator, push UIPusher) http.Handler {
+func NewHandler(store *registry.Store, gh GitHubReviewClient, sessions SessionValidator, push UIPusher, opts ...Option) http.Handler {
+	var cfg handlerConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 	newServer := func(*http.Request) *mcp.Server {
 		server := mcp.NewServer(&mcp.Implementation{Name: "io.cwrau.pr-watch-mcp", Version: "0.1.0"}, &mcp.ServerOptions{Instructions: serverInstructions})
 
@@ -438,6 +442,8 @@ func NewHandler(store *registry.Store, gh GitHubReviewClient, sessions SessionVa
 				return nil, dismissReviewOutput{}, fmt.Errorf("review %q is %s, nothing to dismiss", in.ReviewURL, review.State)
 			}
 		})
+
+		addSubscriptionTools(server, store, sessions, push, cfg.scopes)
 
 		return server
 	}

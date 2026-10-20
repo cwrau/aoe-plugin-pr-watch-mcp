@@ -138,6 +138,15 @@ func main() {
 		return runToken(ctx, "glab", "config", "get", "token", "--host", host)
 	}
 
+	// Shared with the MCP handler, which asks it whether a GitLab path is a
+	// project or a group when a session subscribes to one.
+	glChecker := &provider.GitLabChecker{
+		HTTPClient: httpClient,
+		// Check's context is passed straight through so the glab fork
+		// is bounded by the same deadline as the poll it serves.
+		TokenFunc: glabTokenFunc,
+	}
+
 	snooze := &snoozeRules{}
 	filters := &commentFilters{}
 
@@ -146,14 +155,11 @@ func main() {
 		CommentFilters: filters.get,
 		Store:          store,
 		GitHub:         ghChecker,
-		GitLab: &provider.GitLabChecker{
-			HTTPClient: httpClient,
-			// Check's context is passed straight through so the glab fork
-			// is bounded by the same deadline as the poll it serves.
-			TokenFunc: glabTokenFunc,
-		},
-		Sessions: aoe,
-		Notify:   &notifier.Notifier{RPC: rpc},
+		GitLab:         glChecker,
+		GitHubScan:     ghChecker,
+		GitLabScan:     glChecker,
+		Sessions:       aoe,
+		Notify:         &notifier.Notifier{RPC: rpc},
 		// Sessions and Workspaces read the same directory the MCP handler
 		// uses; it is safe for concurrent use.
 		Workspaces:        aoe,
@@ -190,7 +196,7 @@ func main() {
 	}()
 
 	go runSchedulerLoop(ctx, sched, store, aoe, rpc, discovery, logger)
-	go runHTTPServer(ctx, store, ghChecker, aoe, rpc, logger)
+	go runHTTPServer(ctx, store, ghChecker, glChecker, aoe, rpc, logger)
 
 	// The ndjson stdio channel is how the AoE daemon supervises this
 	// worker. Every line is handed to rpc.handleInboundLine, which only
@@ -332,7 +338,7 @@ func (p *immediateUIPusher) Push() {
 	pushUIState(context.Background(), p.store, p.aoe, p.rpc, p.log)
 }
 
-func runHTTPServer(ctx context.Context, store *registry.Store, gh *provider.GitHubChecker, sessions *aoeclient.Client, rpc *hostRPC, logger *slog.Logger) {
+func runHTTPServer(ctx context.Context, store *registry.Store, gh *provider.GitHubChecker, gl *provider.GitLabChecker, sessions *aoeclient.Client, rpc *hostRPC, logger *slog.Logger) {
 	port := defaultPort
 	if raw := os.Getenv("PR_WATCH_MCP_PORT"); raw != "" {
 		if p, err := strconv.Atoi(raw); err == nil {
@@ -341,7 +347,7 @@ func runHTTPServer(ctx context.Context, store *registry.Store, gh *provider.GitH
 	}
 	srv := &http.Server{
 		Addr:    "127.0.0.1:" + strconv.Itoa(port),
-		Handler: mcpserver.NewHandler(store, gh, sessions, &immediateUIPusher{store: store, aoe: sessions, rpc: rpc, log: logger}),
+		Handler: mcpserver.NewHandler(store, gh, sessions, &immediateUIPusher{store: store, aoe: sessions, rpc: rpc, log: logger}, mcpserver.WithScopeResolver(gl)),
 	}
 	go func() {
 		<-ctx.Done()
