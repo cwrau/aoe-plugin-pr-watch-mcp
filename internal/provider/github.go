@@ -88,14 +88,13 @@ type GitHubChecker struct {
 
 	tokenMu sync.Mutex
 
-	// selfLoginOnce/selfLogin/selfLoginErr cache SelfLogin's result — the
-	// authenticated login never changes for the lifetime of one Token, and
+	// selfLogin caches SelfLogin's successful result — the authenticated login
+	// never changes for the lifetime of one Token. A failure is never cached:
+	// one network blip must not cost the worker its own identity for good.
 	// GitHubChecker is shared between the scheduler loop and the MCP HTTP
-	// handler's dismiss_review tool (see main.go), so this needs to be
-	// concurrency-safe; sync.Once gives that for free.
-	selfLoginOnce sync.Once
-	selfLogin     string
-	selfLoginErr  error
+	// handler's dismiss_review tool (see main.go), so access is locked.
+	selfLoginMu sync.Mutex
+	selfLogin   string
 }
 
 // authToken returns the cached credential, fetching it through TokenFunc
@@ -973,19 +972,21 @@ const githubViewerLoginQuery = `query { viewer { login } }`
 // the first time, a cached value every call after — the login never
 // changes for the lifetime of one Token), not once per poll.
 func (c *GitHubChecker) SelfLogin(ctx context.Context) (string, error) {
-	c.selfLoginOnce.Do(func() {
-		var resp struct {
-			Viewer struct {
-				Login string `json:"login"`
-			} `json:"viewer"`
-		}
-		if err := c.doGraphQL(ctx, githubViewerLoginQuery, nil, &resp); err != nil {
-			c.selfLoginErr = err
-			return
-		}
-		c.selfLogin = resp.Viewer.Login
-	})
-	return c.selfLogin, c.selfLoginErr
+	c.selfLoginMu.Lock()
+	defer c.selfLoginMu.Unlock()
+	if c.selfLogin != "" {
+		return c.selfLogin, nil
+	}
+	var resp struct {
+		Viewer struct {
+			Login string `json:"login"`
+		} `json:"viewer"`
+	}
+	if err := c.doGraphQL(ctx, githubViewerLoginQuery, nil, &resp); err != nil {
+		return "", err
+	}
+	c.selfLogin = resp.Viewer.Login
+	return c.selfLogin, nil
 }
 
 // doGraphQL posts one query or mutation and decodes its `data` field into

@@ -755,7 +755,7 @@ func (s *Scheduler) selfAuthor(ctx context.Context, reg registry.Registration) s
 	case "github":
 		login, err := s.GitHub.SelfLogin(ctx)
 		if err != nil {
-			s.log().Debug("resolve github self login", "error", err)
+			s.log().Warn("cannot resolve the worker's own account, so its own reviews and comments are not filtered out of pings; retrying on the next poll", "provider", "github", "error", err)
 			return ""
 		}
 		return login
@@ -766,7 +766,7 @@ func (s *Scheduler) selfAuthor(ctx context.Context, reg registry.Registration) s
 		}
 		username, err := s.GitLab.SelfUsername(ctx, host)
 		if err != nil {
-			s.log().Debug("resolve gitlab self username", "host", host, "error", err)
+			s.log().Warn("cannot resolve the worker's own account, so its own reviews and comments are not filtered out of pings; retrying on the next poll", "provider", "gitlab", "host", host, "error", err)
 			return ""
 		}
 		return username

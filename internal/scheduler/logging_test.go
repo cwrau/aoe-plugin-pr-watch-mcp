@@ -116,3 +116,21 @@ func TestSilentFirstPollSavesBaselineWithoutPinging(t *testing.T) {
 		t.Error("the silent flag is still set after the first poll")
 	}
 }
+
+// When the worker cannot tell who it is, self-authored pings get through, so
+// the failure must be visible in the log rather than swallowed at debug level.
+func TestSelfIdentityFailureIsLoggedAsAWarning(t *testing.T) {
+	store := openTestStore(t)
+	var buf bytes.Buffer
+	sched := &Scheduler{
+		Store: store, GitHub: &fakeGitHubChecker{selfLoginErr: context.DeadlineExceeded},
+		GitLab: &fakeGitLabChecker{}, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{},
+		Log: slog.New(slog.NewTextHandler(&buf, nil)),
+	}
+	if got := sched.selfAuthor(context.Background(), registry.Registration{Provider: "github", PRURL: "https://github.com/o/r/pull/1"}); got != "" {
+		t.Errorf("selfAuthor() = %q, want empty on failure", got)
+	}
+	if out := buf.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "own account") {
+		t.Errorf("log = %q, want a warning that the worker's own account could not be resolved", out)
+	}
+}
