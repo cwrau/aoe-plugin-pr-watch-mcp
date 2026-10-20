@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -27,11 +28,15 @@ const (
 // GitHubScanner searches GitHub for the pull requests of a subscription.
 type GitHubScanner interface {
 	SearchPullRequests(ctx context.Context, queries []string, limit int) (provider.ScanResult, error)
+	// PullRequestStates is what a notify-mode subscription asks about the PRs
+	// that dropped out of its results: merged, closed, or just no longer matching.
+	PullRequestStates(ctx context.Context, urls []string) (map[string]provider.PRState, error)
 }
 
 // GitLabScanner searches a GitLab host for the merge requests of a subscription.
 type GitLabScanner interface {
 	SearchMergeRequests(ctx context.Context, host string, searches []provider.GitLabSearch) (provider.ScanResult, error)
+	MergeRequestStates(ctx context.Context, host string, urls []string) (map[string]provider.PRState, error)
 }
 
 type scanOutcome struct {
@@ -177,6 +182,9 @@ func (s *Scheduler) selfForScan(ctx context.Context, providerName, host string) 
 // It reports false if a registration could not be stored, so the scan is
 // retried and the first-scan silence is not used up.
 func (s *Scheduler) applyMatches(ctx context.Context, sub registry.Subscription, filters provider.ScanFilters, self string, res provider.ScanResult) bool {
+	if sub.Mode == registry.SubscriptionModeNotify {
+		return s.applyNotifyMatches(ctx, sub, filters, self, res)
+	}
 	count, err := s.Store.CountSubscriptionWatches(ctx, sub.ID)
 	if err != nil {
 		s.log().Error("count subscription watches", "subscription", sub.ID, "error", err)
@@ -186,18 +194,7 @@ func (s *Scheduler) applyMatches(ctx context.Context, sub registry.Subscription,
 	current := make(map[string]bool)
 	var added []provider.ScanMatch
 	overflow := 0
-	for _, m := range res.Matches {
-		if !filters.Matches(m) {
-			continue
-		}
-		if filters.Draft == "exclude" && m.Draft || filters.Draft == "only" && !m.Draft {
-			continue
-		}
-		// A reviewer follows other people's work: the worker's own PRs are not
-		// theirs to review.
-		if sub.Persona == registry.PersonaReviewer && self != "" && strings.EqualFold(m.Author, self) {
-			continue
-		}
+	for _, m := range matchesAfterFilters(sub, filters, self, res.Matches) {
 		current[m.URL] = true
 
 		if _, exists, err := s.Store.Get(ctx, m.URL, sub.SessionID); err != nil {
@@ -261,4 +258,163 @@ func (s *Scheduler) applyMatches(ctx context.Context, sub registry.Subscription,
 		s.queuePing(sub.SessionID, fmt.Sprintf("%s: %d more PR/MR(s) match but are not watched (max_watches %d)", sub.ID, overflow, sub.MaxWatches))
 	}
 	return true
+}
+
+// notifyEnabled reports whether a status event (DRAFTED, READY_FOR_REVIEW,
+// MERGED, CLOSED) is enabled for a notify-mode subscription: an empty events
+// list means all of them. MATCHED is not a status event, it is always sent.
+func notifyEnabled(sub registry.Subscription, kind string) bool {
+	return len(sub.EventFilter) == 0 || slices.Contains(sub.EventFilter, kind)
+}
+
+// matchesAfterFilters keeps the scan matches that pass the filters, the
+// draft setting and the reviewer persona's skip of the worker's own PRs.
+func matchesAfterFilters(sub registry.Subscription, filters provider.ScanFilters, self string, matches []provider.ScanMatch) []provider.ScanMatch {
+	var out []provider.ScanMatch
+	for _, m := range matches {
+		if !filters.Matches(m) {
+			continue
+		}
+		if filters.Draft == "exclude" && m.Draft || filters.Draft == "only" && !m.Draft {
+			continue
+		}
+		if sub.Persona == registry.PersonaReviewer && self != "" && strings.EqualFold(m.Author, self) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// applyNotifyMatches is applyMatches for a notify-mode subscription: it
+// registers nothing. It keeps just enough per PR/MR (that the session was told,
+// and its draft flag) to announce new matches and report a draft flip, and,
+// for PRs that dropped out of a complete result, to report that they merged or
+// closed. A PR the session watches itself is left to its watch.
+func (s *Scheduler) applyNotifyMatches(ctx context.Context, sub registry.Subscription, filters provider.ScanFilters, self string, res provider.ScanResult) bool {
+	tracked, err := s.Store.TrackedMatches(ctx, sub.ID)
+	if err != nil {
+		s.log().Error("read tracked matches", "subscription", sub.ID, "error", err)
+		return false
+	}
+	watched := func(url string) (bool, error) {
+		_, ok, err := s.Store.Get(ctx, url, sub.SessionID)
+		return ok, err
+	}
+
+	quiet := !sub.Scanned && !sub.ReportExisting
+	noun := "PR"
+	if sub.Provider == "gitlab" {
+		noun = "MR"
+	}
+	ping := func(url string, ev provider.Event) {
+		s.queuePing(sub.SessionID, strings.TrimPrefix(eventsMessage(provider.ShortRef(url, sub.Provider), []provider.Event{ev}), pingPrefix))
+	}
+
+	current := make(map[string]bool)
+	added, overflow := 0, 0
+	for _, m := range matchesAfterFilters(sub, filters, self, res.Matches) {
+		current[m.URL] = true
+		isWatched, err := watched(m.URL)
+		if err != nil {
+			s.log().Error("look up registration for a notify match", "pr_url", m.URL, "error", err)
+			return false
+		}
+		wasDraft, known := tracked[m.URL]
+		if isWatched {
+			if known { // the session took it on: its own watch reports from here
+				_ = s.Store.DeleteTrackedMatch(ctx, sub.ID, m.URL)
+			}
+			continue
+		}
+		switch {
+		case !known:
+			if len(tracked)+added >= sub.MaxWatches {
+				overflow++
+				continue
+			}
+			if err := s.Store.SetTrackedMatch(ctx, sub.ID, m.URL, m.Draft); err != nil {
+				s.log().Error("track a notify match", "pr_url", m.URL, "error", err)
+				return false
+			}
+			added++
+			s.log().Info("subscription matched", "subscription", sub.ID, "pr_url", m.URL, "session_id", sub.SessionID, "mode", "notify")
+			if !quiet {
+				msg := "new " + noun
+				if m.Author != "" {
+					msg += " by " + m.Author
+				}
+				if m.Draft {
+					msg += ", draft"
+				}
+				ping(m.URL, provider.Event{Kind: "MATCHED", Message: msg + ", not watched: call register to follow it", Href: m.URL})
+			}
+		case wasDraft != m.Draft:
+			if err := s.Store.SetTrackedMatch(ctx, sub.ID, m.URL, m.Draft); err != nil {
+				s.log().Error("update a tracked draft flag", "pr_url", m.URL, "error", err)
+				return false
+			}
+			kind, msg := "READY_FOR_REVIEW", "is ready for review"
+			if m.Draft {
+				kind, msg = "DRAFTED", "is a draft again"
+			}
+			if notifyEnabled(sub, kind) {
+				ping(m.URL, provider.Event{Kind: kind, Message: msg, Href: m.URL})
+			}
+		}
+	}
+
+	// Tracked PRs that are not in a complete result: merged, closed, or just
+	// no longer matching. Only the first two are news. A failed lookup keeps
+	// them tracked, to be asked again next scan.
+	if res.Complete {
+		var gone []string
+		for u := range tracked {
+			if !current[u] {
+				gone = append(gone, u)
+			}
+		}
+		slices.Sort(gone)
+		if len(gone) > 0 {
+			states, err := s.lookupStates(ctx, sub, gone)
+			if err != nil {
+				s.log().Warn("look up the state of PRs that left a subscription's results", "subscription", sub.ID, "error", err)
+			} else {
+				for _, u := range gone {
+					if st, ok := states[u]; ok && (st.State == "merged" || st.State == "closed") {
+						isWatched, err := watched(u)
+						kind := strings.ToUpper(st.State)
+						if err == nil && !isWatched && notifyEnabled(sub, kind) {
+							ping(u, provider.Event{Kind: kind, Message: kind, Href: u})
+						}
+					}
+					if err := s.Store.DeleteTrackedMatch(ctx, sub.ID, u); err != nil {
+						s.log().Error("forget a tracked match", "pr_url", u, "error", err)
+					}
+				}
+			}
+		}
+	}
+
+	if overflow > 0 && !quiet && (added > 0 || !sub.Scanned) {
+		s.queuePing(sub.SessionID, fmt.Sprintf("%s: %d more PR/MR(s) match but are not tracked (max_watches %d)", sub.ID, overflow, sub.MaxWatches))
+	}
+	return true
+}
+
+// lookupStates asks the provider for the state of urls.
+func (s *Scheduler) lookupStates(ctx context.Context, sub registry.Subscription, urls []string) (map[string]provider.PRState, error) {
+	switch sub.Provider {
+	case "github":
+		if s.GitHubScan == nil {
+			return nil, fmt.Errorf("no GitHub scanner")
+		}
+		return s.GitHubScan.PullRequestStates(ctx, urls)
+	case "gitlab":
+		if s.GitLabScan == nil {
+			return nil, fmt.Errorf("no GitLab scanner")
+		}
+		return s.GitLabScan.MergeRequestStates(ctx, sub.Host, urls)
+	}
+	return nil, fmt.Errorf("unknown provider %q", sub.Provider)
 }

@@ -15,6 +15,26 @@ type fakeGitHubScan struct {
 	queries [][]string // every SearchPullRequests call's queries
 	result  provider.ScanResult
 	err     error
+
+	// PullRequestStates answers from states (a URL missing from it was not
+	// returned); stateCalls records the URLs asked about.
+	states     map[string]provider.PRState
+	statesErr  error
+	stateCalls [][]string
+}
+
+func (f *fakeGitHubScan) PullRequestStates(ctx context.Context, urls []string) (map[string]provider.PRState, error) {
+	f.stateCalls = append(f.stateCalls, urls)
+	if f.statesErr != nil {
+		return nil, f.statesErr
+	}
+	out := make(map[string]provider.PRState)
+	for _, u := range urls {
+		if s, ok := f.states[u]; ok {
+			out[u] = s
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeGitHubScan) SearchPullRequests(ctx context.Context, queries []string, limit int) (provider.ScanResult, error) {
@@ -26,6 +46,10 @@ type fakeGitLabScan struct {
 	calls  int
 	result provider.ScanResult
 	err    error
+}
+
+func (f *fakeGitLabScan) MergeRequestStates(ctx context.Context, host string, urls []string) (map[string]provider.PRState, error) {
+	return map[string]provider.PRState{}, nil
 }
 
 func (f *fakeGitLabScan) SearchMergeRequests(ctx context.Context, host string, searches []provider.GitLabSearch) (provider.ScanResult, error) {
@@ -282,4 +306,165 @@ func TestTickScansDueSubscriptions(t *testing.T) {
 		t.Errorf("subscription = %+v, want it scanned by Tick", sub)
 	}
 	getReg(t, st.store, "https://github.com/o/r/pull/1", "sess1")
+}
+
+// --- notify mode: tell the session, watch nothing ---
+
+func (st *subTest) notifySub(mut func(*registry.Subscription)) string {
+	st.t.Helper()
+	return st.subscribe(func(s *registry.Subscription) {
+		s.Mode = registry.SubscriptionModeNotify
+		if mut != nil {
+			mut(s)
+		}
+	})
+}
+
+func watchCount(t *testing.T, st *subTest, id string) int {
+	t.Helper()
+	n, err := st.store.CountSubscriptionWatches(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestNotifyModeAnnouncesNewPRsAndWatchesNothing(t *testing.T) {
+	st := newSubTest(t, "alice")
+	ctx := context.Background()
+	id := st.notifySub(nil)
+	st.gh.result.Matches = []provider.ScanMatch{ghMatch(1, "bob")}
+
+	if sent := st.scan(); len(sent) != 0 {
+		t.Fatalf("first scan sent %q, want it silent", sent)
+	}
+	draft := ghMatch(2, "carol")
+	draft.Draft = true
+	st.gh.result.Matches = append(st.gh.result.Matches, draft)
+	sent := st.scan()
+	want := "sess1: [pr-watch] o/r#2: MATCHED new PR by carol, draft, not watched: call register to follow it (https://github.com/o/r/pull/2)"
+	if len(sent) != 1 || sent[0] != want {
+		t.Errorf("sent %q, want [%q]", sent, want)
+	}
+	if n := watchCount(t, st, id); n != 0 {
+		t.Errorf("a notify subscription registered %d watches", n)
+	}
+	if regs, _ := st.store.List(ctx); len(regs) != 0 {
+		t.Errorf("registrations = %+v, want none", regs)
+	}
+	if tracked, _ := st.store.TrackedMatches(ctx, id); len(tracked) != 2 || !tracked["https://github.com/o/r/pull/2"] {
+		t.Errorf("tracked = %v, want both PRs with #2 as a draft", tracked)
+	}
+	if st.scan(); len(st.notif.sent) != 0 {
+		t.Errorf("a scan with nothing new sent %q", st.notif.sent)
+	}
+}
+
+func TestNotifyModeReportsDraftFlipsUnlessFilteredOut(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		events []string
+		want   int
+	}{
+		{"default events", nil, 1},
+		{"events without the flip", []string{"MERGED"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newSubTest(t, "alice")
+			id := st.notifySub(func(s *registry.Subscription) { s.EventFilter = tc.events })
+			m := ghMatch(1, "bob")
+			m.Draft = true
+			st.gh.result.Matches = []provider.ScanMatch{m}
+			st.scan()
+			m.Draft = false
+			st.gh.result.Matches = []provider.ScanMatch{m}
+			sent := st.scan()
+			if len(sent) != tc.want || (tc.want == 1 && !strings.Contains(sent[0], "o/r#1: READY_FOR_REVIEW")) {
+				t.Errorf("sent %q, want %d READY_FOR_REVIEW ping(s)", sent, tc.want)
+			}
+			if tracked, _ := st.store.TrackedMatches(context.Background(), id); tracked["https://github.com/o/r/pull/1"] {
+				t.Error("the tracked draft flag was not updated")
+			}
+			m.Draft = true
+			st.gh.result.Matches = []provider.ScanMatch{m}
+			if sent := st.scan(); tc.want == 1 && (len(sent) != 1 || !strings.Contains(sent[0], "DRAFTED")) {
+				t.Errorf("flip back sent %q, want DRAFTED", sent)
+			}
+		})
+	}
+}
+
+func TestNotifyModeReportsPRsThatLeaveTheResults(t *testing.T) {
+	st := newSubTest(t, "alice")
+	ctx := context.Background()
+	id := st.notifySub(nil)
+	st.gh.result = provider.ScanResult{Complete: true, Matches: []provider.ScanMatch{ghMatch(1, "bob"), ghMatch(2, "bob"), ghMatch(3, "bob"), ghMatch(4, "bob")}}
+	st.scan()
+
+	st.gh.result = provider.ScanResult{Complete: false}
+	st.gh.states = map[string]provider.PRState{"https://github.com/o/r/pull/1": {State: "merged"}}
+	if sent := st.scan(); len(sent) != 0 || len(st.gh.stateCalls) != 0 {
+		t.Fatalf("an incomplete result sent %q after %d state lookups, want nothing: absent PRs may still match", sent, len(st.gh.stateCalls))
+	}
+
+	st.gh.result = provider.ScanResult{Complete: true, Matches: nil}
+	st.gh.states = map[string]provider.PRState{
+		"https://github.com/o/r/pull/1": {State: "merged"},
+		"https://github.com/o/r/pull/2": {State: "closed"},
+		"https://github.com/o/r/pull/3": {State: "open"}, // just stopped matching
+		// #4 is not returned at all
+	}
+	sent := st.scan()
+	if len(sent) != 1 || !strings.Contains(sent[0], "o/r#1: MERGED") || !strings.Contains(sent[0], "o/r#2: CLOSED") || strings.Contains(sent[0], "#3") || strings.Contains(sent[0], "#4") {
+		t.Errorf("sent %q, want MERGED for #1 and CLOSED for #2 only", sent)
+	}
+	if tracked, _ := st.store.TrackedMatches(ctx, id); len(tracked) != 0 {
+		t.Errorf("tracked = %v, want every one of them forgotten", tracked)
+	}
+}
+
+func TestNotifyModeKeepsTrackingWhenTheStateLookupFails(t *testing.T) {
+	st := newSubTest(t, "alice")
+	id := st.notifySub(nil)
+	st.gh.result = provider.ScanResult{Complete: true, Matches: []provider.ScanMatch{ghMatch(1, "bob")}}
+	st.scan()
+	st.gh.result = provider.ScanResult{Complete: true}
+	st.gh.statesErr = fmt.Errorf("github is down")
+	if sent := st.scan(); len(sent) != 0 {
+		t.Errorf("sent %q", sent)
+	}
+	if tracked, _ := st.store.TrackedMatches(context.Background(), id); len(tracked) != 1 {
+		t.Errorf("tracked = %v, want it kept for the next scan", tracked)
+	}
+}
+
+func TestNotifyModeLeavesPRsTheSessionAlreadyWatchesToTheirWatch(t *testing.T) {
+	st := newSubTest(t, "alice")
+	ctx := context.Background()
+	id := st.notifySub(func(s *registry.Subscription) { s.ReportExisting = true })
+	reg := registry.Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", NextDueAt: time.Now(), CreatedAt: time.Now()}
+	if err := st.store.Add(ctx, reg); err != nil {
+		t.Fatal(err)
+	}
+	st.gh.result = provider.ScanResult{Complete: true, Matches: []provider.ScanMatch{ghMatch(1, "bob"), ghMatch(2, "bob")}}
+	sent := st.scan()
+	if len(sent) != 1 || strings.Contains(sent[0], "#1") || !strings.Contains(sent[0], "o/r#2: MATCHED") {
+		t.Errorf("sent %q, want only #2 announced: #1 has its own watch", sent)
+	}
+	if tracked, _ := st.store.TrackedMatches(ctx, id); len(tracked) != 1 {
+		t.Errorf("tracked = %v, want just #2", tracked)
+	}
+}
+
+func TestNotifyModeHonoursTheCapAndReportExisting(t *testing.T) {
+	st := newSubTest(t, "alice")
+	id := st.notifySub(func(s *registry.Subscription) { s.ReportExisting = true; s.MaxWatches = 2 })
+	st.gh.result = provider.ScanResult{Complete: true, Matches: []provider.ScanMatch{ghMatch(1, "bob"), ghMatch(2, "bob"), ghMatch(3, "bob")}}
+	sent := st.scan()
+	if tracked, _ := st.store.TrackedMatches(context.Background(), id); len(tracked) != 2 {
+		t.Errorf("tracked = %v, want the cap of 2", tracked)
+	}
+	if len(sent) != 1 || !strings.Contains(sent[0], "o/r#1: MATCHED") || !strings.Contains(sent[0], "1 more") {
+		t.Errorf("sent %q, want two announcements and the overflow", sent)
+	}
 }
