@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/provider"
 	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/registry"
 )
 
@@ -805,5 +806,67 @@ func TestEyeChipHonoursTheEventsFilterForConflictAndQueue(t *testing.T) {
 	r.EventFilter = nil
 	if eye := buildRowBadgePayloads([]registry.Registration{r})["sess1"].Items[0]; eye.Tone != "danger" {
 		t.Errorf("unfiltered eye tone = %q, want danger for the conflict", eye.Tone)
+	}
+}
+
+func notifySubInfo(session string, tracked int) subscriptionBadgeInfo {
+	return subscriptionBadgeInfo{
+		SessionID: session, ID: "sub-abc", Scope: "github.com/o/r", Mode: registry.SubscriptionModeNotify,
+		Filters: provider.ScanFilters{ReviewRequested: "me", Draft: "exclude"}, Tracked: tracked,
+		LastScanAt: time.Date(2026, 10, 20, 13, 44, 0, 0, time.Local),
+	}
+}
+
+// A session that subscribed to a scope shows it on its row, even with no
+// watch of its own: an orchestrator in notify mode has nothing else to show.
+func TestSubscriptionChipShowsOnASessionWithoutWatches(t *testing.T) {
+	got := buildRowBadgePayloadsWithSubs(nil, []subscriptionBadgeInfo{notifySubInfo("orch", 3)})
+	badge, ok := got["orch"]
+	if !ok || len(badge.Items) != 1 {
+		t.Fatalf("badge = %+v (%v), want one chip", badge, ok)
+	}
+	chip := badge.Items[0]
+	if chip.Icon != "radar" || chip.Text != "3" || chip.Tone != "info" {
+		t.Errorf("chip = %+v, want the radar icon counting 3 tracked PRs", chip)
+	}
+	for _, want := range []string{"github.com/o/r", "notify", "review_requested=me", "draft=exclude", "3 tracked", "13:44"} {
+		if !strings.Contains(chip.Tooltip, want) {
+			t.Errorf("tooltip %q lacks %q", chip.Tooltip, want)
+		}
+	}
+	if len(got) != 1 {
+		t.Errorf("badges for %d sessions, want just the subscriber", len(got))
+	}
+}
+
+func TestSubscriptionChipComesFirstAndWarnsOnAScanError(t *testing.T) {
+	regs := []registry.Registration{{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", CIBucket: "success"}}
+	sub := notifySubInfo("sess1", 0)
+	sub.LastError = "github is down"
+	items := buildRowBadgePayloadsWithSubs(regs, []subscriptionBadgeInfo{sub})["sess1"].Items
+	if len(items) < 2 || items[0].Icon != "radar" || items[1].Icon != "eye" {
+		t.Fatalf("items = %+v, want the subscription chip ahead of the watch chips", items)
+	}
+	if items[0].Tone != "warn" || !strings.Contains(items[0].Tooltip, "github is down") || items[0].Text != "" {
+		t.Errorf("chip = %+v, want a warning with the error and no count", items[0])
+	}
+}
+
+func TestSubscriptionChipForWatchModeAndSeveralSubscriptions(t *testing.T) {
+	watch := subscriptionBadgeInfo{SessionID: "s", ID: "sub-w", Scope: "gitlab.corp.example/g", Mode: registry.SubscriptionModeWatch, Watches: 4}
+	chip := buildRowBadgePayloadsWithSubs(nil, []subscriptionBadgeInfo{watch})["s"].Items[0]
+	if chip.Text != "" || !strings.Contains(chip.Tooltip, "4 watching") || !strings.Contains(chip.Tooltip, "watch") {
+		t.Errorf("watch-mode chip = %+v, want no count (the watches have their own chips) and the watch count in the tooltip", chip)
+	}
+
+	var subs []subscriptionBadgeInfo
+	for i := range 7 {
+		s := notifySubInfo("s", 2)
+		s.ID = fmt.Sprintf("sub-%d", i)
+		subs = append(subs, s)
+	}
+	chip = buildRowBadgePayloadsWithSubs(nil, subs)["s"].Items[0]
+	if chip.Text != "14" || !strings.Contains(chip.Tooltip, "+2 more") {
+		t.Errorf("chip = %+v, want 14 tracked in total and the tooltip capped with +2 more", chip)
 	}
 }

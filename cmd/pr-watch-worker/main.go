@@ -294,9 +294,16 @@ func pushUIState(ctx context.Context, store *registry.Store, aoe *aoeclient.Clie
 		logger.Warn("push home pane", "error", err)
 	}
 
-	badges := buildRowBadgePayloads(regs)
+	subInfos, subSessions, err := loadSubscriptionBadgeInfos(pushCtx, store)
+	if err != nil {
+		logger.Warn("load subscriptions for UI push", "error", err)
+	}
+	badges := buildRowBadgePayloadsWithSubs(regs, subInfos)
 	regsBySession := make(map[string][]registry.Registration, len(regs))
 	allSessions := make(map[string]bool, len(regs))
+	for _, sid := range subSessions {
+		allSessions[sid] = true
+	}
 	for _, r := range regs {
 		allSessions[r.SessionID] = true
 		regsBySession[r.SessionID] = append(regsBySession[r.SessionID], r)

@@ -48,6 +48,115 @@ type badgeChip struct {
 // stopped) gets no entry in the returned map, so the caller knows to remove
 // any badge it previously had.
 func buildRowBadgePayloads(regs []registry.Registration) map[string]rowBadgePayload {
+	return buildRowBadgePayloadsWithSubs(regs, nil)
+}
+
+// subscriptionBadgeInfo is what a session's row badge says about one of its
+// active subscriptions.
+type subscriptionBadgeInfo struct {
+	SessionID  string
+	ID         string
+	Scope      string // "github.com/owner/repo", "gitlab.example.com/group", "github.com"
+	Mode       string // registry.SubscriptionModeWatch or ...Notify
+	Filters    provider.ScanFilters
+	Tracked    int // PRs/MRs a notify subscription has told the session about
+	Watches    int // watches a watch subscription has registered
+	LastScanAt time.Time
+	LastError  string
+}
+
+const (
+	maxSubscriptionTooltipEntries = 5
+	maxSubscriptionTooltipError   = 80
+)
+
+// filterSummary is the non-empty filters as sorted key=value pairs.
+func filterSummary(f provider.ScanFilters) string {
+	raw, err := json.Marshal(f)
+	if err != nil {
+		return ""
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil {
+		return ""
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		switch v := m[k].(type) {
+		case []any:
+			vals := make([]string, 0, len(v))
+			for _, x := range v {
+				vals = append(vals, fmt.Sprint(x))
+			}
+			parts = append(parts, k+"="+strings.Join(vals, ","))
+		default:
+			parts = append(parts, fmt.Sprintf("%s=%v", k, v))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// subscriptionChip is the one chip standing for a session's subscriptions: a
+// radar with the number of PRs/MRs its notify subscriptions are tracking (a
+// watch subscription's matches already have chips of their own), a warning
+// tone when a scan failed, and every subscription in the tooltip.
+func subscriptionChip(subs []subscriptionBadgeInfo) badgeChip {
+	tracked, failing := 0, false
+	var lines []string
+	for i, s := range subs {
+		tracked += s.Tracked
+		failing = failing || s.LastError != ""
+		if i >= maxSubscriptionTooltipEntries {
+			continue
+		}
+		line := fmt.Sprintf("%s (%s", s.Scope, s.Mode)
+		if f := filterSummary(s.Filters); f != "" {
+			line += ", " + f
+		}
+		line += "): "
+		if s.Mode == registry.SubscriptionModeNotify {
+			line += fmt.Sprintf("%d tracked", s.Tracked)
+		} else {
+			line += fmt.Sprintf("%d watching", s.Watches)
+		}
+		if !s.LastScanAt.IsZero() {
+			line += ", last scan " + s.LastScanAt.Local().Format("15:04")
+		}
+		if s.LastError != "" {
+			e := []rune(s.LastError)
+			if len(e) > maxSubscriptionTooltipError {
+				e = append(e[:maxSubscriptionTooltipError-1], '…')
+			}
+			line += ", last error: " + string(e)
+		}
+		lines = append(lines, line)
+	}
+	if more := len(subs) - maxSubscriptionTooltipEntries; more > 0 {
+		lines = append(lines, fmt.Sprintf("+%d more", more))
+	}
+	chip := badgeChip{Icon: "radar", Tone: "info", Tooltip: "watching scopes: " + strings.Join(lines, "; ")}
+	if tracked > 0 {
+		chip.Text = strconv.Itoa(tracked)
+	}
+	if failing {
+		chip.Tone = "warn"
+	}
+	return chip
+}
+
+// buildRowBadgePayloadsWithSubs is buildRowBadgePayloads plus a leading chip
+// for each session's subscriptions. A session with subscriptions but no watch
+// of its own still gets a badge.
+func buildRowBadgePayloadsWithSubs(regs []registry.Registration, subs []subscriptionBadgeInfo) map[string]rowBadgePayload {
+	subsBySession := make(map[string][]subscriptionBadgeInfo)
+	for _, s := range subs {
+		subsBySession[s.SessionID] = append(subsBySession[s.SessionID], s)
+	}
 	bySession := make(map[string][]registry.Registration)
 	for _, r := range regs {
 		if r.Status == registry.StatusStopped {
@@ -101,7 +210,16 @@ func buildRowBadgePayloads(regs []registry.Registration) map[string]rowBadgePayl
 		if len(items)+len(watchedItems) > compactChipThreshold {
 			watchedItems = chipsForRegistrations(watched, true)
 		}
-		out[sid] = rowBadgePayload{Items: fitRowBadge(append(items, watchedItems...))}
+		items = append(items, watchedItems...)
+		if s, ok := subsBySession[sid]; ok {
+			items = append([]badgeChip{subscriptionChip(s)}, items...)
+		}
+		out[sid] = rowBadgePayload{Items: fitRowBadge(items)}
+	}
+	for sid, s := range subsBySession {
+		if _, ok := out[sid]; !ok {
+			out[sid] = rowBadgePayload{Items: []badgeChip{subscriptionChip(s)}}
+		}
 	}
 	return out
 }

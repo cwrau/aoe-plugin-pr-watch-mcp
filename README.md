@@ -153,6 +153,10 @@ PR text as untrusted.
   lookup, only for PRs that dropped out of the results; `events` can trim
   these). The agent calls `register` on the PRs it wants to follow, and from
   then on that watch reports, so nothing is pinged twice.
+- **Badge:** a session with subscriptions gets a radar chip at the front of its
+  row, even with no watch of its own. Its number is how many PRs/MRs its notify
+  subscriptions track, it turns to a warning when a scan failed, and the tooltip
+  lists every subscription with its scope, filters, counts and last scan.
 - **Cost:** one search per distinct query every two minutes (identical
   subscriptions share it), 1 GraphQL point per GitHub search, plus the usual
   polling of the registered watches.
