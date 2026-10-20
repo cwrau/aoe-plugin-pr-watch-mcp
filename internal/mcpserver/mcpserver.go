@@ -196,7 +196,7 @@ func NewHandler(store *registry.Store, gh GitHubReviewClient, sessions SessionVa
 		o(&cfg)
 	}
 	newServer := func(*http.Request) *mcp.Server {
-		server := mcp.NewServer(&mcp.Implementation{Name: "io.cwrau.pr-watch-mcp", Version: "0.1.0"}, &mcp.ServerOptions{Instructions: serverInstructions})
+		server := mcp.NewServer(&mcp.Implementation{Name: "io.cwrau.pr-watch-mcp", Version: "0.2.0"}, &mcp.ServerOptions{Instructions: serverInstructions})
 
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "register",

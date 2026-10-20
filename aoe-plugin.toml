@@ -5,7 +5,7 @@
 
 id = "io.cwrau.pr-watch-mcp"
 name = "PR Watch"
-version = "0.1.0"
+version = "0.2.0"
 api_version = 15
 aoe_version = ">=1.20.0, <2.0.0"
 description = "Persistent GitHub PR / GitLab MR watcher: register once, get woken on review/CI/merge activity, even across session restarts."
