@@ -203,8 +203,12 @@ func TestSubscribeNotifyModeIsStoredAndValidated(t *testing.T) {
 
 	callTool(t, srv, "subscribe", map[string]any{"scope_url": "https://github.com/acme/other", "session_id": "sess1"})
 	subs, _ := store.ListSubscriptions(context.Background())
-	if subs[1].Mode != registry.SubscriptionModeWatch {
-		t.Errorf("default mode = %q, want watch", subs[1].Mode)
+	for _, s := range subs {
+		// Looked up by scope: the list is ordered by creation second, then by a
+		// random id, so two subscriptions made together can come back either way.
+		if s.ScopePath == "acme/other" && s.Mode != registry.SubscriptionModeWatch {
+			t.Errorf("default mode = %q, want watch", s.Mode)
+		}
 	}
 }
 
