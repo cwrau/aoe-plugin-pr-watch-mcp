@@ -257,13 +257,19 @@ threads.
 
 ## Logs
 
-The worker logs to stderr, which AoE writes to
-`<aoe config dir>/plugin-workers/<worker-id>.log` (one file per worker start;
-on Linux `~/.config/agent-of-empires/plugin-workers/`). Find the live one with
-`rg -l 'pr_url' <dir> | xargs ls -t | head -1`. It records every event found
-(`event`), every ping sent (`ping sent`) or held back (`ping suppressed`, with
-the reason `filter`, `self-authored` or `baseline`), failed sends
-(`notify failed`) and the rate-limit state after each provider pass.
+The worker logs to stderr, which AoE writes to one file per worker start under
+`<aoe config dir>/plugin-workers/` (on Linux
+`~/.config/agent-of-empires/plugin-workers/`). Newer AoE builds name the files
+`<plugin-id>_<worker-uuid>.log`, keep the five newest per plugin, and
+`aoe plugin logs io.cwrau.pr-watch-mcp` prints the live one's path, so
+`tail -f "$(aoe plugin logs io.cwrau.pr-watch-mcp)"` follows it. v1.20.0 names
+them `<worker-uuid>.log` and never prunes; find the live one there with
+`rg -l 'pr_url' <dir> | xargs ls -t | head -1`.
+
+The log records every event found (`event`), every ping sent (`ping sent`) or
+held back (`ping suppressed`, with the reason `filter`, `self-authored` or
+`baseline`), failed sends (`notify failed`), a warning when the worker cannot
+resolve its own account, and the rate-limit state after each provider pass.
 
 ## Building and development
 
