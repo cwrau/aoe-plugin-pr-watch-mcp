@@ -40,7 +40,7 @@ a review, a comment, CI turning red, a conflict, a merge.
 ## Install
 
 ```bash
-aoe plugin install gh:<owner>/aoe-plugin-pr-watch-mcp
+aoe plugin install gh:cwrau/aoe-plugin-pr-watch-mcp
 ```
 
 Update later with `aoe plugin update io.cwrau.pr-watch-mcp`. Grant the
