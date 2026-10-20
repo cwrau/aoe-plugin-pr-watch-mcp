@@ -145,6 +145,14 @@ PR text as untrusted.
   subscription keeps (25, or 10 for a platform; 100 at most) and overflow is
   reported once. Your own PRs are skipped for the reviewer persona. Unsubscribing, or the
   session going away, stops the registered watches.
+- **Notify mode** (`mode: "notify"`) is for an orchestrator that only needs to
+  know PRs exist. Nothing is watched: no per-PR polling, no badge. It gets
+  `MATCHED new PR by alice, draft, not watched: call register to follow it
+  (url)` for each new match, then `DRAFTED` / `READY_FOR_REVIEW` when the draft
+  flag flips and `MERGED` / `CLOSED` when a tracked PR ends (one cheap state
+  lookup, only for PRs that dropped out of the results; `events` can trim
+  these). The agent calls `register` on the PRs it wants to follow, and from
+  then on that watch reports, so nothing is pinged twice.
 - **Cost:** one search per distinct query every two minutes (identical
   subscriptions share it), 1 GraphQL point per GitHub search, plus the usual
   polling of the registered watches.

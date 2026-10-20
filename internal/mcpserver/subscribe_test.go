@@ -174,3 +174,57 @@ func TestSubscriptionsListsByOwner(t *testing.T) {
 	}
 	_ = store
 }
+
+func TestSubscribeNotifyModeIsStoredAndValidated(t *testing.T) {
+	srv, store := subscribeServer(t, fakeScopeResolver{})
+	callTool(t, srv, "subscribe", map[string]any{
+		"scope_url": "https://github.com/acme/widgets", "session_id": "sess1", "mode": "notify",
+		"events":  []string{"READY_FOR_REVIEW", "MERGED"},
+		"filters": map[string]any{"draft": "include"},
+	})
+	sub := onlySubscription(t, store)
+	if sub.Mode != registry.SubscriptionModeNotify || len(sub.EventFilter) != 2 {
+		t.Errorf("subscription = %+v, want notify mode with the two status events", sub)
+	}
+
+	for name, in := range map[string]map[string]any{
+		"unknown mode":                    {"mode": "spy"},
+		"ci event in notify mode":         {"mode": "notify", "events": []string{"CI"}},
+		"release is a watch-mode setting": {"mode": "notify", "release_when_unmatched": true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			in["scope_url"], in["session_id"] = "https://github.com/acme/widgets", "sess1"
+			callToolExpectError(t, srv, "subscribe", in)
+		})
+	}
+	if subs, _ := store.ListSubscriptions(context.Background()); len(subs) != 1 {
+		t.Errorf("rejected input stored %d extra subscriptions", len(subs)-1)
+	}
+
+	callTool(t, srv, "subscribe", map[string]any{"scope_url": "https://github.com/acme/other", "session_id": "sess1"})
+	subs, _ := store.ListSubscriptions(context.Background())
+	if subs[1].Mode != registry.SubscriptionModeWatch {
+		t.Errorf("default mode = %q, want watch", subs[1].Mode)
+	}
+}
+
+func TestSubscriptionsShowsModeAndTrackedCount(t *testing.T) {
+	srv, store := subscribeServer(t, fakeScopeResolver{})
+	callTool(t, srv, "subscribe", map[string]any{"scope_url": "https://github.com/acme/widgets", "session_id": "sess1", "mode": "notify"})
+	sub := onlySubscription(t, store)
+	_ = store.SetTrackedMatch(context.Background(), sub.ID, "https://github.com/acme/widgets/pull/1", false)
+	_ = store.SetTrackedMatch(context.Background(), sub.ID, "https://github.com/acme/widgets/pull/2", true)
+
+	res := callTool(t, srv, "subscriptions", map[string]any{"session_id": "sess1"})
+	raw, _ := json.Marshal(res.StructuredContent)
+	var out struct {
+		Subscriptions []struct {
+			Mode    string `json:"mode"`
+			Tracked int    `json:"tracked"`
+			Watches int    `json:"watches"`
+		} `json:"subscriptions"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || len(out.Subscriptions) != 1 || out.Subscriptions[0].Mode != "notify" || out.Subscriptions[0].Tracked != 2 || out.Subscriptions[0].Watches != 0 {
+		t.Errorf("subscriptions = %s (%v), want mode notify, 2 tracked, 0 watches", raw, err)
+	}
+}

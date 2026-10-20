@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -32,6 +34,10 @@ func WithScopeResolver(r ScopeResolver) Option {
 	return func(c *handlerConfig) { c.scopes = r }
 }
 
+// notifyStatusKinds are the events a notify-mode subscription reports besides
+// MATCHED: the rough status changes of PRs/MRs it does not watch.
+var notifyStatusKinds = []string{"DRAFTED", "READY_FOR_REVIEW", "MERGED", "CLOSED"}
+
 const (
 	defaultMaxWatches         = 25
 	defaultPlatformMaxWatches = 10
@@ -46,7 +52,8 @@ type subscribeInput struct {
 	Events               []string             `json:"events,omitempty" jsonschema:"optional: event kinds the registered watches notify on, as for register; omit for the persona's defaults"`
 	ReportExisting       bool                 `json:"report_existing,omitempty" jsonschema:"optional: announce the PRs/MRs that already match on the first scan instead of registering them silently"`
 	MaxWatches           int                  `json:"max_watches,omitempty" jsonschema:"optional: most watches this subscription keeps registered (default 25, 10 for a platform scope, at most 100)"`
-	ReleaseWhenUnmatched bool                 `json:"release_when_unmatched,omitempty" jsonschema:"optional: stop watching a PR/MR once it no longer matches the filters, instead of following it until merged or closed"`
+	ReleaseWhenUnmatched bool                 `json:"release_when_unmatched,omitempty" jsonschema:"optional, watch mode only: stop watching a PR/MR once it no longer matches the filters, instead of following it until merged or closed"`
+	Mode                 string               `json:"mode,omitempty" jsonschema:"optional: watch (default: every match is registered as a watch) or notify (nothing is watched: you are told about new matches, draft flips, merges and closes, and decide what to register yourself, e.g. as an orchestrator)"`
 }
 
 type subscribeOutput struct {
@@ -85,7 +92,9 @@ type subscriptionView struct {
 	MaxWatches           int                  `json:"max_watches"`
 	ReleaseWhenUnmatched bool                 `json:"release_when_unmatched"`
 	Status               string               `json:"status"`
+	Mode                 string               `json:"mode"`
 	Watches              int                  `json:"watches"`
+	Tracked              int                  `json:"tracked"`
 	LastScanAt           *time.Time           `json:"last_scan_at,omitempty"`
 	LastError            string               `json:"last_error,omitempty"`
 }
@@ -109,6 +118,23 @@ func addSubscriptionTools(server *mcp.Server, store *registry.Store, sessions Se
 			}
 			if err := validateEventFilter(in.Events); err != nil {
 				return nil, subscribeOutput{}, err
+			}
+			mode := in.Mode
+			switch mode {
+			case "":
+				mode = registry.SubscriptionModeWatch
+			case registry.SubscriptionModeWatch:
+			case registry.SubscriptionModeNotify:
+				if in.ReleaseWhenUnmatched {
+					return nil, subscribeOutput{}, fmt.Errorf("release_when_unmatched only applies to watch mode: a notify subscription watches nothing")
+				}
+				for _, kind := range in.Events {
+					if !slices.Contains(notifyStatusKinds, kind) {
+						return nil, subscribeOutput{}, fmt.Errorf("events entry %q does not apply to notify mode, which reports only %s", kind, strings.Join(notifyStatusKinds, ", "))
+					}
+				}
+			default:
+				return nil, subscribeOutput{}, fmt.Errorf("mode %q is not recognized (watch, notify)", mode)
 			}
 			persona := in.Persona
 			switch persona {
@@ -167,7 +193,7 @@ func addSubscriptionTools(server *mcp.Server, store *registry.Store, sessions Se
 			id, err := store.AddSubscription(ctx, registry.Subscription{
 				SessionID: in.SessionID, Provider: scope.Provider, Host: scope.Host, ScopeKind: scope.Kind, ScopePath: scope.Path,
 				Filters: string(filters), Persona: persona, EventFilter: in.Events, ReportExisting: in.ReportExisting,
-				MaxWatches: maxWatches, ReleaseWhenUnmatched: in.ReleaseWhenUnmatched, CreatedAt: now,
+				MaxWatches: maxWatches, ReleaseWhenUnmatched: in.ReleaseWhenUnmatched, CreatedAt: now, Mode: mode,
 			})
 			if err != nil {
 				return nil, subscribeOutput{}, err
@@ -214,10 +240,14 @@ func addSubscriptionTools(server *mcp.Server, store *registry.Store, sessions Se
 				if err != nil {
 					return nil, subscriptionsOutput{}, err
 				}
+				tracked, err := store.TrackedMatches(ctx, s.ID)
+				if err != nil {
+					return nil, subscriptionsOutput{}, err
+				}
 				v := subscriptionView{
 					ID: s.ID, SessionID: s.SessionID, Provider: s.Provider, Host: s.Host, ScopeKind: s.ScopeKind, ScopePath: s.ScopePath,
 					Persona: s.Persona, Events: s.EventFilter, MaxWatches: s.MaxWatches,
-					ReleaseWhenUnmatched: s.ReleaseWhenUnmatched, Status: s.Status, Watches: watches, LastError: s.LastError,
+					ReleaseWhenUnmatched: s.ReleaseWhenUnmatched, Status: s.Status, Mode: s.Mode, Watches: watches, Tracked: len(tracked), LastError: s.LastError,
 				}
 				if err := json.Unmarshal([]byte(s.Filters), &v.Filters); err != nil {
 					return nil, subscriptionsOutput{}, fmt.Errorf("subscription %s: stored filters: %w", s.ID, err)

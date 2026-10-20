@@ -132,3 +132,25 @@ func TestRegisterStoresPersonaAndRejectsUnknownOnes(t *testing.T) {
 		t.Error("a registration with an unknown persona was stored")
 	}
 }
+
+func TestSubscribeDocsExplainNotifyMode(t *testing.T) {
+	session := connect(t, newTestServer(t))
+	tools, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var desc string
+	for _, tool := range tools.Tools {
+		if tool.Name == "subscribe" {
+			desc = tool.Description
+		}
+	}
+	for _, want := range []string{"notify", "orchestrator", "register", "not watched"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("subscribe description does not mention %q", want)
+		}
+	}
+	if !strings.Contains(session.InitializeResult().Instructions, "notify") {
+		t.Error("server instructions do not mention notify mode")
+	}
+}
