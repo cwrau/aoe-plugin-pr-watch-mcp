@@ -1301,3 +1301,51 @@ func TestGitHubCheckerForcePushIsOnlyTheCurrentHead(t *testing.T) {
 		t.Errorf("result = %+v, want no force-push (a later head) and no self review (dismissed)", r)
 	}
 }
+
+// A failed lookup (a network blip, a poll that timed out) must not be
+// remembered: with it cached forever, the worker never learned its own login
+// and pinged its user about their own comments until it restarted.
+func TestSelfLoginRetriesAfterAFailure(t *testing.T) {
+	var calls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			http.Error(w, "boom", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data": {"viewer": {"login": "alice"}}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	if _, err := c.SelfLogin(t.Context()); err == nil {
+		t.Fatal("first SelfLogin() succeeded, want the 502 as an error")
+	}
+	got, err := c.SelfLogin(t.Context())
+	if err != nil || got != "alice" {
+		t.Fatalf("second SelfLogin() = (%q, %v), want (alice, nil)", got, err)
+	}
+	if _, err := c.SelfLogin(t.Context()); err != nil || calls != 2 {
+		t.Errorf("third SelfLogin() err = %v after %d calls, want the success cached", err, calls)
+	}
+}
+
+func TestSelfLoginSurvivesACancelledFirstContext(t *testing.T) {
+	srv := dispatchGraphQLServer(t, map[string]string{
+		"viewer { login }": `{"data": {"viewer": {"login": "alice"}}}`,
+	})
+	defer srv.Close()
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := c.SelfLogin(ctx); err == nil {
+		t.Fatal("SelfLogin() with a cancelled context succeeded")
+	}
+	if got, err := c.SelfLogin(t.Context()); err != nil || got != "alice" {
+		t.Errorf("SelfLogin() afterwards = (%q, %v), want (alice, nil)", got, err)
+	}
+}
