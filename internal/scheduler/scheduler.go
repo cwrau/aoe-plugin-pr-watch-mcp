@@ -594,6 +594,7 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 	// watching it regardless of whether that session asked to hear about it.
 	notifyEvents := filterEvents(events, reg.EffectiveEventFilter())
 	notifyEvents = filterReviewRequests(notifyEvents, prev, result, selfAuthor)
+	notifyEvents = filterSelfResolved(notifyEvents, prev, result, selfAuthor)
 	if len(events) > 0 && len(notifyEvents) == 0 {
 		s.log().Info("ping suppressed", "pr_url", reg.PRURL, "session_id", reg.SessionID, "reason", "filter", "events", len(events))
 	}
@@ -1004,4 +1005,37 @@ func eventsMessage(ref string, events []provider.Event) string {
 		b.WriteString(formatEventBody(ev))
 	}
 	return b.String()
+}
+
+// filterSelfResolved keeps THREAD_RESOLVED events about threads the worker's
+// own account did not resolve: resolving a thread yourself is not news. The
+// count in the message is narrowed to the other people's, and the event goes
+// when none are left. A thread whose resolver the provider does not name could
+// have been resolved by anyone, so it counts.
+func filterSelfResolved(events []provider.Event, prev provider.PrevState, result provider.CheckResult, self string) []provider.Event {
+	if self == "" {
+		return events
+	}
+	var out []provider.Event
+	for _, ev := range events {
+		if ev.Kind != "THREAD_RESOLVED" {
+			out = append(out, ev)
+			continue
+		}
+		others := 0
+		for _, id := range prev.UnresolvedThreadIDs {
+			if slices.Contains(result.UnresolvedThreadIDs, id) {
+				continue // still open
+			}
+			if resolver := result.ResolvedBy[id]; !strings.EqualFold(resolver, self) {
+				others++
+			}
+		}
+		if others == 0 {
+			continue
+		}
+		ev.Message = fmt.Sprintf("%d thread(s) resolved, %d unresolved left", others, len(result.UnresolvedThreadIDs))
+		out = append(out, ev)
+	}
+	return out
 }

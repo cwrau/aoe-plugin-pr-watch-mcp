@@ -137,7 +137,10 @@ type gitlabDiscussion struct {
 		Body       string `json:"body"`
 		Resolvable bool   `json:"resolvable"`
 		Resolved   bool   `json:"resolved"`
-		Author     struct {
+		ResolvedBy *struct {
+			Username string `json:"username"`
+		} `json:"resolved_by"`
+		Author struct {
 			Username string `json:"username"`
 		} `json:"author"`
 	} `json:"notes"`
@@ -333,15 +336,24 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 	// discussion needs at least one real (non-system) note to count.
 	for _, d := range discussions {
 		resolvable, unresolved, hasComment := false, false, false
+		resolver := ""
 		for _, n := range d.Notes {
 			if n.Resolvable {
 				resolvable = true
 				if !n.Resolved {
 					unresolved = true
+				} else if n.ResolvedBy != nil {
+					resolver = n.ResolvedBy.Username
 				}
 			} else if !n.System {
 				hasComment = true
 			}
+		}
+		if resolvable && !unresolved && resolver != "" {
+			if result.ResolvedBy == nil {
+				result.ResolvedBy = make(map[string]string)
+			}
+			result.ResolvedBy[d.ID] = resolver
 		}
 		if unresolved {
 			result.UnresolvedThreadIDs = append(result.UnresolvedThreadIDs, d.ID)

@@ -51,6 +51,7 @@ type CheckResult struct {
 	UnresolvedThreadIDs     []string          // IDs of currently-unresolved review/discussion threads; empty if none or the provider doesn't track them
 	ThreadComments          []ThreadComment   // the (newest) comments of those threads as fetched; replies are detected from it. May be narrowed by ExcludeThreadCommentsBy before diffing, so it is not what gets persisted — ThreadCommentIDs is
 	ThreadCommentIDs        []string          // IDs of every comment in ThreadComments as fetched, persisted as the baseline for the next check
+	ResolvedBy              map[string]string // thread ID -> login/username of whoever resolved it, for the resolved threads the provider names the resolver of; used to keep a session from being told about its own resolve
 	TopLevelComments        []TopLevelComment // the raw top-level comments as fetched; TopLevelCommentIDs/LatestComment* below are derived from it by ApplyCommentFilters
 	TopLevelCommentIDs      []string          // IDs of top-level PR/MR conversation comments (the Conversation tab, not inline review threads — e.g. a bot's walkthrough summary); empty if none
 	LatestCommentHref       string            // link to the most recent top-level comment; empty if none

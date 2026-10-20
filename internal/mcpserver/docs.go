@@ -28,7 +28,7 @@ Events (the kind is the first word of the line):
   - PUSH: the head commit moved ("new commits by <author>, head now <sha>", "force-push, ..." after a force-push). The re-review signal.
   - REVIEW_REQUESTED: a review was requested from the worker's own account ("review requested from you"). Requests for other people never ping.
   - READY_FOR_REVIEW / DRAFTED: the PR/MR left or went back to draft.
-  - THREAD_RESOLVED: review threads were resolved ("N thread(s) resolved, M unresolved left").
+  - THREAD_RESOLVED: review threads were resolved ("N thread(s) resolved, M unresolved left"). Threads the worker's own account resolved are not counted.
 
 Personas: register takes persona "author" (default; you watch your own PR/MR) or "reviewer" (you review someone else's). The reviewer defaults to REVIEW, REVIEW_DISMISSED, COMMENT, PUSH, REVIEW_REQUESTED, READY_FOR_REVIEW, DRAFTED, THREAD_RESOLVED, REOPENED, MERGED and CLOSED, so no CI, conflict or merge queue pings, and its row badge shows only the PR chip and a review chip reading "in progress" until the worker's own account has approved. Auto-discovered watches are always author. An explicit events list overrides the persona's default.
 

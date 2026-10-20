@@ -90,7 +90,7 @@ group/project!17: MERGED
 | `REVIEW_REQUESTED` | **Opt-in.** A review was requested from *your* account. Requests for other people never ping.        |
 | `READY_FOR_REVIEW` | **Opt-in.** The PR/MR left draft.                                                                    |
 | `DRAFTED`          | **Opt-in.** The PR/MR went back to draft.                                                            |
-| `THREAD_RESOLVED`  | **Opt-in.** Review threads were resolved: "2 thread(s) resolved, 1 unresolved left".                 |
+| `THREAD_RESOLVED`  | **Opt-in.** Review threads were resolved by someone else: "2 thread(s) resolved, 1 unresolved left". |
 
 ### Personas
 

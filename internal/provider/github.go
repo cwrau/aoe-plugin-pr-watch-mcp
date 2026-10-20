@@ -159,7 +159,7 @@ const githubPullRequestFieldsQuery = `      state
       reviewDecision
       reviewCount: reviews { totalCount }
       latestReview: reviews(last: 1) { nodes { author { login } state body submittedAt url } }
-      reviewThreads(first: 100) { nodes { id isResolved comments(last: 3) { nodes { id url author { login } } } } }
+      reviewThreads(first: 100) { nodes { id isResolved resolvedBy { login } comments(last: 3) { nodes { id url author { login } } } } }
       comments(last: 20) { nodes { id url body author { login } } }
       commits(last: 1) {
         nodes { commit { author { name user { login } } statusCheckRollup { state } } }
@@ -217,6 +217,9 @@ type githubPullRequestFields struct {
 		Nodes []struct {
 			ID         string `json:"id"`
 			IsResolved bool   `json:"isResolved"`
+			ResolvedBy *struct {
+				Login string `json:"login"`
+			} `json:"resolvedBy"`
 			// Only the newest few comments per thread: enough to spot a
 			// reply, without paying GraphQL cost for whole long threads.
 			Comments struct {
@@ -428,6 +431,12 @@ func buildCheckResult(pr githubPullRequestFields) CheckResult {
 		result.MergeQueueRemovalReason = n[len(n)-1].Reason
 	}
 	for _, t := range pr.ReviewThreads.Nodes {
+		if t.IsResolved && t.ResolvedBy != nil && t.ResolvedBy.Login != "" {
+			if result.ResolvedBy == nil {
+				result.ResolvedBy = make(map[string]string)
+			}
+			result.ResolvedBy[t.ID] = t.ResolvedBy.Login
+		}
 		if !t.IsResolved {
 			result.UnresolvedThreadIDs = append(result.UnresolvedThreadIDs, t.ID)
 			for _, c := range t.Comments.Nodes {

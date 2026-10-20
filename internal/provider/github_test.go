@@ -1349,3 +1349,36 @@ func TestSelfLoginSurvivesACancelledFirstContext(t *testing.T) {
 		t.Errorf("SelfLogin() afterwards = (%q, %v), want (alice, nil)", got, err)
 	}
 }
+
+func TestGitHubCheckerRecordsWhoResolvedEachThread(t *testing.T) {
+	body := `{"data": {"repo0": {"pr0": {
+	  "state": "OPEN", "title": "t", "headRefOid": "x",
+	  "reviewThreads": {"nodes": [
+	    {"id": "t1", "isResolved": true, "resolvedBy": {"login": "alice"}, "comments": {"nodes": []}},
+	    {"id": "t2", "isResolved": true, "resolvedBy": null, "comments": {"nodes": []}},
+	    {"id": "t3", "isResolved": false, "resolvedBy": null, "comments": {"nodes": [{"id": "c1", "url": "u", "author": {"login": "bob"}}]}}
+	  ]},
+	  "reviewCount": {"totalCount": 0}, "latestReview": {"nodes": []}, "commits": {"nodes": []}
+	}}, "rateLimit": {"limit": 5000, "remaining": 4998, "resetAt": "2026-09-20T23:00:00Z"}}}`
+	srv := fakeGitHubServer(t, body, 0)
+	defer srv.Close()
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := results[url]
+	if !slices.Equal(r.UnresolvedThreadIDs, []string{"t3"}) {
+		t.Errorf("UnresolvedThreadIDs = %v", r.UnresolvedThreadIDs)
+	}
+	if r.ResolvedBy["t1"] != "alice" {
+		t.Errorf("ResolvedBy = %v, want t1 resolved by alice", r.ResolvedBy)
+	}
+	if v, ok := r.ResolvedBy["t2"]; ok && v != "" {
+		t.Errorf("ResolvedBy[t2] = %q, want unknown", v)
+	}
+	if _, ok := r.ResolvedBy["t3"]; ok {
+		t.Error("an unresolved thread has a resolver")
+	}
+}

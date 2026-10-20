@@ -1011,3 +1011,32 @@ func TestGitLabCheckerReadsReviewFlowFields(t *testing.T) {
 		t.Errorf("SelfReviewState = %q, want APPROVED from user_has_approved", r.SelfReviewState)
 	}
 }
+
+func TestGitLabCheckerRecordsWhoResolvedEachDiscussion(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"state": "opened", "title": "t", "pipeline": map[string]any{"status": "success"}})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": []map[string]any{}})
+	})
+	mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"id": "d1", "notes": []map[string]any{{"resolvable": true, "resolved": true, "resolved_by": map[string]any{"username": "alice"}}}},
+			{"id": "d2", "notes": []map[string]any{{"resolvable": true, "resolved": false}}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "tok", nil }, apiBaseOverride: srv.URL}
+	r, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.ResolvedBy["d1"] != "alice" || len(r.ResolvedBy) != 1 {
+		t.Errorf("ResolvedBy = %v, want only d1 by alice", r.ResolvedBy)
+	}
+	if !slices.Equal(r.UnresolvedThreadIDs, []string{"d2"}) {
+		t.Errorf("UnresolvedThreadIDs = %v", r.UnresolvedThreadIDs)
+	}
+}

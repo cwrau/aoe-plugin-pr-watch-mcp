@@ -100,3 +100,61 @@ func TestReviewFlowStateIsPersisted(t *testing.T) {
 		t.Errorf("stored = %+v", got)
 	}
 }
+
+// tickResolving polls a reviewer watch that had threads t1 and t2 open and now
+// has only t2 (and t3 if keepT3) left, resolved by whoever resolvedBy names.
+func tickResolving(t *testing.T, resolvedBy map[string]string, self string) []string {
+	t.Helper()
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+	reg := registry.Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", CIBucket: "none",
+		NextDueAt: now.Add(-time.Second), CreatedAt: now, Persona: registry.PersonaReviewer,
+	}
+	if err := store.Add(ctx, reg); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateState(ctx, reg.PRURL, "sess1", registry.StateUpdate{
+		CIBucket: "none", NextDueAt: now.Add(-time.Second), HeadSHA: "aaaaaaaaaa",
+		UnresolvedThreadIDs: []string{"t1", "t2", "t3"}, ThreadCommentsKnown: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gh := &fakeGitHubChecker{selfLogin: self, results: map[string]provider.CheckResult{reg.PRURL: {
+		State: "open", HeadSHA: "aaaaaaaaaa", UnresolvedThreadIDs: []string{"t3"}, ResolvedBy: resolvedBy,
+	}}, budgets: provider.GitHubBudgets{
+		GraphQL: provider.RateBudget{Limit: 5000, Remaining: 4999, ResetAt: now.Add(time.Hour)},
+		REST:    provider.RateBudget{Limit: 5000, Remaining: 4999, ResetAt: now.Add(time.Hour)},
+	}}
+	notify := &fakeNotifier{}
+	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: notify}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	return notify.sent
+}
+
+// Resolving a thread yourself is not news to you; resolving someone else's is.
+func TestThreadResolvedIsNotReportedWhenTheWorkersOwnAccountResolvedIt(t *testing.T) {
+	if got := tickResolving(t, map[string]string{"t1": "Alice", "t2": "alice"}, "alice"); len(got) != 0 {
+		t.Errorf("sent %q for threads the worker's own account resolved", got)
+	}
+
+	got := tickResolving(t, map[string]string{"t1": "bob", "t2": "bob"}, "alice")
+	if len(got) != 1 || got[0] != "sess1: [pr-watch] o/r#1: THREAD_RESOLVED 2 thread(s) resolved, 1 unresolved left" {
+		t.Errorf("sent %q, want the resolve by bob reported", got)
+	}
+
+	// Mixed: only the one resolved by someone else counts.
+	got = tickResolving(t, map[string]string{"t1": "alice", "t2": "bob"}, "alice")
+	if len(got) != 1 || !strings.Contains(got[0], "1 thread(s) resolved, 1 unresolved left") {
+		t.Errorf("sent %q, want one thread counted (the one bob resolved)", got)
+	}
+
+	// A resolver the provider does not name could be anyone: it is reported.
+	got = tickResolving(t, nil, "alice")
+	if len(got) != 1 || !strings.Contains(got[0], "2 thread(s) resolved") {
+		t.Errorf("sent %q, want an unattributed resolve reported", got)
+	}
+}
