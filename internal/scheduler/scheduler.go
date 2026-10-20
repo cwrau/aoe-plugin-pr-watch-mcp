@@ -99,6 +99,10 @@ type Scheduler struct {
 	Notify     Sender
 	Workspaces WorkspaceSource // optional: nil disables auto-watch discovery entirely
 	Remotes    RemoteResolver  // optional: nil disables auto-watch discovery entirely
+	// GitHubScan and GitLabScan search for the matches of subscriptions; nil
+	// leaves that provider's subscriptions unscanned.
+	GitHubScan GitHubScanner
+	GitLabScan GitLabScanner
 	Log        *slog.Logger
 
 	// CommentFilters returns the current top-level-comment filter rules; nil
@@ -222,6 +226,13 @@ func (s *Scheduler) Tick(ctx context.Context) error {
 		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), discoveryTimeout)
 		defer cancel()
 		s.discoverTick(dctx, now)
+	}
+
+	// Subscriptions, on a budget of their own like discovery.
+	if s.GitHubScan != nil || s.GitLabScan != nil {
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), subscriptionTimeout)
+		defer cancel()
+		s.scanSubscriptions(sctx, now)
 	}
 	return nil
 }
