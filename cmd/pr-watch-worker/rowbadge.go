@@ -471,6 +471,12 @@ func badgeChipsFor(r registry.Registration, compact bool) []badgeChip {
 			}
 			eye.Tooltip += "; review " + r.LatestReviewState
 		}
+		// A watch held back by a snooze gate sleeps: a moon for the eye, so a
+		// quiet PR that is muted looks different from one nothing happens on.
+		if r.Snoozed {
+			eye.Icon = "moon"
+			eye.Tooltip += " (snoozed: not checked until its snooze gate opens)"
+		}
 		chips := []badgeChip{eye}
 		if eventFilterShows(filter, "CI") && (!compact || compactCIChip(r.CIBucket)) {
 			if ci, ok := ciBadge(r.CIBucket); ok {

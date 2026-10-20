@@ -1360,3 +1360,29 @@ func TestSubscriptionModeAndTrackedMatches(t *testing.T) {
 		t.Errorf("a stopped subscription still tracks %v", got)
 	}
 }
+
+func TestSetSnoozedRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	r := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "s1", Provider: "github", NextDueAt: time.Now(), CreatedAt: time.Now()}
+	if err := s.Add(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ := s.Get(ctx, r.PRURL, "s1"); got.Snoozed {
+		t.Error("a new registration is snoozed")
+	}
+	if err := s.SetSnoozed(ctx, r.PRURL, "s1", true); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ := s.Get(ctx, r.PRURL, "s1")
+	list, _ := s.List(ctx)
+	if !got.Snoozed || len(list) != 1 || !list[0].Snoozed {
+		t.Errorf("Get() snoozed = %v, List() = %+v, want it set", got.Snoozed, list)
+	}
+	if err := s.SetSnoozed(ctx, r.PRURL, "s1", false); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ := s.Get(ctx, r.PRURL, "s1"); got.Snoozed {
+		t.Error("snoozed was not cleared")
+	}
+}

@@ -268,7 +268,14 @@ func (s *Scheduler) classifySession(ctx context.Context, reg registry.Registrati
 		return false
 	}
 
-	if s.isSnoozed(ctx, reg) {
+	snoozed := s.isSnoozed(ctx, reg)
+	if snoozed != reg.Snoozed {
+		// For the badge: a sleeping watch looks different from a live one.
+		if err := s.Store.SetSnoozed(ctx, reg.PRURL, reg.SessionID, snoozed); err != nil {
+			s.log().Error("mark snoozed state", "pr_url", reg.PRURL, "session_id", reg.SessionID, "error", err)
+		}
+	}
+	if snoozed {
 		// Stored state is left untouched on purpose: the baseline stays at
 		// what was last seen, so the first check after the gate opens diffs
 		// against it and reports everything that happened while snoozed.

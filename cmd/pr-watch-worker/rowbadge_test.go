@@ -870,3 +870,35 @@ func TestSubscriptionChipForWatchModeAndSeveralSubscriptions(t *testing.T) {
 		t.Errorf("chip = %+v, want 14 tracked in total and the tooltip capped with +2 more", chip)
 	}
 }
+
+// A snoozed watch is asleep: the PR chip wears a moon instead of the eye, so a
+// glance tells "quiet because nothing happens" from "quiet because muted".
+func TestSnoozedWatchShowsASleepingIcon(t *testing.T) {
+	awake := registry.Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", CIBucket: "success", Title: "Fix it"}
+	asleep := awake
+	asleep.Snoozed = true
+
+	if eye := buildRowBadgePayloads([]registry.Registration{awake})["sess1"].Items[0]; eye.Icon != "eye" || strings.Contains(eye.Tooltip, "snoozed") {
+		t.Errorf("awake chip = %+v, want the eye and no mention of snoozing", eye)
+	}
+	eye := buildRowBadgePayloads([]registry.Registration{asleep})["sess1"].Items[0]
+	if eye.Icon != "moon" || !strings.Contains(eye.Tooltip, "snoozed") || !strings.Contains(eye.Tooltip, "Fix it") {
+		t.Errorf("snoozed chip = %+v, want a moon and the tooltip saying snoozed", eye)
+	}
+	if eye.Href != "https://github.com/o/r/pull/1" {
+		t.Errorf("snoozed chip href = %q, want it still linking to the PR", eye.Href)
+	}
+
+	// Conflict colouring survives; only the icon and tooltip change.
+	asleep.HasConflict = true
+	if eye := buildRowBadgePayloads([]registry.Registration{asleep})["sess1"].Items[0]; eye.Icon != "moon" || eye.Tone != "danger" {
+		t.Errorf("snoozed conflicting chip = %+v, want a moon that is still danger", eye)
+	}
+
+	// A merged PR is no longer being polled, so it never sleeps.
+	merged := asleep
+	merged.Status = registry.StatusMerged
+	if chip := buildRowBadgePayloads([]registry.Registration{merged})["sess1"].Items[0]; chip.Icon != "check-circle" {
+		t.Errorf("merged chip = %+v", chip)
+	}
+}

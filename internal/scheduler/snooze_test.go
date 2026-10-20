@@ -345,3 +345,48 @@ func TestTickSnoozesGitLabRegistrations(t *testing.T) {
 		t.Errorf("GitLab checker calls = %d, want 0 while snoozed", gl.calls)
 	}
 }
+
+// A snoozed watch is marked so its badge can show it: set while the gate is
+// closed, cleared as soon as the watch is checked again.
+func TestSnoozedFlagFollowsTheGate(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+	reg := registry.Registration{
+		PRURL: "https://gitlab.corp.example/g/p/-/merge_requests/1", SessionID: "sessA", Provider: "gitlab",
+		NextDueAt: now.Add(-time.Minute), CreatedAt: now,
+	}
+	if err := store.Add(ctx, reg); err != nil {
+		t.Fatal(err)
+	}
+	gl := &fakeGitLabChecker{result: provider.CheckResult{State: "open"}}
+	gate := &gateCalls{answers: map[string]bool{"work-hours": false}}
+	sched := &Scheduler{
+		Store: store, GitLab: gl, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{},
+		Snooze: func() []SnoozeRule {
+			return []SnoozeRule{{Match: []string{"gitlab.corp.example/*"}, Gate: "work-hours"}}
+		},
+		RunGate: gate.run,
+	}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := getReg(t, store, reg.PRURL, "sessA"); !got.Snoozed {
+		t.Fatalf("registration = %+v, want it marked snoozed while the gate is closed", got)
+	}
+
+	// The gate opens; the next check is due again (the snooze recheck is a minute).
+	gate.answers["work-hours"] = true
+	if err := store.UpdateState(ctx, reg.PRURL, "sessA", registry.StateUpdate{NextDueAt: now.Add(-time.Second), CIBucket: "none"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := getReg(t, store, reg.PRURL, "sessA"); got.Snoozed {
+		t.Errorf("registration = %+v, want the snoozed mark cleared once the gate opened", got)
+	}
+	if gl.calls == 0 {
+		t.Error("the watch was not checked after the gate opened")
+	}
+}
