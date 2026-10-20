@@ -323,3 +323,68 @@ func TestResolveGitLabScope(t *testing.T) {
 		t.Error("an unknown path resolved")
 	}
 }
+
+func TestGitHubPullRequestStates(t *testing.T) {
+	var vars map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		vars = body.Variables
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data": {
+		  "p0": {"pullRequest": {"state": "MERGED", "isDraft": false}},
+		  "p1": {"pullRequest": {"state": "OPEN", "isDraft": true}},
+		  "p2": {"pullRequest": null}
+		}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "t", BaseURL: srv.URL}
+
+	urls := []string{"https://github.com/o/a/pull/1", "https://github.com/o/b/pull/2", "https://github.com/o/c/pull/3"}
+	got, err := c.PullRequestStates(t.Context(), urls)
+	if err != nil {
+		t.Fatalf("PullRequestStates() error = %v", err)
+	}
+	if got[urls[0]] != (PRState{State: "merged"}) || got[urls[1]] != (PRState{State: "open", Draft: true}) {
+		t.Errorf("states = %+v", got)
+	}
+	if _, ok := got[urls[2]]; ok {
+		t.Errorf("a PR GitHub no longer returns has a state: %+v", got[urls[2]])
+	}
+	if vars["o0"] != "o" || vars["r1"] != "b" || vars["n2"] != float64(3) {
+		t.Errorf("variables = %v, want owner, repo and number per alias", vars)
+	}
+	if got, err := c.PullRequestStates(t.Context(), nil); err != nil || len(got) != 0 {
+		t.Errorf("PullRequestStates(nil) = (%v, %v)", got, err)
+	}
+}
+
+func TestGitLabMergeRequestStates(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/projects/g%2Fp/merge_requests/3", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"state": "merged", "draft": false}`))
+	})
+	mux.HandleFunc("/api/v4/projects/g%2Fp/merge_requests/4", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"state": "opened", "draft": true}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "tok", nil }, apiBaseOverride: srv.URL}
+
+	urls := []string{"https://gitlab.corp.example/g/p/-/merge_requests/3", "https://gitlab.corp.example/g/p/-/merge_requests/4", "https://gitlab.corp.example/g/p/-/merge_requests/5"}
+	got, err := c.MergeRequestStates(t.Context(), "gitlab.corp.example", urls)
+	if err != nil {
+		t.Fatalf("MergeRequestStates() error = %v", err)
+	}
+	if got[urls[0]] != (PRState{State: "merged"}) || got[urls[1]] != (PRState{State: "open", Draft: true}) {
+		t.Errorf("states = %+v", got)
+	}
+	if _, ok := got[urls[2]]; ok {
+		t.Error("a missing MR (404) has a state, want it left out")
+	}
+}

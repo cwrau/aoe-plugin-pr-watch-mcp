@@ -178,3 +178,93 @@ func (c *GitLabChecker) ResolveScopeKind(ctx context.Context, host, path string)
 	}
 	return "", fmt.Errorf("%s/%s is neither a project nor a group the credential can see", host, path)
 }
+
+// PRState is the rough state of one PR/MR: open, merged or closed, and whether
+// it is a draft. It is all a notify-mode subscription needs to know about a PR
+// it does not watch.
+type PRState struct {
+	State string // "open" | "merged" | "closed"
+	Draft bool
+}
+
+// PullRequestStates looks up the state of each PR in one aliased query. A PR
+// GitHub does not return (deleted, no access) is left out of the result.
+func (c *GitHubChecker) PullRequestStates(ctx context.Context, urls []string) (map[string]PRState, error) {
+	out := make(map[string]PRState, len(urls))
+	if len(urls) == 0 {
+		return out, nil
+	}
+	var decl, body strings.Builder
+	vars := make(map[string]any, len(urls)*3)
+	for i, u := range urls {
+		owner, repo, number, err := ParseGitHubPRURL(u)
+		if err != nil {
+			return nil, err
+		}
+		if i > 0 {
+			decl.WriteString(", ")
+		}
+		fmt.Fprintf(&decl, "$o%d: String!, $r%d: String!, $n%d: Int!", i, i, i)
+		fmt.Fprintf(&body, "  p%d: repository(owner: $o%d, name: $r%d) { pullRequest(number: $n%d) { state isDraft } }\n", i, i, i, i)
+		vars[fmt.Sprintf("o%d", i)], vars[fmt.Sprintf("r%d", i)], vars[fmt.Sprintf("n%d", i)] = owner, repo, number
+	}
+	query := "query(" + decl.String() + ") {\n" + body.String() + "}"
+
+	var resp map[string]struct {
+		PullRequest *struct {
+			State   string `json:"state"`
+			IsDraft bool   `json:"isDraft"`
+		} `json:"pullRequest"`
+	}
+	if err := c.doGraphQL(ctx, query, vars, &resp); err != nil {
+		return nil, fmt.Errorf("github pull request states: %w", err)
+	}
+	for i, u := range urls {
+		if pr := resp[fmt.Sprintf("p%d", i)].PullRequest; pr != nil {
+			out[u] = PRState{State: mapGitHubState(pr.State), Draft: pr.IsDraft}
+		}
+	}
+	return out, nil
+}
+
+// MergeRequestStates looks up the state of each MR on host, one request per
+// MR. An MR GitLab does not return (404) is left out of the result.
+func (c *GitLabChecker) MergeRequestStates(ctx context.Context, host string, urls []string) (map[string]PRState, error) {
+	out := make(map[string]PRState, len(urls))
+	if len(urls) == 0 {
+		return out, nil
+	}
+	if c.TokenFunc == nil {
+		return nil, fmt.Errorf("no GitLab credential for %s", host)
+	}
+	token, err := c.token(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if token == "" {
+		return nil, fmt.Errorf("no GitLab credential for %s", host)
+	}
+	base := c.apiBaseOverride
+	if base == "" {
+		base = "https://" + host
+	}
+	for _, u := range urls {
+		_, path, iid, err := ParseGitLabMRURL(u)
+		if err != nil {
+			return nil, err
+		}
+		var mr struct {
+			State string `json:"state"`
+			Draft bool   `json:"draft"`
+		}
+		_, _, err = c.getJSON(ctx, token, fmt.Sprintf("%s/api/v4/projects/%s/merge_requests/%d", base, url.PathEscape(path), iid), &mr)
+		if err != nil {
+			if status, ok := errors.AsType[*httpStatusError](err); ok && status.Code == http.StatusNotFound {
+				continue
+			}
+			return nil, err
+		}
+		out[u] = PRState{State: mapGitLabState(mr.State), Draft: mr.Draft}
+	}
+	return out, nil
+}
