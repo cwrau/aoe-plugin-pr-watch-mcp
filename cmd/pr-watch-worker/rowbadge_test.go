@@ -902,3 +902,29 @@ func TestSnoozedWatchShowsASleepingIcon(t *testing.T) {
 		t.Errorf("merged chip = %+v", chip)
 	}
 }
+
+// The subscription chip leads the row in every case: ahead of the finished
+// counts, and it survives the size cap that drops chips from the end.
+func TestSubscriptionChipLeadsEvenWithFinishedChipsAndOverflow(t *testing.T) {
+	regs := []registry.Registration{
+		{PRURL: "https://github.com/o/r/pull/1", SessionID: "s", Provider: "github", Status: registry.StatusMerged},
+		{PRURL: "https://github.com/o/r/pull/2", SessionID: "s", Provider: "github", Status: registry.StatusClosed},
+	}
+	items := buildRowBadgePayloadsWithSubs(regs, []subscriptionBadgeInfo{notifySubInfo("s", 1)})["s"].Items
+	if len(items) != 3 || items[0].Icon != "radar" || items[1].Icon != "check-circle" || items[2].Icon != "circle-slash" {
+		t.Errorf("items = %+v, want radar, merged, closed", items)
+	}
+
+	var many []registry.Registration
+	for i := 1; i <= 80; i++ {
+		many = append(many, registry.Registration{
+			PRURL: fmt.Sprintf("https://github.com/org/repo/pull/%d", i), SessionID: "s", Provider: "github",
+			Title: strings.Repeat("a long pull request title ", 10), CIBucket: "failure", CIDetail: strings.Repeat("failing job name ", 10),
+			LatestReviewState: "CHANGES_REQUESTED", LatestReviewer: "reviewer", HasConflict: true,
+		})
+	}
+	items = buildRowBadgePayloadsWithSubs(many, []subscriptionBadgeInfo{notifySubInfo("s", 1)})["s"].Items
+	if items[0].Icon != "radar" || !strings.HasPrefix(items[len(items)-1].Text, "+") {
+		t.Errorf("first chip %+v, last chip %+v: want the radar first even when chips are dropped from the end", items[0], items[len(items)-1])
+	}
+}
