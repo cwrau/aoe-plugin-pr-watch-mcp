@@ -25,8 +25,10 @@ func TestBuildRowBadgePayloadsGroupsBySession(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("buildRowBadgePayloads() len = %d, want 2 sessions", len(got))
 	}
-	if len(got["sess1"].Items) != 6 {
-		t.Errorf("sess1 items = %d, want 6 (two registrations, three chips each: eye/CI/review)", len(got["sess1"].Items))
+	// Two PRs: both open and unreviewed, so their eye and review chips merge;
+	// their CI states differ, so those stay apart: eye, success, failure, review.
+	if len(got["sess1"].Items) != 4 {
+		t.Errorf("sess1 items = %d, want 4 (merged eye, two CI states, merged review)", len(got["sess1"].Items))
 	}
 	if len(got["sess2"].Items) != 3 {
 		t.Errorf("sess2 items = %d, want 3 (one registration, three chips)", len(got["sess2"].Items))
@@ -460,20 +462,28 @@ func TestBuildRowBadgePayloadsOrdersByStatusThenNumber(t *testing.T) {
 	}
 
 	var got []string
+	var watchedTooltip string
 	for _, chip := range buildRowBadgePayloads(regs)["sess1"].Items {
 		switch chip.Icon {
 		case "eye", "check-circle", "circle-slash":
 			got = append(got, chip.Href)
 		}
+		if chip.Icon == "eye" {
+			watchedTooltip = chip.Tooltip
+		}
 	}
+	// #9 and #10 are in the same state, so they are one chip (linking #9, the
+	// lower number) listing both in that order.
 	want := []string{
 		"https://github.com/o/r/pull/5",
 		"https://github.com/o/r/pull/2",
 		"https://github.com/o/r/pull/9",
-		"https://github.com/o/r/pull/10",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("chip order = %v, want %v", got, want)
+	}
+	if !strings.Contains(watchedTooltip, "o/r#9, o/r#10") {
+		t.Errorf("merged tooltip = %q, want #9 listed before #10", watchedTooltip)
 	}
 }
 
@@ -493,22 +503,42 @@ func TestBuildRowBadgePayloadsOrdersQueuedByQueuePosition(t *testing.T) {
 	}
 
 	var got []string
+	var lastTooltip string
 	for _, chip := range buildRowBadgePayloads(regs)["sess1"].Items {
 		if chip.Icon == "eye" {
 			got = append(got, chip.Href)
+			lastTooltip = chip.Tooltip
 		}
 	}
+	// Queue entries stay one chip each, in queue order; the two PRs outside any
+	// queue are in the same state and so one merged chip after them.
 	want := []string{
 		"https://github.com/o/other/pull/2",
 		"https://github.com/o/r/pull/20",
 		"https://github.com/o/r/pull/5",
 		"https://github.com/o/r/pull/7",
 		"https://github.com/o/r/pull/1",
-		"https://github.com/o/r/pull/3",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("chip order = %v, want %v", got, want)
 	}
+	if !strings.Contains(lastTooltip, "o/r#1, o/r#3") {
+		t.Errorf("merged tooltip = %q, want the two unqueued PRs by number", lastTooltip)
+	}
+}
+
+// queuedTestRegs are n PRs in a merge queue, each a chip of its own (queue
+// entries are never merged), so a row of them gets long enough for compact
+// mode, which equal chips otherwise never do.
+func queuedTestRegs(n int, ci, review string) []registry.Registration {
+	var regs []registry.Registration
+	for i := 1; i <= n; i++ {
+		regs = append(regs, registry.Registration{
+			PRURL: fmt.Sprintf("https://github.com/o/r/pull/%d", i), SessionID: "sess1", Provider: "github", Status: registry.StatusWatching,
+			CIBucket: ci, LatestReviewState: review, MergeQueueState: "QUEUED", MergeQueuePosition: i,
+		})
+	}
+	return regs
 }
 
 func compactTestRegs(n int, ci, review string) []registry.Registration {
@@ -522,22 +552,23 @@ func compactTestRegs(n int, ci, review string) []registry.Registration {
 	return regs
 }
 
-// Up to the threshold every watched PR shows its eye, CI and review chips.
+// Up to the threshold (counted after equal chips are merged) every watched PR
+// keeps its eye, CI and review chips.
 func TestBuildRowBadgePayloadsKeepsAllChipsAtOrBelowCompactThreshold(t *testing.T) {
-	regs := compactTestRegs(5, "success", "") // 5 x 3 = 15 chips
+	regs := queuedTestRegs(14, "success", "") // 14 queue entries + merged CI + merged review = 16
 	items := buildRowBadgePayloads(regs)["sess1"].Items
-	if len(items) != 15 {
-		t.Errorf("len(items) = %d, want 15 (eye+CI+review per PR, below the threshold)", len(items))
+	if len(items) != 16 {
+		t.Errorf("len(items) = %d, want 16 (14 eyes, the CI and the review chip, at the threshold)", len(items))
 	}
 }
 
 // Past the threshold the boring states (CI success/none/pending, no review)
 // drop out and only the eye chip remains for a quiet PR.
 func TestBuildRowBadgePayloadsCompactsQuietPRsPastThreshold(t *testing.T) {
-	regs := compactTestRegs(8, "success", "") // 24 chips uncompacted
+	regs := queuedTestRegs(15, "success", "") // 17 chips uncompacted
 	items := buildRowBadgePayloads(regs)["sess1"].Items
-	if len(items) != 8 {
-		t.Fatalf("len(items) = %d, want 8 (eye chip only per quiet PR)", len(items))
+	if len(items) != 15 {
+		t.Fatalf("len(items) = %d, want 15 (eye chip only per quiet PR)", len(items))
 	}
 	for _, it := range items {
 		if it.Icon != "eye" {
@@ -558,8 +589,9 @@ func TestBuildRowBadgePayloadsCompactKeepsAttentionStates(t *testing.T) {
 	regs[4].LatestReviewState = "APPROVED 1/2"
 	regs[5].LatestReviewState = "COMMENTED"
 
+	// Compact mode is chosen by length; this exercises it directly.
 	var texts []string
-	for _, it := range buildRowBadgePayloads(regs)["sess1"].Items {
+	for _, it := range groupChips(chipsForRegistrations(regs, true)) {
 		if it.Icon != "eye" {
 			texts = append(texts, it.Text)
 		}
@@ -572,11 +604,11 @@ func TestBuildRowBadgePayloadsCompactKeepsAttentionStates(t *testing.T) {
 
 // The merged chip is a single chip already and stays, in front.
 func TestBuildRowBadgePayloadsCompactKeepsMergedChips(t *testing.T) {
-	regs := compactTestRegs(8, "success", "")
+	regs := queuedTestRegs(15, "success", "")
 	regs = append(regs, registry.Registration{PRURL: "https://github.com/o/r/pull/99", SessionID: "sess1", Provider: "github", Status: registry.StatusMerged})
 	items := buildRowBadgePayloads(regs)["sess1"].Items
-	if len(items) != 9 || items[0].Icon != "check-circle" {
-		t.Errorf("items = %+v, want the merged chip followed by 8 eye chips", items)
+	if len(items) != 16 || items[0].Icon != "check-circle" {
+		t.Errorf("items = %+v, want the merged chip followed by 15 eye chips", items)
 	}
 }
 
@@ -598,15 +630,17 @@ func TestBuildRowBadgePayloadsCompactTintsEyeChipForPartialApproval(t *testing.T
 	regs[0].LatestReviewState = "APPROVED 1/2"
 	regs[1].LatestReviewState = "APPROVED"
 
-	eyes := eyeChips(buildRowBadgePayloads(regs)["sess1"].Items)
+	// Compact mode is chosen by length; this exercises it directly. The fully
+	// approved PR and the unreviewed ones look the same and are one chip.
+	eyes := eyeChips(groupChips(chipsForRegistrations(regs, true)))
+	if len(eyes) != 2 {
+		t.Fatalf("eye chips = %+v, want the partial approval and one merged chip for the rest", eyes)
+	}
 	if eyes[0].Tone != "info" || !strings.Contains(eyes[0].Tooltip, "APPROVED 1/2") {
 		t.Errorf("partially approved eye chip = %+v, want info tone and the progress in the tooltip", eyes[0])
 	}
-	if eyes[1].Tone != "neutral" {
-		t.Errorf("fully approved eye chip tone = %q, want neutral (approval is not interesting)", eyes[1].Tone)
-	}
-	if eyes[2].Tone != "neutral" {
-		t.Errorf("unreviewed eye chip tone = %q, want neutral", eyes[2].Tone)
+	if eyes[1].Tone != "neutral" || eyes[1].Text != "7" {
+		t.Errorf("approved and unreviewed eye chip = %+v, want neutral and a count of 7 (approval is not interesting)", eyes[1])
 	}
 }
 
@@ -615,7 +649,7 @@ func TestBuildRowBadgePayloadsCompactPartialApprovalKeepsMoreUrgentEyeTone(t *te
 	regs[0].LatestReviewState = "APPROVED 1/2"
 	regs[0].HasConflict = true
 
-	if tone := eyeChips(buildRowBadgePayloads(regs)["sess1"].Items)[0].Tone; tone != "danger" {
+	if tone := eyeChips(groupChips(chipsForRegistrations(regs, true)))[0].Tone; tone != "danger" {
 		t.Errorf("eye chip tone = %q, want danger: a conflict outranks a partial approval", tone)
 	}
 }
@@ -716,6 +750,8 @@ func TestRowBadgePayloadStaysUnderTheHostCap(t *testing.T) {
 			Title: strings.Repeat("a long pull request title ", 10), CIBucket: "failure", CIDetail: strings.Repeat("failing job name ", 10),
 			LatestReviewState: "CHANGES_REQUESTED", LatestReviewer: "reviewer", ReviewHref: fmt.Sprintf("https://github.com/org/repo/pull/%d#r", i),
 			HasConflict: true,
+			// Queue entries are never merged, which keeps this a long row.
+			MergeQueueState: "QUEUED", MergeQueuePosition: i,
 		})
 	}
 
@@ -921,10 +957,128 @@ func TestSubscriptionChipLeadsEvenWithFinishedChipsAndOverflow(t *testing.T) {
 			PRURL: fmt.Sprintf("https://github.com/org/repo/pull/%d", i), SessionID: "s", Provider: "github",
 			Title: strings.Repeat("a long pull request title ", 10), CIBucket: "failure", CIDetail: strings.Repeat("failing job name ", 10),
 			LatestReviewState: "CHANGES_REQUESTED", LatestReviewer: "reviewer", HasConflict: true,
+			MergeQueueState: "QUEUED", MergeQueuePosition: i, // never merged: keeps this a long row
 		})
 	}
 	items = buildRowBadgePayloadsWithSubs(many, []subscriptionBadgeInfo{notifySubInfo("s", 1)})["s"].Items
 	if items[0].Icon != "radar" || !strings.HasPrefix(items[len(items)-1].Text, "+") {
 		t.Errorf("first chip %+v, last chip %+v: want the radar first even when chips are dropped from the end", items[0], items[len(items)-1])
+	}
+}
+
+func prsInState(n int, mut func(i int, r *registry.Registration)) []registry.Registration {
+	var regs []registry.Registration
+	for i := 1; i <= n; i++ {
+		r := registry.Registration{
+			PRURL: fmt.Sprintf("https://github.com/o/r/pull/%d", i), SessionID: "s", Provider: "github", CIBucket: "success", Title: "t",
+		}
+		if mut != nil {
+			mut(i, &r)
+		}
+		regs = append(regs, r)
+	}
+	return regs
+}
+
+func chipTexts(items []badgeChip) []string {
+	var out []string
+	for _, c := range items {
+		out = append(out, c.Icon+"|"+c.Text+"|"+c.Tone)
+	}
+	return out
+}
+
+// A session watching many PRs in the same state shows one chip per state, with
+// a count, instead of the same three chips per PR.
+func TestIdenticalChipsAcrossPRsAreMerged(t *testing.T) {
+	items := buildRowBadgePayloads(prsInState(12, nil))["s"].Items
+	want := []string{"eye|12|neutral", "|success ×12|success", "|no review ×12|neutral"}
+	if got := chipTexts(items); !slices.Equal(got, want) {
+		t.Fatalf("chips = %v, want %v", got, want)
+	}
+	eye := items[0]
+	if eye.Text != "12" {
+		t.Errorf("eye text = %q, want the count", eye.Text)
+	}
+	for _, want := range []string{"12", "watching", "o/r#1", "o/r#8", "+4 more"} {
+		if !strings.Contains(eye.Tooltip, want) {
+			t.Errorf("eye tooltip %q lacks %q", eye.Tooltip, want)
+		}
+	}
+	if strings.Contains(eye.Tooltip, "o/r#9") {
+		t.Errorf("eye tooltip %q lists more than the cap", eye.Tooltip)
+	}
+	if eye.Href != "https://github.com/o/r/pull/1" {
+		t.Errorf("eye href = %q, want the first PR", eye.Href)
+	}
+}
+
+func TestChipsOfDifferentStatesStayApartAndGroupByKind(t *testing.T) {
+	regs := prsInState(10, func(i int, r *registry.Registration) {
+		if i <= 6 {
+			r.CIBucket = "failure"
+		}
+		if i == 9 {
+			r.HasConflict = true
+		}
+	})
+	got := chipTexts(buildRowBadgePayloads(regs)["s"].Items)
+	// Eyes first, then CI, then review; within a kind, in order of appearance. The
+	// one conflicting PR is its own chip and keeps the usual look (no count).
+	want := []string{
+		"eye|9|neutral", "eye||danger",
+		"|failure ×6|danger", "|success ×4|success",
+		"|no review ×10|neutral",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("chips = %v, want %v", got, want)
+	}
+}
+
+func TestAGroupOfOneKeepsItsOwnChip(t *testing.T) {
+	items := buildRowBadgePayloads(prsInState(1, nil))["s"].Items
+	if got, want := chipTexts(items), []string{"eye||neutral", "|success|success", "|no review|neutral"}; !slices.Equal(got, want) {
+		t.Errorf("chips = %v, want %v", got, want)
+	}
+	if !strings.Contains(items[0].Tooltip, "o/r#1") || strings.Contains(items[0].Tooltip, "watching:") {
+		t.Errorf("a single PR's tooltip = %q, want the usual per-PR text", items[0].Tooltip)
+	}
+}
+
+// Merge queue entries are ordered by position, which a merged count would hide.
+func TestMergeQueueEntriesAreNotMerged(t *testing.T) {
+	regs := prsInState(3, func(i int, r *registry.Registration) {
+		r.MergeQueueState, r.MergeQueuePosition = "QUEUED", i
+	})
+	eyes := 0
+	for _, c := range buildRowBadgePayloads(regs)["s"].Items {
+		if c.Icon == "eye" {
+			eyes++
+		}
+	}
+	if eyes != 3 {
+		t.Errorf("eye chips = %d, want one per queue entry", eyes)
+	}
+}
+
+func TestSnoozedAndReviewerChipsGroupToo(t *testing.T) {
+	asleep := prsInState(4, func(i int, r *registry.Registration) { r.Snoozed = true })
+	items := buildRowBadgePayloads(asleep)["s"].Items
+	if items[0].Icon != "moon" || items[0].Text != "4" || !strings.Contains(items[0].Tooltip, "snoozed") {
+		t.Errorf("snoozed group = %+v, want one moon counting 4", items[0])
+	}
+
+	reviewing := prsInState(5, func(i int, r *registry.Registration) { r.Persona = registry.PersonaReviewer })
+	got := chipTexts(buildRowBadgePayloads(reviewing)["s"].Items)
+	if want := []string{"eye|5|neutral", "|in progress ×5|info"}; !slices.Equal(got, want) {
+		t.Errorf("reviewer chips = %v, want %v", got, want)
+	}
+}
+
+// With grouping a long row of PRs no longer needs compact mode.
+func TestGroupingKeepsManyIdenticalPRsInFullMode(t *testing.T) {
+	items := buildRowBadgePayloads(prsInState(60, func(i int, r *registry.Registration) { r.CIBucket = "failure" }))["s"].Items
+	if got, want := chipTexts(items), []string{"eye|60|neutral", "|failure ×60|danger", "|no review ×60|neutral"}; !slices.Equal(got, want) {
+		t.Errorf("chips = %v, want %v", got, want)
 	}
 }

@@ -284,8 +284,13 @@ threads.
 - GitLab: one request per distinct MR per poll, a few more when it has
   approvals, discussions or a failing pipeline. An instance without the
   approvals endpoint just shows no approvals.
-- A row badge has an 8KB payload cap on the host; past roughly 16 chips it
-  switches to compact mode and past the cap it ends with a `+N` chip.
+- A row badge has an 8KB payload cap on the host. Chips of different PRs that
+  say the same thing are merged first: twelve open PRs with passing CI and no
+  review show one eye with `12`, `success ×12` and `no review ×12`, whose
+  tooltips list the PRs (the first links to the first PR). A PR in a different
+  state keeps its own chip, and so does each merge queue entry, since its
+  position matters. Only if the row is still past roughly 16 chips does it
+  switch to compact mode, and past the cap it ends with a `+N` chip.
 - Pane payloads are capped at 56KB here; long descriptions are trimmed, and
   the pane says so.
 - Rate limits are per token, so several machines on the same token share the

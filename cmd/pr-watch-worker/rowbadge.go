@@ -31,7 +31,19 @@ type badgeChip struct {
 	Tone    string `json:"tone"`
 	Tooltip string `json:"tooltip"`
 	Href    string `json:"href,omitempty"`
+
+	// What groupChips needs to merge equal chips of different PRs; never sent.
+	kind    string // chipKindEye, chipKindCI or chipKindReview
+	label   string // what the chip says, for the merged tooltip ("CI failure")
+	ref     string // the PR/MR short ref
+	noGroup bool   // never merged: merge queue entries are told apart by position
 }
+
+const (
+	chipKindEye    = "eye"
+	chipKindCI     = "ci"
+	chipKindReview = "review"
+)
 
 // buildRowBadgePayloads groups the registrations that should currently show
 // a badge by session, one cluster of chips per registration, so a session
@@ -206,9 +218,11 @@ func buildRowBadgePayloadsWithSubs(regs []registry.Registration, subs []subscrip
 			}
 		}
 		items := append(finishedChip(merged, registry.StatusMerged), finishedChip(closed, registry.StatusClosed)...)
-		watchedItems := chipsForRegistrations(watched, false)
+		// Equal chips of different PRs are merged first; compact mode is only
+		// for what is still too long after that.
+		watchedItems := groupChips(chipsForRegistrations(watched, false))
 		if len(items)+len(watchedItems) > compactChipThreshold {
-			watchedItems = chipsForRegistrations(watched, true)
+			watchedItems = groupChips(chipsForRegistrations(watched, true))
 		}
 		items = append(items, watchedItems...)
 		if s, ok := subsBySession[sid]; ok {
@@ -477,6 +491,9 @@ func badgeChipsFor(r registry.Registration, compact bool) []badgeChip {
 			eye.Icon = "moon"
 			eye.Tooltip += " (snoozed: not checked until its snooze gate opens)"
 		}
+		eye.kind, eye.ref, eye.label = chipKindEye, ref, eyeLabel(r, compact)
+		// Queue entries are told apart by position, which a count would hide.
+		eye.noGroup = r.MergeQueueState != ""
 		chips := []badgeChip{eye}
 		if eventFilterShows(filter, "CI") && (!compact || compactCIChip(r.CIBucket)) {
 			if ci, ok := ciBadge(r.CIBucket); ok {
@@ -485,6 +502,7 @@ func badgeChipsFor(r registry.Registration, compact bool) []badgeChip {
 					Tone:    ci.Tone,
 					Tooltip: ciTooltip(ci.Text, r.CIDetail),
 					Href:    hrefOr(r.CIHref, r.PRURL),
+					kind:    chipKindCI, ref: ref, label: "CI " + ci.Text,
 				})
 			}
 		}
@@ -492,6 +510,7 @@ func badgeChipsFor(r registry.Registration, compact bool) []badgeChip {
 			// A reviewer's review chip is its own progress: in progress until
 			// its own account has approved. Quiet in compact mode once done.
 			if chip, inProgress := reviewerReviewChip(r); inProgress || !compact {
+				chip.kind, chip.ref, chip.label = chipKindReview, ref, "your review "+chip.Text
 				chips = append(chips, chip)
 			}
 		} else if eventFilterShows(filter, "REVIEW") && (!compact || compactReviewChip(r.LatestReviewState)) {
@@ -501,6 +520,7 @@ func badgeChipsFor(r registry.Registration, compact bool) []badgeChip {
 				Tone:    review.Tone,
 				Tooltip: reviewTooltip(review.Text, r.LatestReviewer, r.LatestReviewAt),
 				Href:    hrefOr(r.ReviewHref, r.PRURL),
+				kind:    chipKindReview, ref: ref, label: "review " + review.Text,
 			})
 		}
 		return chips
@@ -647,4 +667,93 @@ func atSuffix(t time.Time) string {
 		return ""
 	}
 	return " at " + t.UTC().Format("2006-01-02 15:04 MST")
+}
+
+// eyeLabel says what a watch's eye chip stands for, for the merged tooltip:
+// the state its tone and icon encode.
+func eyeLabel(r registry.Registration, compact bool) string {
+	label := "watching"
+	switch {
+	case r.HasConflict:
+		label = "merge conflict"
+	case r.Blocked:
+		label = "blocked"
+	case r.MergeQueueState != "":
+		label = "in merge queue"
+	}
+	if compact && provider.PartialApproval(r.LatestReviewState) {
+		label += ", review " + r.LatestReviewState
+	}
+	if r.Snoozed {
+		label += ", snoozed"
+	}
+	return label
+}
+
+// chipKindRank orders merged chips: the PR chips first, then CI, then review.
+func chipKindRank(kind string) int {
+	switch kind {
+	case chipKindEye:
+		return 0
+	case chipKindCI:
+		return 1
+	case chipKindReview:
+		return 2
+	default:
+		return 3
+	}
+}
+
+// groupChips merges the chips of several PRs/MRs that say the same thing (same
+// kind, icon, text, tone and meaning) into one chip with a count and the PRs in
+// its tooltip, so a session watching dozens of PRs in the same few states shows
+// a handful of chips instead of three per PR. A chip alone in its group is left
+// exactly as it was, and queue entries are never merged. Merged chips come out
+// grouped by kind (PR, CI, review), each kind in order of first appearance.
+func groupChips(chips []badgeChip) []badgeChip {
+	type key struct{ kind, icon, text, tone, label, unique string }
+	var order []key
+	members := make(map[key][]badgeChip)
+	for i, c := range chips {
+		k := key{kind: c.kind, icon: c.Icon, text: c.Text, tone: c.Tone, label: c.label}
+		if c.kind == "" || c.noGroup {
+			k.unique = strconv.Itoa(i) // not mergeable: a key of its own
+		}
+		if _, seen := members[k]; !seen {
+			order = append(order, k)
+		}
+		members[k] = append(members[k], c)
+	}
+	sort.SliceStable(order, func(i, j int) bool { return chipKindRank(order[i].kind) < chipKindRank(order[j].kind) })
+
+	out := make([]badgeChip, 0, len(order))
+	for _, k := range order {
+		group := members[k]
+		first := group[0]
+		if len(group) == 1 {
+			out = append(out, first)
+			continue
+		}
+		shown := group
+		if len(shown) > maxFinishedTooltipRefs {
+			shown = shown[:maxFinishedTooltipRefs]
+		}
+		refs := make([]string, 0, len(shown))
+		for _, c := range shown {
+			refs = append(refs, c.ref)
+		}
+		list := strings.Join(refs, ", ")
+		if more := len(group) - len(shown); more > 0 {
+			list += fmt.Sprintf(", +%d more", more)
+		}
+		merged := first
+		merged.Tooltip = fmt.Sprintf("%d × %s: %s", len(group), first.label, list)
+		if first.Text == "" {
+			merged.Text = strconv.Itoa(len(group))
+		} else {
+			merged.Text = fmt.Sprintf("%s ×%d", first.Text, len(group))
+		}
+		out = append(out, merged)
+	}
+	return out
 }
