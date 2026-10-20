@@ -82,7 +82,7 @@ func TestPushUIStateRemovesBadgeForSessionThatDroppedOut(t *testing.T) {
 	// row itself survives (never deleted) — it's the status change alone
 	// that must drive the badge to disappear, restart-safe with no
 	// in-memory bookkeeping needed to know sess1 previously had one.
-	if err := store.SetStatus(t.Context(), "https://github.com/o/r/pull/1", registry.StatusStopped); err != nil {
+	if err := store.SetStatus(t.Context(), "https://github.com/o/r/pull/1", "sess1", registry.StatusStopped); err != nil {
 		t.Fatalf("SetStatus() error = %v", err)
 	}
 	buf.Reset()
@@ -126,7 +126,7 @@ func TestPushUIStateReconcilesStatelesslyOnFirstCall(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Add() error = %v", err)
 	}
-	if err := store.SetStatus(t.Context(), "https://github.com/o/r/pull/1", registry.StatusStopped); err != nil {
+	if err := store.SetStatus(t.Context(), "https://github.com/o/r/pull/1", "sess1", registry.StatusStopped); err != nil {
 		t.Fatalf("SetStatus() error = %v", err)
 	}
 

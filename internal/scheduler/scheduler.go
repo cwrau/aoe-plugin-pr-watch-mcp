@@ -591,7 +591,8 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 	// means every kind); it only ever trims what gets sent, never what's
 	// logged above or how the terminal-status handling below behaves — a
 	// PR/MR that's actually merged moves to StatusMerged for every session
-	// watching it regardless of whether that session asked to hear about it.
+	// watching it regardless of whether that session asked to hear about it,
+	// each on its own poll so that every session reports the transition.
 	notifyEvents := filterEvents(events, reg.EffectiveEventFilter())
 	notifyEvents = filterReviewRequests(notifyEvents, prev, result, selfAuthor)
 	notifyEvents = filterSelfResolved(notifyEvents, prev, result, selfAuthor)
@@ -635,13 +636,13 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 	// that piled up before the merge as late activity.
 	newlyTerminal := !finished && (result.State == registry.StatusMerged || result.State == registry.StatusClosed)
 	if result.State == registry.StatusMerged && (newlyTerminal || reg.Status == registry.StatusClosed) {
-		if err := s.Store.SetMerged(pctx, reg.PRURL, result.MergedAt); err != nil {
+		if err := s.Store.SetMerged(pctx, reg.PRURL, reg.SessionID, result.MergedAt); err != nil {
 			s.log().Error("mark merged registration", "pr_url", reg.PRURL, "error", err)
 			return
 		}
 	}
 	if newlyTerminal && result.State == registry.StatusClosed {
-		if err := s.Store.SetStatus(pctx, reg.PRURL, result.State); err != nil {
+		if err := s.Store.SetStatus(pctx, reg.PRURL, reg.SessionID, result.State); err != nil {
 			s.log().Error("mark resolved registration", "pr_url", reg.PRURL, "error", err)
 			return
 		}

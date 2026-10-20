@@ -486,31 +486,34 @@ func (s *Store) Get(ctx context.Context, prURL, sessionID string) (Registration,
 	return r, true, nil
 }
 
-// SetStatus moves prURL to status unconditionally, without an ownership
-// check — for the scheduler's own use (e.g. marking a PR closed, or
-// stopping a registration whose session is gone), never exposed to the MCP
-// tools directly. Marking a PR/MR merged goes through SetMerged instead, so
-// its merge timestamp is never lost.
-func (s *Store) SetStatus(ctx context.Context, prURL, status string) error {
+// SetStatus moves sessionID's registration of prURL to status, for the
+// scheduler's own use (e.g. marking a PR closed), never exposed to the MCP
+// tools directly. It touches only that one session's row: every session
+// watching a PR/MR gets its own terminal-transition poll, so one session's
+// poll must not mark the others finished before they have reported it.
+// Marking a PR/MR merged goes through SetMerged instead, so its merge
+// timestamp is never lost.
+func (s *Store) SetStatus(ctx context.Context, prURL, sessionID, status string) error {
 	closedAt := int64(0)
 	if status == StatusClosed {
 		closedAt = time.Now().Unix()
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE registrations SET status = ?, closed_at = CASE WHEN ? != 0 THEN ? ELSE closed_at END WHERE pr_url = ?`, status, closedAt, closedAt, prURL)
+	_, err := s.db.ExecContext(ctx, `UPDATE registrations SET status = ?, closed_at = CASE WHEN ? != 0 THEN ? ELSE closed_at END WHERE pr_url = ? AND session_id = ?`, status, closedAt, closedAt, prURL, sessionID)
 	if err != nil {
 		return fmt.Errorf("set status: %w", err)
 	}
 	return nil
 }
 
-// SetMerged moves prURL to StatusMerged and records when the merge
-// happened, for the scheduler's own use once a check reports a merged
-// PR/MR.
-func (s *Store) SetMerged(ctx context.Context, prURL string, mergedAt time.Time) error {
+// SetMerged moves sessionID's registration of prURL to StatusMerged and
+// records when the merge happened, for the scheduler's own use once a check
+// reports a merged PR/MR. Scoped to the one session for the reason given on
+// SetStatus.
+func (s *Store) SetMerged(ctx context.Context, prURL, sessionID string, mergedAt time.Time) error {
 	if mergedAt.IsZero() {
 		mergedAt = time.Now() // the watch window runs from the merge; an unreported date counts as now
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE registrations SET status = ?, merged_at = ? WHERE pr_url = ?`, StatusMerged, unixOrZero(mergedAt), prURL)
+	_, err := s.db.ExecContext(ctx, `UPDATE registrations SET status = ?, merged_at = ? WHERE pr_url = ? AND session_id = ?`, StatusMerged, unixOrZero(mergedAt), prURL, sessionID)
 	if err != nil {
 		return fmt.Errorf("set merged: %w", err)
 	}

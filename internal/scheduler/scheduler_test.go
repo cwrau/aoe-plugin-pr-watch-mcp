@@ -694,13 +694,10 @@ func TestTickMarksMergedInsteadOfDeregistering(t *testing.T) {
 	}
 }
 
-// TestTickMarksMergedForEverySessionSharingThePR is a deliberate exception
-// to per-session-scoped state: unlike UpdateState (which only ever touches
-// the calling session's own row), a real merge/close is true for every
-// session watching that PR/MR, not just whichever registration the
-// scheduler happens to process first — so SetMerged/SetStatus stay
-// unscoped by session, and every row sharing the URL ends up terminal, each
-// still getting its own notification.
+// TestTickMarksMergedForEverySessionSharingThePR pins that a real merge is
+// true for every session watching that PR/MR: every row sharing the URL ends
+// up merged, each getting its own notification. Each row is marked by its
+// own poll, never by another session's.
 func TestTickMarksMergedForEverySessionSharingThePR(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -737,6 +734,58 @@ func TestTickMarksMergedForEverySessionSharingThePR(t *testing.T) {
 	}
 	if len(notify.sent) != 2 {
 		t.Errorf("notify.sent = %v, want a separate MERGED message for each session", notify.sent)
+	}
+}
+
+// TestTickReportsMergeToSessionPolledAfterTheFirstOneMarkedItMerged pins that
+// a session whose registration comes due later than another session's on the
+// same PR/MR still hears MERGED: the earlier session's poll must not flip
+// the later one's registration to merged behind its back.
+func TestTickReportsMergeToSessionPolledAfterTheFirstOneMarkedItMerged(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+	url := "https://github.com/o/r/pull/1"
+	early := registry.Registration{PRURL: url, SessionID: "early", Provider: "github", NextDueAt: now.Add(-time.Minute), CreatedAt: now}
+	late := registry.Registration{PRURL: url, SessionID: "late", Provider: "github", NextDueAt: now.Add(time.Hour), CreatedAt: now}
+	for _, r := range []registry.Registration{early, late} {
+		if err := store.Add(ctx, r); err != nil {
+			t.Fatalf("Add(%s) error = %v", r.SessionID, err)
+		}
+	}
+
+	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "merged", MergedAt: now.Add(-time.Minute).Truncate(time.Second)}}
+	notify := &fakeNotifier{}
+	sched := &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: notify}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("first Tick() error = %v", err)
+	}
+	regs, err := store.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	for _, r := range regs {
+		if r.SessionID != "late" {
+			continue
+		}
+		if err := store.UpdateState(ctx, r.PRURL, r.SessionID, stateUpdateFromReg(r, now.Add(-time.Second))); err != nil {
+			t.Fatalf("UpdateState() error = %v", err)
+		}
+	}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("second Tick() error = %v", err)
+	}
+
+	want := map[string]bool{"early: [pr-watch] o/r#1: MERGED": false, "late: [pr-watch] o/r#1: MERGED": false}
+	for _, msg := range notify.sent {
+		if _, ok := want[msg]; ok {
+			want[msg] = true
+		}
+	}
+	for msg, seen := range want {
+		if !seen {
+			t.Errorf("notify.sent = %v, missing %q", notify.sent, msg)
+		}
 	}
 }
 
@@ -1598,11 +1647,11 @@ func finishedFixture(t *testing.T, status string, result provider.CheckResult) (
 	}
 	switch status {
 	case registry.StatusMerged:
-		if err := store.SetMerged(ctx, reg.PRURL, now.Add(-time.Hour)); err != nil {
+		if err := store.SetMerged(ctx, reg.PRURL, reg.SessionID, now.Add(-time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 	case registry.StatusClosed:
-		if err := store.SetStatus(ctx, reg.PRURL, registry.StatusClosed); err != nil {
+		if err := store.SetStatus(ctx, reg.PRURL, reg.SessionID, registry.StatusClosed); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1693,7 +1742,7 @@ func TestTickLeavesFinishedRegistrationOfGoneSessionAlone(t *testing.T) {
 	if err := store.Add(ctx, reg); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SetMerged(ctx, reg.PRURL, now.Add(-time.Hour)); err != nil {
+	if err := store.SetMerged(ctx, reg.PRURL, reg.SessionID, now.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "merged"}}

@@ -866,7 +866,7 @@ func TestListWithNoFiltersReturnsEveryStatusAndSession(t *testing.T) {
 
 	callTool(t, srv, "register", map[string]any{"pr_urls": []string{"https://github.com/o/r/pull/1"}, "session_id": "sess1"})
 	callTool(t, srv, "register", map[string]any{"pr_urls": []string{"https://github.com/o/r/pull/2"}, "session_id": "sess2"})
-	if err := store.SetStatus(ctx, "https://github.com/o/r/pull/2", registry.StatusMerged); err != nil {
+	if err := store.SetStatus(ctx, "https://github.com/o/r/pull/2", "sess2", registry.StatusMerged); err != nil {
 		t.Fatalf("SetStatus() error = %v", err)
 	}
 
@@ -913,7 +913,7 @@ func TestListFiltersByStatus(t *testing.T) {
 
 	callTool(t, srv, "register", map[string]any{"pr_urls": []string{"https://github.com/o/r/pull/1"}, "session_id": "sess1"})
 	callTool(t, srv, "register", map[string]any{"pr_urls": []string{"https://github.com/o/r/pull/2"}, "session_id": "sess1"})
-	if err := store.SetStatus(ctx, "https://github.com/o/r/pull/2", registry.StatusMerged); err != nil {
+	if err := store.SetStatus(ctx, "https://github.com/o/r/pull/2", "sess1", registry.StatusMerged); err != nil {
 		t.Fatalf("SetStatus() error = %v", err)
 	}
 
@@ -940,7 +940,7 @@ func TestUnregisterBulkModeStopsEveryRegistrationForSession(t *testing.T) {
 	callTool(t, srv, "register", map[string]any{"pr_urls": []string{"https://github.com/o/r/pull/1"}, "session_id": "sess1"})
 	callTool(t, srv, "register", map[string]any{"pr_urls": []string{"https://github.com/o/r/pull/2"}, "session_id": "sess1"})
 	callTool(t, srv, "register", map[string]any{"pr_urls": []string{"https://github.com/o/r/pull/3"}, "session_id": "sess2"})
-	if err := store.SetStatus(ctx, "https://github.com/o/r/pull/2", registry.StatusMerged); err != nil {
+	if err := store.SetStatus(ctx, "https://github.com/o/r/pull/2", "sess1", registry.StatusMerged); err != nil {
 		t.Fatalf("SetStatus() error = %v", err)
 	}
 

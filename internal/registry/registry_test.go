@@ -116,7 +116,7 @@ func TestAddReactivatesStatusOnReregister(t *testing.T) {
 	if err := s.Add(ctx, reg); err != nil {
 		t.Fatalf("Add() error = %v", err)
 	}
-	if err := s.SetStatus(ctx, reg.PRURL, StatusMerged); err != nil {
+	if err := s.SetStatus(ctx, reg.PRURL, reg.SessionID, StatusMerged); err != nil {
 		t.Fatalf("SetStatus() error = %v", err)
 	}
 
@@ -186,7 +186,7 @@ func TestDueBefore(t *testing.T) {
 	if err := s.Add(ctx, mergedButDue); err != nil {
 		t.Fatalf("Add(mergedButDue) error = %v", err)
 	}
-	if err := s.SetStatus(ctx, mergedButDue.PRURL, StatusMerged); err != nil {
+	if err := s.SetStatus(ctx, mergedButDue.PRURL, mergedButDue.SessionID, StatusMerged); err != nil {
 		t.Fatalf("SetStatus() error = %v", err)
 	}
 
@@ -281,7 +281,7 @@ func TestSetStatus(t *testing.T) {
 		t.Fatalf("Add() error = %v", err)
 	}
 
-	if err := s.SetStatus(ctx, reg.PRURL, StatusClosed); err != nil {
+	if err := s.SetStatus(ctx, reg.PRURL, reg.SessionID, StatusClosed); err != nil {
 		t.Fatalf("SetStatus() error = %v", err)
 	}
 
@@ -304,7 +304,7 @@ func TestSetMerged(t *testing.T) {
 	}
 
 	mergedAt := now.Truncate(time.Second)
-	if err := s.SetMerged(ctx, reg.PRURL, mergedAt); err != nil {
+	if err := s.SetMerged(ctx, reg.PRURL, reg.SessionID, mergedAt); err != nil {
 		t.Fatalf("SetMerged() error = %v", err)
 	}
 
@@ -674,7 +674,7 @@ func TestCountByProvider(t *testing.T) {
 			t.Fatalf("Add() error = %v", err)
 		}
 	}
-	if err := s.SetStatus(ctx, "https://github.com/o/r/pull/3", StatusMerged); err != nil {
+	if err := s.SetStatus(ctx, "https://github.com/o/r/pull/3", "d", StatusMerged); err != nil {
 		t.Fatalf("SetStatus() error = %v", err)
 	}
 
@@ -915,7 +915,7 @@ func TestStopAllOwnedByStopsOnlyThatSessionsNonStopped(t *testing.T) {
 			t.Fatalf("Add() error = %v", err)
 		}
 	}
-	if err := s.SetStatus(ctx, regs[1].PRURL, StatusMerged); err != nil {
+	if err := s.SetStatus(ctx, regs[1].PRURL, regs[1].SessionID, StatusMerged); err != nil {
 		t.Fatalf("SetStatus() error = %v", err)
 	}
 
@@ -1032,7 +1032,7 @@ func TestDueBeforeIncludesRecentlyFinishedRegistrations(t *testing.T) {
 		}
 		switch status {
 		case StatusMerged:
-			if err := s.SetMerged(ctx, url, finished); err != nil {
+			if err := s.SetMerged(ctx, url, "a", finished); err != nil {
 				t.Fatal(err)
 			}
 			if finished.IsZero() { // a legacy row from before merge dates were recorded
@@ -1041,7 +1041,7 @@ func TestDueBeforeIncludesRecentlyFinishedRegistrations(t *testing.T) {
 				}
 			}
 		case StatusClosed, StatusStopped:
-			if err := s.SetStatus(ctx, url, status); err != nil {
+			if err := s.SetStatus(ctx, url, "a", status); err != nil {
 				t.Fatal(err)
 			}
 			if status == StatusClosed {
@@ -1096,7 +1096,7 @@ func TestReopenedRegistrationIsWatchedAgain(t *testing.T) {
 	if err := s.Add(ctx, reg); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetStatus(ctx, reg.PRURL, StatusClosed); err != nil {
+	if err := s.SetStatus(ctx, reg.PRURL, reg.SessionID, StatusClosed); err != nil {
 		t.Fatal(err)
 	}
 	if ok, err := s.SetStatusOwnedBy(ctx, reg.PRURL, "a", StatusWatching); err != nil || !ok {
