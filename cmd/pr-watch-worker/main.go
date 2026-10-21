@@ -270,8 +270,9 @@ func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, store *re
 	}
 }
 
-// pushUIState renders and pushes both UI slots this worker owns — the
-// global home-pane and each session's row-badge — from one consistent
+// pushUIState renders and pushes the UI slots this worker owns — the
+// global home-pane and filter facets, and each session's row-badge, pane and
+// facet-value row-column — from one consistent
 // snapshot of the registry. Because registrations are never deleted (see
 // registry.Store.Add's doc comment), the set of session ids that have ever
 // registered anything is itself durable state, readable fresh from the
@@ -308,7 +309,21 @@ func pushUIState(ctx context.Context, store *registry.Store, aoe *aoeclient.Clie
 		allSessions[r.SessionID] = true
 		regsBySession[r.SessionID] = append(regsBySession[r.SessionID], r)
 	}
+	for _, f := range filterFacets {
+		if err := rpc.pushFilterFacet(f); err != nil {
+			logger.Warn("push filter facet", "facet", f.ID, "error", err)
+		}
+	}
+	facetValues := filterValuesFor(regs, subInfos)
 	for sessionID := range allSessions {
+		if values := facetValues[sessionID]; len(values) > 0 {
+			if err := rpc.setRowColumn(sessionID, values); err != nil {
+				logger.Warn("set row column", "session_id", sessionID, "error", err)
+			}
+		} else if err := rpc.removeRowColumn(sessionID); err != nil {
+			logger.Warn("remove row column", "session_id", sessionID, "error", err)
+		}
+
 		if payload, ok := badges[sessionID]; ok {
 			if err := rpc.setRowBadge(sessionID, payload); err != nil {
 				logger.Warn("set row badge", "session_id", sessionID, "error", err)

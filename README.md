@@ -231,6 +231,33 @@ Registrations live in SQLite at `$XDG_STATE_HOME/pr-watch-mcp/registry.db`
 nothing. State is saved before the ping is sent, so a failed save repeats the
 poll instead of pinging twice.
 
+## Session filters
+
+The dashboard's sidebar filter menu (and plugins such as the kanban board) can
+filter sessions by what they watch. The worker publishes one facet per fact; a
+session matches an option when any of its watches has it, and options within a
+facet are OR. Facts, not display: they ignore the events filter and compact
+badges. Finished (merged or closed) watches count as `pr: merged` / `closed`
+only; stopped watches count for nothing.
+
+The first six facets use the same ids, values and labels as the official GitHub
+plugin's, without its platform prefix, since this plugin also watches GitLab.
+
+| Facet | Options |
+| --- | --- |
+| CI | passing, failing, running, action required |
+| Review | approved, partial approval, changes requested, commented, awaiting review |
+| PR | open, draft, merged, closed |
+| Comments | unresolved |
+| Conflicts | conflicts |
+| Merge queue | queued, awaiting checks, mergeable, locked, unmergeable |
+| Blocked | blocked by another MR (GitLab) |
+| Persona | author, reviewer |
+| Your review | in progress, approved (reviewer persona) |
+| Snoozed | snoozed |
+| Subscription | watching matches, notifying about matches |
+| Provider | GitHub, GitLab |
+
 ## Snoozing
 
 Configure **Snooze rules** in the plugin's AoE settings (TUI or web). Each

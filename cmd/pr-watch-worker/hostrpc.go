@@ -297,6 +297,47 @@ func (h *hostRPC) pushSessionPane(sessionID string, payload panePayload) error {
 	})
 }
 
+// rowColumnPayload is a session's row-column cell. The host requires the text
+// field, but the words are the badge's job, so it stays empty: the cell exists
+// to carry filter_values for the facets.
+type rowColumnPayload struct {
+	Text         string   `json:"text"`
+	FilterValues []string `json:"filter_values,omitempty"`
+}
+
+// setRowColumn pushes a session's facet values as its row-column cell.
+func (h *hostRPC) setRowColumn(sessionID string, filterValues []string) error {
+	return h.send("ui.state.set", map[string]any{
+		"slot":       rowColumnSlot,
+		"id":         rowColumnID,
+		"session_id": sessionID,
+		"payload":    rowColumnPayload{FilterValues: filterValues},
+	})
+}
+
+// removeRowColumn clears a session's facet values, for a session with nothing
+// left to filter on.
+func (h *hostRPC) removeRowColumn(sessionID string) error {
+	return h.send("ui.state.remove", map[string]any{
+		"slot":       rowColumnSlot,
+		"id":         rowColumnID,
+		"session_id": sessionID,
+	})
+}
+
+// pushFilterFacet pushes one global filter facet and its options.
+func (h *hostRPC) pushFilterFacet(f facetDef) error {
+	return h.send("ui.state.set", map[string]any{
+		"slot": filterFacetSlot,
+		"id":   f.ID,
+		"payload": map[string]any{
+			"label":   f.Label,
+			"column":  f.Column,
+			"options": f.Options,
+		},
+	})
+}
+
 // removeSessionPane clears a session's pane entirely — same reasoning as
 // removeRowBadge: nothing left to show must not mean a stale pane lingers.
 func (h *hostRPC) removeSessionPane(sessionID string) error {

@@ -82,6 +82,64 @@ id = "watched_badge"
 slot = "pane"
 id = "pr_pane"
 
+# Facet values for the dashboard's session filters: an empty-text per-session
+# cell whose filter_values (ci:failing, review:approved, pr:draft, ...) the
+# global filter-facets below match on, so the sidebar and plugins such as the
+# kanban board can filter sessions by one watch fact. The ids and values
+# mirror the official GitHub plugin's, minus its platform prefix, since this
+# plugin watches GitLab too.
+[[ui]]
+slot = "row-column"
+id = "pr_status"
+
+[[ui]]
+slot = "filter-facet"
+id = "ci"
+
+[[ui]]
+slot = "filter-facet"
+id = "review"
+
+[[ui]]
+slot = "filter-facet"
+id = "pr"
+
+[[ui]]
+slot = "filter-facet"
+id = "comments"
+
+[[ui]]
+slot = "filter-facet"
+id = "conflicts"
+
+[[ui]]
+slot = "filter-facet"
+id = "queue"
+
+[[ui]]
+slot = "filter-facet"
+id = "blocked"
+
+[[ui]]
+slot = "filter-facet"
+id = "persona"
+
+[[ui]]
+slot = "filter-facet"
+id = "my_review"
+
+[[ui]]
+slot = "filter-facet"
+id = "snoozed"
+
+[[ui]]
+slot = "filter-facet"
+id = "subscription"
+
+[[ui]]
+slot = "filter-facet"
+id = "provider"
+
 # Snooze rules: while a rule's gate command exits non-zero, registrations
 # whose PR/MR URL matches one of its patterns are not polled at all, so
 # nothing is notified. Everything that happened meanwhile is reported once
