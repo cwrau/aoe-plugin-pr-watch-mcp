@@ -236,9 +236,13 @@ poll instead of pinging twice.
 The dashboard's sidebar filter menu (and plugins such as the kanban board) can
 filter sessions by what they watch. The worker publishes one facet per fact; a
 session matches an option when any of its watches has it, and options within a
-facet are OR. Facts, not display: they ignore the events filter and compact
-badges. Finished (merged or closed) watches count as `pr: merged` / `closed`
-only; stopped watches count for nothing.
+facet are OR. They follow a watch's events filter, like its badge chips: a
+watch not told about CI has no CI value, review needs REVIEW, comments
+COMMENT, conflicts and blocked CONFLICT, merge queue MERGE_QUEUE. The
+reviewer persona's default filter counts. Persona, provider, PR state and your
+own review progress are always set. Compact badges do not matter. Finished
+(merged or closed) watches count as `pr: merged` / `closed` only; stopped
+watches count for nothing.
 
 The first six facets use the same ids, values and labels as the official GitHub
 plugin's, without its platform prefix, since this plugin also watches GitLab.

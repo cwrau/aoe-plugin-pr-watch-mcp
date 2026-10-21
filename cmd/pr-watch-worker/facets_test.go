@@ -326,3 +326,76 @@ func TestPushUIStatePushesFacetsAndTheRowColumnAndClearsDroppedSessions(t *testi
 		t.Errorf("row column for the dropped sess1 = %q, want ui.state.remove", columnFor["sess1"])
 	}
 }
+
+// busyWatch is a watch with a value for every gated facet, so each case below
+// shows exactly which ones its event filter lets through.
+func busyWatch(filter []string) registry.Registration {
+	return watching(func(r *registry.Registration) {
+		r.EventFilter = filter
+		r.CIBucket = "failure"
+		r.LatestReviewState = "CHANGES_REQUESTED"
+		r.HasConflict = true
+		r.Blocked = true
+		r.UnresolvedThreadIDs = []string{"t1"}
+		r.MergeQueueState = "QUEUED"
+		r.Persona = registry.PersonaReviewer
+		r.SelfReviewState = "APPROVED"
+	})
+}
+
+func TestFilterValuesFollowTheRegistrationsEventFilter(t *testing.T) {
+	ungated := []string{"my_review:approved", "persona:reviewer", "pr:open", "provider:github"}
+	all := append([]string{
+		"blocked:yes", "ci:failing", "comments:unresolved", "conflicts:yes", "queue:queued", "review:changes-requested",
+	}, ungated...)
+	slices.Sort(all)
+	tests := []struct {
+		name   string
+		filter []string
+		want   []string
+	}{
+		{"an explicit filter naming every kind keeps all values", []string{"CI", "REVIEW", "CONFLICT", "COMMENT", "MERGE_QUEUE"}, all},
+		{"without CI drops ci", []string{"REVIEW", "CONFLICT", "COMMENT", "MERGE_QUEUE"},
+			slices.DeleteFunc(slices.Clone(all), func(v string) bool { return v == "ci:failing" })},
+		{"without REVIEW drops review", []string{"CI", "CONFLICT", "COMMENT", "MERGE_QUEUE"},
+			slices.DeleteFunc(slices.Clone(all), func(v string) bool { return v == "review:changes-requested" })},
+		{"without CONFLICT drops conflicts and blocked, which the badge hides with it", []string{"CI", "REVIEW", "COMMENT", "MERGE_QUEUE"},
+			slices.DeleteFunc(slices.Clone(all), func(v string) bool { return v == "conflicts:yes" || v == "blocked:yes" })},
+		{"without COMMENT drops comments", []string{"CI", "REVIEW", "CONFLICT", "MERGE_QUEUE"},
+			slices.DeleteFunc(slices.Clone(all), func(v string) bool { return v == "comments:unresolved" })},
+		{"without MERGE_QUEUE drops queue", []string{"CI", "REVIEW", "CONFLICT", "COMMENT"},
+			slices.DeleteFunc(slices.Clone(all), func(v string) bool { return v == "queue:queued" })},
+		{"MERGED and CLOSED only keeps just the ungated facets", []string{"MERGED", "CLOSED"}, ungated},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := filterValuesFor([]registry.Registration{busyWatch(tt.filter)}, nil)["s"]
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("filter values = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	t.Run("an empty filter on an author watch keeps all values", func(t *testing.T) {
+		r := busyWatch(nil)
+		r.Persona = registry.PersonaAuthor
+		got := filterValuesFor([]registry.Registration{r}, nil)["s"]
+		want := []string{
+			"blocked:yes", "ci:failing", "comments:unresolved", "conflicts:yes", "persona:author", "pr:open",
+			"provider:github", "queue:queued", "review:changes-requested",
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("filter values = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("the reviewer persona's default filter drops what it does not follow", func(t *testing.T) {
+		got := filterValuesFor([]registry.Registration{busyWatch(nil)}, nil)["s"]
+		want := []string{
+			"comments:unresolved", "my_review:approved", "persona:reviewer", "pr:open", "provider:github", "review:changes-requested",
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("filter values = %v, want %v", got, want)
+		}
+	})
+}
