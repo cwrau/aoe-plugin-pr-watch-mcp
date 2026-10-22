@@ -19,12 +19,20 @@ const SnoozeRecheckInterval = time.Minute
 // gateTimeout bounds one gate command so a hung check can't stall a Tick.
 const gateTimeout = 10 * time.Second
 
-// SnoozeRule mutes every registration whose URL matches one of Match while
-// Gate reports closed. Gate is a shell command: exit 0 means open (poll
-// normally), any other exit means closed (snoozed).
+// SnoozeRule mutes every registration whose URL matches one of Match, and none
+// of Exclude, while Gate reports closed. Gate is a shell command: exit 0 means
+// open (poll normally), any other exit means closed (snoozed).
 type SnoozeRule struct {
-	Match []string
-	Gate  string
+	Match   []string
+	Exclude []string
+	Gate    string
+}
+
+// applies reports whether the rule governs url: a Match pattern hits and no
+// Exclude pattern does. A URL the rule does not apply to ignores it entirely,
+// its gate included.
+func (r SnoozeRule) applies(url string) bool {
+	return matchesSnooze(r.Match, url) && !matchesSnooze(r.Exclude, url)
 }
 
 // GateFunc evaluates a gate command. A non-nil error means the gate could
@@ -55,18 +63,18 @@ func ShellGate(ctx context.Context, gate string) (bool, error) {
 	return false, err
 }
 
-// isSnoozed reports whether reg is currently muted. Every rule with a
-// matching pattern is a stage the registration has to pass: it is muted as
-// soon as any of those gates is closed, so e.g. work PRs can be held to a
-// work-hours gate while everything is held to a no-break gate. A registration
-// no rule matches is never snoozed. A gate that errors fails open — an
-// unevaluable gate must not hide events.
+// isSnoozed reports whether reg is currently muted. Every rule that applies to
+// it (a matching pattern, no excluding one) is a stage it has to pass: it is
+// muted as soon as any of those gates is closed, so e.g. work PRs can be held
+// to a work-hours gate while everything else is held to a no-break gate. A
+// registration no rule applies to is never snoozed. A gate that errors fails
+// open — an unevaluable gate must not hide events.
 func (s *Scheduler) isSnoozed(ctx context.Context, reg registry.Registration) bool {
 	if s.Snooze == nil {
 		return false
 	}
 	for _, rule := range s.Snooze() {
-		if rule.Gate == "" || !matchesSnooze(rule.Match, reg.PRURL) {
+		if rule.Gate == "" || !rule.applies(reg.PRURL) {
 			continue
 		}
 		if !s.gateOpen(ctx, rule.Gate) {

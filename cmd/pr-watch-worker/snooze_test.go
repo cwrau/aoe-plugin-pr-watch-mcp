@@ -211,3 +211,32 @@ func TestSnoozeRulesRefreshLoadsAndKeepsPreviousOnFailure(t *testing.T) {
 		t.Errorf("get() after emptying the setting = %+v, want no rules (clearing must un-snooze)", got)
 	}
 }
+
+func TestParseSnoozeRulesExclude(t *testing.T) {
+	raw := json.RawMessage(`{
+		"value": [
+			{"match": ["*"], "exclude": [" github.com/work/* ", "", "  ", "gitlab.corp.example/*"], "gate": "usage"},
+			{"match": ["github.com/work/*"], "exclude": [], "gate": "work-hours"},
+			{"match": ["github.com/other/*"], "gate": "other"},
+			{"match": ["*"], "exclude": ["", "  "], "gate": "only-blank-excludes"}
+		]
+	}`)
+	got, err := parseSnoozeRules(raw)
+	if err != nil {
+		t.Fatalf("parseSnoozeRules() error = %v", err)
+	}
+	want := []scheduler.SnoozeRule{
+		{Match: []string{"*"}, Exclude: []string{"github.com/work/*", "gitlab.corp.example/*"}, Gate: "usage"},
+		{Match: []string{"github.com/work/*"}, Gate: "work-hours"},
+		{Match: []string{"github.com/other/*"}, Gate: "other"},
+		{Match: []string{"*"}, Gate: "only-blank-excludes"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("parseSnoozeRules() = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].Gate != want[i].Gate || !slices.Equal(got[i].Match, want[i].Match) || !slices.Equal(got[i].Exclude, want[i].Exclude) {
+			t.Errorf("rule[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}

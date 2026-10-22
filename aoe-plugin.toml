@@ -141,13 +141,14 @@ slot = "filter-facet"
 id = "provider"
 
 # Snooze rules: while a rule's gate command exits non-zero, registrations
-# whose PR/MR URL matches one of its patterns are not polled at all, so
+# whose PR/MR URL matches one of its patterns (and none of its optional
+# exclude patterns) are not polled at all, so
 # nothing is notified. Everything that happened meanwhile is reported once
 # the gate opens. Empty by default, i.e. nothing is ever snoozed.
 [[settings]]
 key = "snooze"
 label = "Snooze rules"
-description = "Mute watched PRs/MRs while a gate command reports closed (exits non-zero). Every rule with a matching pattern applies, so a PR/MR is only checked while all of its matching gates are open; PRs/MRs matching no rule are never snoozed."
+description = "Mute watched PRs/MRs while a gate command reports closed (exits non-zero). Every rule that applies to a PR/MR (a URL pattern matches and no exclude pattern does) counts, so it is only checked while all of its applying gates are open; PRs/MRs no rule applies to are never snoozed."
 type = "object_list"
 min_items = 0
 max_items = 20
@@ -158,6 +159,12 @@ label = "URL patterns"
 description = "Matched against the PR/MR URL without scheme, case-insensitively. * matches any characters including /, ? matches one. Example: gitlab.example.com/*"
 type = "string_list"
 required = true
+
+[[settings.fields]]
+key = "exclude"
+label = "Exclude patterns"
+description = "Optional. URLs matching any of these ignore this rule entirely (its gate is not run for them), even if a URL pattern matches. Same glob rules as the URL patterns. Example: github.com/my-org/*, so a catch-all rule leaves work PRs alone."
+type = "string_list"
 
 [[settings.fields]]
 key = "gate"

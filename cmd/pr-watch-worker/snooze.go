@@ -67,14 +67,16 @@ func (s *snoozeRules) refresh(ctx context.Context, rpc *hostRPC, logger *slog.Lo
 }
 
 // parseSnoozeRules decodes a config.get reply for the snooze object_list:
-// {"value": [{"_id": "...", "match": ["pat", ...], "gate": "cmd"}, ...]}.
-// A null/absent value is simply no rules. Items missing a gate or any
-// pattern are dropped rather than failing the whole list.
+// {"value": [{"_id": "...", "match": ["pat", ...], "exclude": ["pat", ...],
+// "gate": "cmd"}, ...]}. A null/absent value is simply no rules. Items
+// missing a gate or any match pattern are dropped rather than failing the
+// whole list; exclude is optional.
 func parseSnoozeRules(raw json.RawMessage) ([]scheduler.SnoozeRule, error) {
 	var reply struct {
 		Value []struct {
-			Match []string `json:"match"`
-			Gate  string   `json:"gate"`
+			Match   []string `json:"match"`
+			Exclude []string `json:"exclude"`
+			Gate    string   `json:"gate"`
 		} `json:"value"`
 	}
 	if err := json.Unmarshal(raw, &reply); err != nil {
@@ -83,16 +85,22 @@ func parseSnoozeRules(raw json.RawMessage) ([]scheduler.SnoozeRule, error) {
 	rules := make([]scheduler.SnoozeRule, 0, len(reply.Value))
 	for _, item := range reply.Value {
 		gate := strings.TrimSpace(item.Gate)
-		var patterns []string
-		for _, p := range item.Match {
-			if p = strings.TrimSpace(p); p != "" {
-				patterns = append(patterns, p)
-			}
-		}
+		patterns := trimmedPatterns(item.Match)
 		if gate == "" || len(patterns) == 0 {
 			continue
 		}
-		rules = append(rules, scheduler.SnoozeRule{Match: patterns, Gate: gate})
+		rules = append(rules, scheduler.SnoozeRule{Match: patterns, Exclude: trimmedPatterns(item.Exclude), Gate: gate})
 	}
 	return rules, nil
+}
+
+// trimmedPatterns trims each pattern and drops the blank ones.
+func trimmedPatterns(raw []string) []string {
+	var patterns []string
+	for _, p := range raw {
+		if p = strings.TrimSpace(p); p != "" {
+			patterns = append(patterns, p)
+		}
+	}
+	return patterns
 }

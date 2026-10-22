@@ -390,3 +390,106 @@ func TestSnoozedFlagFollowsTheGate(t *testing.T) {
 		t.Error("the watch was not checked after the gate opened")
 	}
 }
+
+func TestSnoozeRuleAppliesOnlyWhenMatchedAndNotExcluded(t *testing.T) {
+	tests := []struct {
+		name string
+		rule SnoozeRule
+		url  string
+		want bool
+	}{
+		{"match, no exclude", SnoozeRule{Match: []string{"*"}}, "https://github.com/work/repo/pull/1", true},
+		{"empty exclude list changes nothing", SnoozeRule{Match: []string{"*"}, Exclude: []string{}}, "https://github.com/work/repo/pull/1", true},
+		{"exclude hit", SnoozeRule{Match: []string{"*"}, Exclude: []string{"github.com/work/*"}}, "https://github.com/work/repo/pull/1", false},
+		{"exclude miss", SnoozeRule{Match: []string{"*"}, Exclude: []string{"github.com/work/*"}}, "https://github.com/me/private/pull/1", true},
+		{"one of several excludes hits", SnoozeRule{Match: []string{"*"}, Exclude: []string{"gitlab.corp.example/*", "github.com/work/*"}}, "https://github.com/work/repo/pull/1", false},
+		{"exclude ignores scheme and case", SnoozeRule{Match: []string{"*"}, Exclude: []string{"https://GitHub.com/Work/*"}}, "http://github.com/work/repo/pull/1", false},
+		{"exclude cannot make a miss apply", SnoozeRule{Match: []string{"gitlab.corp.example/*"}, Exclude: []string{"github.com/work/*"}}, "https://github.com/me/private/pull/1", false},
+		{"no match patterns never applies", SnoozeRule{Exclude: []string{"github.com/work/*"}}, "https://github.com/me/private/pull/1", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.rule.applies(tt.url); got != tt.want {
+				t.Errorf("%+v.applies(%q) = %v, want %v", tt.rule, tt.url, got, tt.want)
+			}
+		})
+	}
+}
+
+// The catch-all usage-limit rule excludes the work hosts, so a closed usage
+// gate holds back a private PR but never a work PR.
+func TestTickExcludedURLsIgnoreARuleOthersStayHeldBy(t *testing.T) {
+	rules := func() []SnoozeRule {
+		return []SnoozeRule{
+			{Match: []string{"github.com/work/*"}, Gate: "work-hours"},
+			{Match: []string{"*"}, Exclude: []string{"github.com/work/*"}, Gate: "usage"},
+		}
+	}
+	cases := []struct {
+		name      string
+		url       string
+		answers   map[string]bool
+		wantCalls int
+		wantGates []string
+	}{
+		{"work PR, usage closed, work hours open: flows", "https://github.com/work/special/pull/1",
+			map[string]bool{"work-hours": true, "usage": false}, 1, []string{"work-hours"}},
+		{"work PR, work hours closed: still held by its own rule", "https://github.com/work/special/pull/1",
+			map[string]bool{"work-hours": false, "usage": true}, 0, []string{"work-hours"}},
+		{"private PR, usage closed: held", "https://github.com/me/private/pull/1",
+			map[string]bool{"work-hours": true, "usage": false}, 0, []string{"usage"}},
+		{"private PR, usage open: flows", "https://github.com/me/private/pull/1",
+			map[string]bool{"work-hours": false, "usage": true}, 1, []string{"usage"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openTestStore(t)
+			snoozeTestRegs(t, store, c.url)
+			gh := &fakeGitHubChecker{result: provider.CheckResult{State: "open", CIBucket: "pending"}}
+			gate := &gateCalls{answers: c.answers}
+			sched := &Scheduler{
+				Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{},
+				Snooze: rules, RunGate: gate.run,
+			}
+			if err := sched.Tick(ctx); err != nil {
+				t.Fatalf("Tick() error = %v", err)
+			}
+			if gh.calls != c.wantCalls {
+				t.Errorf("GitHub checker calls = %d, want %d", gh.calls, c.wantCalls)
+			}
+			if !slices.Equal(gate.calls, c.wantGates) {
+				t.Errorf("gate calls = %v, want %v", gate.calls, c.wantGates)
+			}
+		})
+	}
+}
+
+// When every rule that matches a URL excludes it, no gate runs at all.
+func TestTickRunsNoGateWhenEveryMatchingRuleExcludesTheURL(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	snoozeTestRegs(t, store, "https://github.com/work/special/pull/1")
+
+	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "open", CIBucket: "pending"}}
+	gate := &gateCalls{answers: map[string]bool{"usage": false, "no-break": false}}
+	sched := &Scheduler{
+		Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{},
+		Snooze: func() []SnoozeRule {
+			return []SnoozeRule{
+				{Match: []string{"*"}, Exclude: []string{"github.com/work/*"}, Gate: "usage"},
+				{Match: []string{"github.com/*"}, Exclude: []string{"github.com/work/special/*"}, Gate: "no-break"},
+			}
+		},
+		RunGate: gate.run,
+	}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if len(gate.calls) != 0 {
+		t.Errorf("gate calls = %v, want none: every matching rule excludes the URL", gate.calls)
+	}
+	if gh.calls != 1 {
+		t.Errorf("GitHub checker calls = %d, want 1", gh.calls)
+	}
+}

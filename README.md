@@ -265,8 +265,9 @@ plugin's, without its platform prefix, since this plugin also watches GitLab.
 ## Snoozing
 
 Configure **Snooze rules** in the plugin's AoE settings (TUI or web). Each
-rule has a list of URL patterns and a gate command. While the gate exits
-non-zero, every watched PR/MR matching one of the rule's patterns is snoozed:
+rule has a list of URL patterns (and optional exclude patterns) and a gate
+command. While the gate exits non-zero, every watched PR/MR matching one of
+the rule's patterns, and none of its exclude patterns, is snoozed:
 the worker skips the provider call entirely, so nothing is polled and nothing
 is notified. When the gate exits 0 again, the next check reports everything
 that happened in between in one go.
@@ -285,6 +286,29 @@ that happened in between in one go.
   a break" keeps work PRs quiet outside work hours and during breaks, while
   other PRs are only held back during breaks. Order does not matter. A PR/MR
   matching no rule is never snoozed, and with no rules nothing is.
+- **Exclude** is an optional second pattern list per rule, with the same glob
+  rules as the patterns. A rule applies to a PR/MR only if a pattern matches
+  and no exclude pattern does; an excluded URL ignores the rule entirely, so
+  its gate is not even run for it. An empty or missing list changes nothing.
+  It is how you say "everything except": the work PRs are held to their own
+  work-hours gate, while a catch-all rule gated on a usage limit leaves them
+  alone:
+
+  ```yaml
+  - match:
+      - gitlab.example.com/*
+      - github.com/my-org/*
+    gate: systemctl --user is-active --quiet work.target
+  - match:
+      - "*"
+    exclude:
+      - gitlab.example.com/*
+      - github.com/my-org/*
+    gate: test ! -e ~/.local/state/usage-limit-hit
+  ```
+
+  A work PR is only held back by the first rule; any other PR is held back by
+  the second.
 - Rules apply to every registration alike, explicit or discovered, and
   changes take effect without a restart. A snoozed watch re-checks its gate
   every minute.
