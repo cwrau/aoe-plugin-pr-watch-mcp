@@ -243,8 +243,8 @@ card sits in the first column of its tab that fits.
 
 | Column | Holds |
 | --- | --- |
-| Needs attention | changes requested, CI failing or needing action, a conflict, or unresolved threads |
-| In review | open and waiting: no review yet, commented, partly approved, CI still running |
+| Needs attention | changes requested, CI failing, a conflict, or unresolved threads |
+| In review | open and waiting: no review yet, commented, partly approved, CI still running or a run waiting for approval |
 | Ready | approved with nothing needing attention, or in the merge queue |
 | Draft | drafts, whatever their CI says |
 | Done | merged or closed, newest first |

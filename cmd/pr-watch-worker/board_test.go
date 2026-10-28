@@ -33,7 +33,7 @@ func TestBoardColumnPlacement(t *testing.T) {
 		{"approved and in the merge queue", watching(func(r *registry.Registration) { r.LatestReviewState, r.MergeQueueState = "APPROVED", "QUEUED" }), boardReady},
 		{"changes requested", watching(func(r *registry.Registration) { r.LatestReviewState = "CHANGES_REQUESTED" }), boardAttention},
 		{"CI failing", watching(func(r *registry.Registration) { r.CIBucket = "failure" }), boardAttention},
-		{"CI needs action", watching(func(r *registry.Registration) { r.CIBucket = "action_required" }), boardAttention},
+		{"CI needing action (a run waiting for approval) is not attention", watching(func(r *registry.Registration) { r.CIBucket = "action_required" }), boardInReview},
 		{"CI running is not attention", watching(func(r *registry.Registration) { r.CIBucket = "pending" }), boardInReview},
 		{"conflict", watching(func(r *registry.Registration) { r.HasConflict = true }), boardAttention},
 		{"unresolved threads", watching(func(r *registry.Registration) { r.UnresolvedThreadIDs = []string{"t"} }), boardAttention},

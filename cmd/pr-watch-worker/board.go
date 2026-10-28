@@ -136,7 +136,7 @@ func authorColumnFor(r registry.Registration) string {
 		return boardDone
 	case has("pr:draft"):
 		return boardDraft
-	case has("ci:failing", "ci:action-required", "review:changes-requested", "conflicts:yes", "comments:unresolved"):
+	case has("ci:failing", "review:changes-requested", "conflicts:yes", "comments:unresolved"):
 		return boardAttention
 	case has("review:approved") || has("queue:queued", "queue:awaiting-checks", "queue:mergeable", "queue:locked"):
 		return boardReady
