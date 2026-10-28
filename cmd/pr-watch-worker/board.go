@@ -149,6 +149,9 @@ func buildBoardPayload(regs []registry.Registration, tracked []trackedCard, titl
 	var payload boardPayload
 	for _, c := range boardColumnTitles {
 		cards := cols[c.ID]
+		if cards == nil {
+			cards = []boardCard{} // encodes as [], not null, which the page reads the length of
+		}
 		slices.SortStableFunc(cards, func(a, b boardCard) int {
 			if c.ID == boardDone {
 				if d := b.finishedAt.Compare(a.finishedAt); d != 0 {

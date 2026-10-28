@@ -215,19 +215,20 @@ function render(payload) {
   el.board.replaceChildren();
   let shown = 0;
   for (const column of payload.columns || []) {
+    const columnCards = column.cards || [];
     const col = document.createElement("section");
     col.className = "col " + column.id;
     const head = document.createElement("h2");
-    head.append(text("span", "", column.title), text("span", "", String(column.cards.length)));
+    head.append(text("span", "", column.title), text("span", "", String(columnCards.length)));
     const list = document.createElement("div");
     list.className = "cards";
-    for (const card of column.cards) {
+    for (const card of columnCards) {
       const node = renderCard(card);
       if (query && !node.dataset.search.includes(query)) node.classList.add("hidden");
       else shown++;
       list.append(node);
     }
-    if (!column.cards.length) list.append(text("div", "empty", "Nothing here."));
+    if (!columnCards.length) list.append(text("div", "empty", "Nothing here."));
     col.append(head, list);
     el.board.append(col);
   }

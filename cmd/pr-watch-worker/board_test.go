@@ -351,3 +351,18 @@ func TestManifestDeclaresTheBoardPageAndItsFileIsSelfContained(t *testing.T) {
 		}
 	}
 }
+
+// A column with no cards must reach the page as an empty list: a null would
+// break the page's reading of its length.
+func TestBoardPayloadEncodesEmptyColumnsAsEmptyLists(t *testing.T) {
+	raw, err := json.Marshal(buildBoardPayload(nil, nil, boardTitleOf))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(raw, []byte(`"cards":null`)) {
+		t.Errorf("payload = %s, want no null card lists", raw)
+	}
+	if got := bytes.Count(raw, []byte(`"cards":[]`)); got != len(boardColumnTitles) {
+		t.Errorf("payload = %s, want %d empty card lists", raw, len(boardColumnTitles))
+	}
+}
