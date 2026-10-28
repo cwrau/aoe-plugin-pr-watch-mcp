@@ -6,7 +6,7 @@
 id = "io.cwrau.pr-watch-mcp"
 name = "PR Watch"
 version = "0.2.0"
-api_version = 15
+api_version = 16
 aoe_version = ">=1.20.0, <2.0.0"
 description = "Persistent GitHub PR / GitLab MR watcher: register once, get woken on review/CI/merge activity, even across session restarts."
 
@@ -61,11 +61,18 @@ id = "watched_badge"
 command = "open_pr"
 key = "Ctrl+Shift+O"
 
-# Host-wide dashboard panel listing every currently-watched PR/MR and its
-# owning session, pushed via ui.state.set (requires api_version >= 13).
+# A kanban-style dashboard page: every watched PR/MR as a card, in columns by
+# state (needs attention, in review, ready, draft, done), plus the ones a
+# notify-mode subscription announced that nobody watches yet. The worker pushes
+# the cards with ui.state.set (slot "page", requires api_version >= 16); the
+# page reads them through the host bridge. One self-contained file, since the
+# host sandboxes it and blocks every other load.
 [[ui]]
-slot = "home-pane"
-id = "watched_prs"
+slot = "page"
+id = "board"
+title = "PR Board"
+icon = "kanban"
+entry = "pages/board.html"
 
 # Per-session badge on the session row: one clickable chip per PR/MR that
 # session is watching, tone-colored by CI state.

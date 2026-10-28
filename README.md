@@ -17,8 +17,8 @@ a review, a comment, CI turning red, a conflict, a merge.
   reviews, your own comments and noisy bot comments don't ping.
 - **Polite to the APIs.** It spreads the remaining rate-limit budget over the
   live watches instead of polling on a fixed timer.
-- **Visible.** Row badges, a home-pane dashboard and a per-session pane show
-  CI, review, conflict and merge-queue state at a glance.
+- **Visible.** Row badges, a kanban-style PR board page and a per-session pane
+  show CI, review, conflict and merge-queue state at a glance.
 
 ## Requirements
 
@@ -102,7 +102,7 @@ defaults, and an explicit `events` list always wins.
 - **reviewer**: `REVIEW`, `REVIEW_DISMISSED`, `COMMENT`, `PUSH`,
   `REVIEW_REQUESTED`, `READY_FOR_REVIEW`, `DRAFTED`, `THREAD_RESOLVED`,
   `REOPENED`, `MERGED` and `CLOSED`. No CI, conflict or merge queue pings. The
-  row badge, home pane and session pane show only the PR and a review chip that
+  row badge and session pane show only the PR and a review chip that
   reads **in progress** until your own account approved, then **approved**.
   Another reviewer's approval does not count.
 
@@ -230,6 +230,30 @@ Registrations live in SQLite at `$XDG_STATE_HOME/pr-watch-mcp/registry.db`
 (default `~/.local/state/pr-watch-mcp/registry.db`), so a restart loses
 nothing. State is saved before the ping is sent, so a failed save repeats the
 poll instead of pinging twice.
+
+## PR board
+
+**PR Board** is a dashboard page (button beside the top bar's search, or the
+command palette) that lays every watched PR/MR out as a card, in columns by
+state. It needs AoE 1.20 or newer. A card sits in the first column that fits:
+
+| Column | Holds |
+| --- | --- |
+| New, not watched | PRs/MRs a notify-mode subscription announced that no session watches yet |
+| Needs attention | changes requested, CI failing or needing action, a conflict, or unresolved threads |
+| In review | open and waiting: no review yet, commented, partly approved, CI still running |
+| Ready | approved (and nothing needing attention), in the merge queue, or, for the reviewer persona, approved by you |
+| Draft | drafts, whatever their CI says |
+| Done | merged or closed, newest first |
+
+Columns follow a watch's events filter like its badge chips do, so a failing
+check the watch is not told about does not put it under *Needs attention*.
+Each card shows the PR/MR, its title, status chips and the session that
+watches it. Clicking a card opens that session: the dashboard sandboxes pages
+and they cannot open links, so the PR/MR reference is shown as selectable
+text. The page filters by text, refreshes every 10 seconds, and is read-only.
+The host caps a page's state at 64 KiB, so the oldest finished cards are left
+out when there are very many; the header says how many.
 
 ## Session filters
 

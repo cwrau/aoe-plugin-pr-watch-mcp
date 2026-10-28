@@ -56,3 +56,27 @@ func loadSubscriptionBadgeInfos(ctx context.Context, store *registry.Store) ([]s
 	}
 	return infos, sessions, nil
 }
+
+// loadTrackedBoardCards reads the PRs/MRs that active notify-mode
+// subscriptions have announced to their sessions, for the board's "New, not
+// watched" column.
+func loadTrackedBoardCards(ctx context.Context, store *registry.Store) ([]trackedCard, error) {
+	subs, err := store.ListSubscriptions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var cards []trackedCard
+	for _, s := range subs {
+		if s.Status != registry.SubscriptionActive || s.Mode != registry.SubscriptionModeNotify {
+			continue
+		}
+		tracked, err := store.TrackedMatches(ctx, s.ID)
+		if err != nil {
+			return nil, err
+		}
+		for url, draft := range tracked {
+			cards = append(cards, trackedCard{SessionID: s.SessionID, Provider: s.Provider, URL: url, Draft: draft})
+		}
+	}
+	return cards, nil
+}

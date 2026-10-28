@@ -189,7 +189,7 @@ func sessionPaneBlocks(r registry.Registration) []any {
 	case registry.StatusClosed:
 		badges = []rowBadge{{Text: "closed", Tone: "neutral"}}
 	default:
-		// Same event.Kind gating as the home-pane and row-badge: each badge
+		// Same event.Kind gating as the row-badge and the board: each badge
 		// only shows if this registration's own EventFilter includes its
 		// matching kind (or the filter is empty, meaning every kind).
 		filter := r.EffectiveEventFilter()

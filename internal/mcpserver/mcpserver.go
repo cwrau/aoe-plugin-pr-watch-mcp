@@ -92,7 +92,7 @@ type GitHubReviewClient interface {
 
 // UIPusher lets register/unregister/dismiss_review request an immediate
 // dashboard refresh right after a mutation succeeds, instead of leaving the
-// home-pane/row-badge/session-pane stale until the scheduler's next
+// board/row-badge/session-pane stale until the scheduler's next
 // scheduled push (up to tickInterval later). Push does no real provider
 // check of its own — it just re-renders and re-sends whatever's already in
 // the registry, so it's cheap enough to call synchronously and unconditionally

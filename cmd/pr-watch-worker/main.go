@@ -51,8 +51,8 @@ const (
 	// backend.
 	tokenTimeout = 10 * time.Second
 
-	// panePushTimeout bounds one full UI push (home-pane, row-badges, and
-	// session panes). pushUIState runs synchronously in the scheduler loop
+	// panePushTimeout bounds one full UI push (board page, facets, row-badges,
+	// and session panes). pushUIState runs synchronously in the scheduler loop
 	// (once at startup, once after every tick), so an unbounded wait here —
 	// e.g. a host that never replies — would stall the entire loop, not
 	// just the pane feature.
@@ -228,7 +228,7 @@ func serveStdin(r io.Reader, handle func([]byte), logger *slog.Logger) {
 
 func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, store *registry.Store, aoe *aoeclient.Client, rpc *hostRPC, discovery *discoveryTrigger, logger *slog.Logger) {
 	// Load the session directory once up front (this blocks on the host's
-	// reply, which the stdin loop delivers), then push so the home-pane and
+	// reply, which the stdin loop delivers), then push so the board and
 	// row-badges aren't blank until the first tick completes. If the
 	// listing fails, titles fall back to raw session ids and the first tick
 	// retries it.
@@ -271,7 +271,7 @@ func runSchedulerLoop(ctx context.Context, sched *scheduler.Scheduler, store *re
 }
 
 // pushUIState renders and pushes the UI slots this worker owns — the
-// global home-pane and filter facets, and each session's row-badge, pane and
+// global board page and filter facets, and each session's row-badge, pane and
 // facet-value row-column — from one consistent
 // snapshot of the registry. Because registrations are never deleted (see
 // registry.Store.Add's doc comment), the set of session ids that have ever
@@ -291,13 +291,16 @@ func pushUIState(ctx context.Context, store *registry.Store, aoe *aoeclient.Clie
 		return
 	}
 
-	if err := rpc.pushHomePane(buildHomePanePayload(regs, aoe.Title)); err != nil {
-		logger.Warn("push home pane", "error", err)
-	}
-
 	subInfos, subSessions, err := loadSubscriptionBadgeInfos(pushCtx, store)
 	if err != nil {
 		logger.Warn("load subscriptions for UI push", "error", err)
+	}
+	tracked, err := loadTrackedBoardCards(pushCtx, store)
+	if err != nil {
+		logger.Warn("load announced PRs for the board", "error", err)
+	}
+	if err := rpc.pushBoardPage(buildBoardPayload(regs, tracked, aoe.Title)); err != nil {
+		logger.Warn("push board page", "error", err)
 	}
 	badges := buildRowBadgePayloadsWithSubs(regs, subInfos)
 	regsBySession := make(map[string][]registry.Registration, len(regs))

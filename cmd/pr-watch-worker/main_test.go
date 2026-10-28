@@ -16,7 +16,7 @@ import (
 
 // methodsOf decodes every ui.state.set/remove line written to buf and
 // returns, for each, its method and session_id (empty for the
-// session-less home-pane push), in write order.
+// session-less board page and facet pushes), in write order.
 func methodsOf(t *testing.T, buf *bytes.Buffer) []struct{ Method, SessionID string } {
 	t.Helper()
 	var out []struct{ Method, SessionID string }

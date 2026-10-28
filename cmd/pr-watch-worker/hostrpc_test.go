@@ -100,35 +100,6 @@ func TestHostRPCSendIsConcurrencySafe(t *testing.T) {
 	}
 }
 
-func TestHostRPCPushHomePaneSendsCorrectSlotAndID(t *testing.T) {
-	var buf bytes.Buffer
-	h := newHostRPC(&buf)
-
-	payload := panePayload{Title: "PR Watch", Blocks: []any{noteBlock{Kind: "note", Text: "hi"}}}
-	if err := h.pushHomePane(payload); err != nil {
-		t.Fatalf("pushHomePane() error = %v", err)
-	}
-
-	var msg map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &msg); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	params := msg["params"].(map[string]any)
-	if params["slot"] != homePaneSlot {
-		t.Errorf("slot = %v, want %q", params["slot"], homePaneSlot)
-	}
-	if params["id"] != homePaneID {
-		t.Errorf("id = %v, want %q", params["id"], homePaneID)
-	}
-	pushedPayload, ok := params["payload"].(map[string]any)
-	if !ok {
-		t.Fatalf("payload = %T, want an object", params["payload"])
-	}
-	if pushedPayload["title"] != "PR Watch" {
-		t.Errorf("payload.title = %v, want %q", pushedPayload["title"], "PR Watch")
-	}
-}
-
 func TestHostRPCSetRowBadgeSendsCorrectSlotIDAndSession(t *testing.T) {
 	var buf bytes.Buffer
 	h := newHostRPC(&buf)

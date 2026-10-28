@@ -254,17 +254,7 @@ func (h *hostRPC) handleSessionLifecycleChanged(params json.RawMessage) {
 	h.onSessionLifecycle(p.Kind, p.SessionID, p.Summary)
 }
 
-// pushHomePane pushes the worker's home-pane state via ui.state.set. The
-// (slot, id) pair must match the [[ui]] entry declared in aoe-plugin.toml.
-func (h *hostRPC) pushHomePane(payload panePayload) error {
-	return h.send("ui.state.set", map[string]any{
-		"slot":    homePaneSlot,
-		"id":      homePaneID,
-		"payload": payload,
-	})
-}
-
-// setRowBadge pushes a session's row-badge state. Unlike home-pane, this
+// setRowBadge pushes a session's row-badge state. Unlike the board page, this
 // slot is per-session, so the payload carries session_id alongside slot/id.
 func (h *hostRPC) setRowBadge(sessionID string, payload rowBadgePayload) error {
 	return h.send("ui.state.set", map[string]any{
@@ -345,5 +335,15 @@ func (h *hostRPC) removeSessionPane(sessionID string) error {
 		"slot":       sessionPaneSlot,
 		"id":         sessionPaneID,
 		"session_id": sessionID,
+	})
+}
+
+// pushBoardPage pushes the board page's state: global, so no session_id. The
+// page reads it back through the bridge's plugins.uiState.
+func (h *hostRPC) pushBoardPage(payload boardPayload) error {
+	return h.send("ui.state.set", map[string]any{
+		"slot":    boardPageSlot,
+		"id":      boardPageID,
+		"payload": payload,
 	})
 }

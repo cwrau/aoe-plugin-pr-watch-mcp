@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PR Board</title>
+<style>
+  :root {
+    color-scheme: dark light;
+    --bg: var(--color-surface-900, #16161e);
+    --panel: var(--color-surface-850, #1c1d27);
+    --card: var(--color-surface-800, #232433);
+    --line: var(--color-surface-700, #34364a);
+    --text: var(--color-text-primary, #e6e6ef);
+    --muted: var(--color-text-muted, #9a9cb0);
+    --success: var(--color-status-running, #4ec07a);
+    --danger: var(--color-status-error-text, #f0707a);
+    --warn: var(--color-status-warning, #e6b450);
+    --info: var(--color-brand-500, #6f9cf0);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px/1.4 system-ui, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 14px; border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+  header .meta { color: var(--muted); font-size: 12px; margin-left: auto; }
+  header input {
+    background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 8px; min-width: 220px; font: inherit;
+  }
+  #notice { padding: 8px 14px; color: var(--muted); }
+  #notice:empty { display: none; }
+  #board { flex: 1; display: flex; gap: 10px; padding: 12px 14px; overflow-x: auto; align-items: flex-start; }
+  .col {
+    flex: 0 0 290px; max-height: 100%; display: flex; flex-direction: column;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  }
+  .col h2 {
+    margin: 0; padding: 8px 10px; font-size: 12px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+    display: flex; justify-content: space-between;
+  }
+  .col.attention h2 { color: var(--danger); }
+  .col.ready h2 { color: var(--success); }
+  .cards { overflow-y: auto; padding: 0 8px 8px; display: flex; flex-direction: column; gap: 8px; }
+  .empty { color: var(--muted); padding: 4px 4px 10px; font-size: 12px; }
+  button.card {
+    text-align: left; font: inherit; color: inherit; cursor: pointer;
+    background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 8px;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  button.card:hover, button.card:focus-visible { border-color: var(--info); outline: none; }
+  .ref { font: 12px ui-monospace, monospace; color: var(--muted); overflow-wrap: anywhere; user-select: all; }
+  .title { overflow-wrap: anywhere; }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .chip {
+    font-size: 11px; padding: 1px 6px; border-radius: 9px;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .chip.success { color: var(--success); border-color: var(--success); }
+  .chip.danger { color: var(--danger); border-color: var(--danger); }
+  .chip.warn { color: var(--warn); border-color: var(--warn); }
+  .chip.info { color: var(--info); border-color: var(--info); }
+  .session { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>PR Board</h1>
+  <input id="filter" type="search" placeholder="Filter by PR, title or session" aria-label="Filter cards">
+  <span class="meta" id="meta"></span>
+</header>
+<div id="notice">Connecting...</div>
+<main id="board"></main>
+<script>
+"use strict";
+
+const PLUGIN_ID = "io.cwrau.pr-watch-mcp";
+const PAGE_ID = "board";
+const REFRESH_MS = 10000;
+
+// What each facet value reads as on a card. Anything not listed (the PR state
+// "open", the author persona, the provider) is the column's or the tag's job.
+const CHIPS = {
+  "ci:passing": ["CI passing", "success"],
+  "ci:failing": ["CI failing", "danger"],
+  "ci:running": ["CI running", "info"],
+  "ci:action-required": ["CI needs action", "warn"],
+  "review:approved": ["approved", "success"],
+  "review:partial-approval": ["partly approved", "info"],
+  "review:changes-requested": ["changes requested", "danger"],
+  "review:commented": ["commented", "info"],
+  "review:waiting": ["no review yet", ""],
+  "conflicts:yes": ["conflict", "danger"],
+  "blocked:yes": ["blocked by another MR", "warn"],
+  "queue:queued": ["in merge queue", "info"],
+  "queue:awaiting-checks": ["queue: checking", "info"],
+  "queue:mergeable": ["queue: ready", "success"],
+  "queue:locked": ["queue: locked", "warn"],
+  "queue:unmergeable": ["queue: unmergeable", "danger"],
+  "snoozed:yes": ["snoozed", ""],
+  "persona:reviewer": ["reviewing", "info"],
+  "my_review:in-progress": ["your review: in progress", "info"],
+  "my_review:approved": ["you approved", "success"],
+  "pr:draft": ["draft", "warn"],
+  "pr:merged": ["merged", "success"],
+  "pr:closed": ["closed", ""],
+};
+const PROVIDERS = { github: "GH", gitlab: "GL" };
+
+let cards = [];
+const el = {
+  board: document.getElementById("board"),
+  notice: document.getElementById("notice"),
+  meta: document.getElementById("meta"),
+  filter: document.getElementById("filter"),
+};
+
+// The bridge: one MessageChannel to the dashboard, requests answered by id.
+let nextId = 0;
+const pending = new Map();
+const channel = new MessageChannel();
+const port = channel.port1;
+port.onmessage = (event) => {
+  const msg = event.data;
+  if (!msg || msg.aoeBridge !== 1) return;
+  if (msg.event) {
+    if (msg.event === "theme" && msg.data && msg.data.cssVars) {
+      for (const [name, value] of Object.entries(msg.data.cssVars)) {
+        document.documentElement.style.setProperty(name, String(value));
+      }
+    }
+    return;
+  }
+  const done = pending.get(msg.id);
+  if (!done) return;
+  pending.delete(msg.id);
+  if (msg.error) done.reject(msg.error);
+  else done.resolve(msg.result);
+};
+
+function call(method, params) {
+  const id = ++nextId;
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    port.postMessage({ aoeBridge: 1, id, method, params });
+  });
+}
+
+function connect() {
+  // The first message goes to the dashboard window, carrying the channel's
+  // other end and the nonce from this page's URL fragment.
+  const id = ++nextId;
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    parent.postMessage(
+      { aoeBridge: 1, id, method: "ready", params: { nonce: location.hash.slice(1) } },
+      "*",
+      [channel.port2],
+    );
+  });
+}
+
+function boardState(reply) {
+  const entries = (reply && reply.entries) || [];
+  const entry = entries.find((e) => e.plugin_id === PLUGIN_ID && e.slot === "page" && e.id === PAGE_ID);
+  return entry ? entry.payload : null;
+}
+
+function text(tag, cls, value) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  node.textContent = value;
+  return node;
+}
+
+function chip(label, tone) {
+  return text("span", "chip" + (tone ? " " + tone : ""), label);
+}
+
+function renderCard(card) {
+  const node = document.createElement("button");
+  node.className = "card";
+  node.type = "button";
+  node.dataset.search = [card.ref, card.title, card.session_title, card.session].join(" ").toLowerCase();
+  node.title = card.url;
+  node.append(text("span", "ref", (PROVIDERS[card.provider] || card.provider) + " " + card.ref));
+  if (card.title) node.append(text("span", "title", card.title));
+  const chips = document.createElement("span");
+  chips.className = "chips";
+  for (const fact of card.facts || []) {
+    const known = CHIPS[fact];
+    if (known) chips.append(chip(known[0], known[1]));
+  }
+  if (card.threads) chips.append(chip(card.threads + " unresolved", "warn"));
+  if (chips.children.length) node.append(chips);
+  node.append(text("span", "session", "in " + (card.session_title || card.session)));
+  node.addEventListener("click", () => {
+    call("openSession", { id: card.session }).catch(() => {
+      el.notice.textContent = "Could not open the session.";
+    });
+  });
+  return node;
+}
+
+function render(payload) {
+  const query = el.filter.value.trim().toLowerCase();
+  el.board.replaceChildren();
+  let shown = 0;
+  for (const column of payload.columns || []) {
+    const col = document.createElement("section");
+    col.className = "col " + column.id;
+    const head = document.createElement("h2");
+    head.append(text("span", "", column.title), text("span", "", String(column.cards.length)));
+    const list = document.createElement("div");
+    list.className = "cards";
+    for (const card of column.cards) {
+      const node = renderCard(card);
+      if (query && !node.dataset.search.includes(query)) node.classList.add("hidden");
+      else shown++;
+      list.append(node);
+    }
+    if (!column.cards.length) list.append(text("div", "empty", "Nothing here."));
+    col.append(head, list);
+    el.board.append(col);
+  }
+  el.meta.textContent = shown + " shown" + (payload.dropped ? ", " + payload.dropped + " older finished left out" : "");
+}
+
+async function refresh() {
+  try {
+    const payload = boardState(await call("plugins.uiState"));
+    if (!payload) {
+      el.notice.textContent = "No board data yet. The worker pushes it shortly after it starts.";
+      return;
+    }
+    el.notice.textContent = "";
+    cards = payload;
+    render(payload);
+  } catch (err) {
+    el.notice.textContent = "Could not read the board: " + ((err && err.message) || "unknown error");
+  }
+}
+
+el.filter.addEventListener("input", () => cards && cards.columns && render(cards));
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+
+connect().then(refresh).catch(() => {
+  el.notice.textContent = "Could not reach the dashboard.";
+});
+setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_MS);
+</script>
+</body>
+</html>

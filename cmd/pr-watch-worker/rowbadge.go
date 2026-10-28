@@ -458,7 +458,7 @@ func badgeChipsFor(r registry.Registration, compact bool) []badgeChip {
 		// eventFilterShows and registry.Registration.EventFilter's doc
 		// comment), so a session that registered with e.g. events:
 		// ["MERGED"] only gets the eye chip here — same principle as the
-		// home-pane's badges.
+		// session pane's badges.
 		// The eye chip's conflict and queue colouring is those events' badge,
 		// so it follows the events filter too: a watch (a reviewer's, say) not
 		// told about conflicts or the queue does not wear them.
