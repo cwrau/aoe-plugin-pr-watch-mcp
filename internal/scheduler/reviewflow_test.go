@@ -158,3 +158,61 @@ func TestThreadResolvedIsNotReportedWhenTheWorkersOwnAccountResolvedIt(t *testin
 		t.Errorf("sent %q, want an unattributed resolve reported", got)
 	}
 }
+
+// selfReviewTick polls a reviewer watch once with result, after making it due.
+func selfReviewTick(t *testing.T, store *registry.Store, sched *Scheduler, gh *fakeGitHubChecker, url string, result provider.CheckResult) registry.Registration {
+	t.Helper()
+	ctx := context.Background()
+	reg := getReg(t, store, url, "sess1")
+	if err := store.UpdateState(ctx, url, "sess1", stateUpdateFromReg(reg, time.Now().Add(-time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	gh.results = map[string]provider.CheckResult{url: result}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return getReg(t, store, url, "sess1")
+}
+
+func newSelfReviewWatch(t *testing.T) (*registry.Store, *Scheduler, *fakeGitHubChecker, string) {
+	t.Helper()
+	store := openTestStore(t)
+	now := time.Now()
+	reg := registry.Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github", CIBucket: "none", NextDueAt: now.Add(-time.Second), CreatedAt: now, Persona: registry.PersonaReviewer}
+	if err := store.Add(context.Background(), reg); err != nil {
+		t.Fatal(err)
+	}
+	gh := &fakeGitHubChecker{budgets: provider.GitHubBudgets{
+		GraphQL: provider.RateBudget{Limit: 5000, Remaining: 4999, ResetAt: now.Add(time.Hour)},
+		REST:    provider.RateBudget{Limit: 5000, Remaining: 4999, ResetAt: now.Add(time.Hour)},
+	}}
+	return store, &Scheduler{Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{}}, gh, reg.PRURL
+}
+
+func TestSelfReviewCommitFromTheProviderIsStored(t *testing.T) {
+	store, sched, gh, url := newSelfReviewWatch(t)
+	got := selfReviewTick(t, store, sched, gh, url, provider.CheckResult{
+		State: "open", HeadSHA: "new", SelfReviewState: "COMMENTED", SelfReviewSHA: "old",
+	})
+	if got.SelfReviewSHA != "old" {
+		t.Errorf("SelfReviewSHA = %q, want old, the commit the provider says the review was on", got.SelfReviewSHA)
+	}
+}
+
+// GitLab does not say which commit an approval was on, so the head the worker
+// saw when it first saw the verdict stands in, and stays while the verdict does.
+func TestSelfReviewCommitFallsBackToTheHeadSeenWithTheVerdict(t *testing.T) {
+	store, sched, gh, url := newSelfReviewWatch(t)
+	got := selfReviewTick(t, store, sched, gh, url, provider.CheckResult{State: "open", HeadSHA: "h1", SelfReviewState: "APPROVED"})
+	if got.SelfReviewSHA != "h1" {
+		t.Fatalf("SelfReviewSHA = %q, want h1, the head seen with the new verdict", got.SelfReviewSHA)
+	}
+	got = selfReviewTick(t, store, sched, gh, url, provider.CheckResult{State: "open", HeadSHA: "h2", SelfReviewState: "APPROVED"})
+	if got.SelfReviewSHA != "h1" {
+		t.Errorf("SelfReviewSHA = %q after a push with the same verdict, want h1 kept", got.SelfReviewSHA)
+	}
+	got = selfReviewTick(t, store, sched, gh, url, provider.CheckResult{State: "open", HeadSHA: "h2"})
+	if got.SelfReviewSHA != "" {
+		t.Errorf("SelfReviewSHA = %q after the verdict went away, want it cleared", got.SelfReviewSHA)
+	}
+}

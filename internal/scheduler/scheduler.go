@@ -507,6 +507,7 @@ func stateUpdateFromReg(reg registry.Registration, nextDueAt time.Time) registry
 		IsDraft:             reg.IsDraft,
 		RequestedReviewers:  reg.RequestedReviewers,
 		SelfReviewState:     reg.SelfReviewState,
+		SelfReviewSHA:       reg.SelfReviewSHA,
 	}
 }
 
@@ -691,6 +692,7 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 		IsDraft:             reg.IsDraft,
 		RequestedReviewers:  reg.RequestedReviewers,
 		SelfReviewState:     result.SelfReviewState,
+		SelfReviewSHA:       selfReviewSHA(reg, result),
 	}
 	// A result that carries no head (a finished GitLab MR's early return)
 	// keeps the stored baseline rather than erasing it.
@@ -1039,4 +1041,20 @@ func filterSelfResolved(events []provider.Event, prev provider.PrevState, result
 		out = append(out, ev)
 	}
 	return out
+}
+
+// selfReviewSHA is the commit the worker's own account's verdict is on: the
+// provider's word where it gives one (GitHub). Otherwise (GitLab approvals)
+// the head seen when the verdict first showed up stands in and is kept while
+// the verdict does not change, so a later push shows as new commits since it.
+func selfReviewSHA(reg registry.Registration, result provider.CheckResult) string {
+	switch {
+	case result.SelfReviewState == "":
+		return ""
+	case result.SelfReviewSHA != "":
+		return result.SelfReviewSHA
+	case reg.SelfReviewState == result.SelfReviewState && reg.SelfReviewSHA != "":
+		return reg.SelfReviewSHA
+	}
+	return result.HeadSHA
 }

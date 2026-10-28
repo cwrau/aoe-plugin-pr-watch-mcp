@@ -43,13 +43,62 @@ func TestBoardColumnPlacement(t *testing.T) {
 		{"a failing check its event filter ignores is not attention", watching(func(r *registry.Registration) {
 			r.CIBucket, r.EventFilter = "failure", []string{"MERGED", "CLOSED"}
 		}), boardInReview},
-		{"reviewer, own review in progress", watching(func(r *registry.Registration) { r.Persona = registry.PersonaReviewer }), boardInReview},
-		{"reviewer, own approval", watching(func(r *registry.Registration) {
-			r.Persona, r.SelfReviewState = registry.PersonaReviewer, "APPROVED"
-		}), boardReady},
-		{"reviewer approved, others asked for changes", watching(func(r *registry.Registration) {
-			r.Persona, r.SelfReviewState, r.LatestReviewState = registry.PersonaReviewer, "APPROVED", "CHANGES_REQUESTED"
-		}), boardReady},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := boardColumnFor(tt.reg); got != tt.want {
+				t.Errorf("boardColumnFor() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func reviewing(mod func(*registry.Registration)) registry.Registration {
+	return watching(func(r *registry.Registration) {
+		r.Persona = registry.PersonaReviewer
+		if mod != nil {
+			mod(r)
+		}
+	})
+}
+
+// A reviewer is placed by their own verdict and whether the author pushed
+// since: what the PR's CI or conflicts say is the author's business.
+func TestBoardColumnPlacementForTheReviewerView(t *testing.T) {
+	tests := []struct {
+		name string
+		reg  registry.Registration
+		want string
+	}{
+		{"no verdict yet", reviewing(nil), boardToReview},
+		{"CI failing is not the reviewer's attention", reviewing(func(r *registry.Registration) { r.CIBucket, r.EventFilter = "failure", []string{"CI", "REVIEW"} }), boardToReview},
+		{"a conflict is not either", reviewing(func(r *registry.Registration) { r.HasConflict, r.EventFilter = true, []string{"CONFLICT", "REVIEW"} }), boardToReview},
+		{"other reviewers' verdicts do not move it", reviewing(func(r *registry.Registration) { r.LatestReviewState = "CHANGES_REQUESTED" }), boardToReview},
+		{"asked for changes", reviewing(func(r *registry.Registration) {
+			r.SelfReviewState, r.SelfReviewSHA, r.HeadSHA = "CHANGES_REQUESTED", "aaa", "aaa"
+		}), boardWaiting},
+		{"commented", reviewing(func(r *registry.Registration) {
+			r.SelfReviewState, r.SelfReviewSHA, r.HeadSHA = "COMMENTED", "aaa", "aaa"
+		}), boardWaiting},
+		{"approved", reviewing(func(r *registry.Registration) {
+			r.SelfReviewState, r.SelfReviewSHA, r.HeadSHA = "APPROVED", "aaa", "aaa"
+		}), boardApproved},
+		{"approved, others asked for changes", reviewing(func(r *registry.Registration) {
+			r.SelfReviewState, r.LatestReviewState = "APPROVED", "CHANGES_REQUESTED"
+		}), boardApproved},
+		{"new commits since the changes request", reviewing(func(r *registry.Registration) {
+			r.SelfReviewState, r.SelfReviewSHA, r.HeadSHA = "CHANGES_REQUESTED", "aaa", "bbb"
+		}), boardReReview},
+		{"new commits since an approval", reviewing(func(r *registry.Registration) {
+			r.SelfReviewState, r.SelfReviewSHA, r.HeadSHA = "APPROVED", "aaa", "bbb"
+		}), boardReReview},
+		{"head unknown is not new commits", reviewing(func(r *registry.Registration) { r.SelfReviewState, r.SelfReviewSHA = "COMMENTED", "aaa" }), boardWaiting},
+		{"verdict commit unknown is not new commits", reviewing(func(r *registry.Registration) { r.SelfReviewState, r.HeadSHA = "COMMENTED", "bbb" }), boardWaiting},
+		{"a draft is a draft", reviewing(func(r *registry.Registration) {
+			r.IsDraft, r.SelfReviewState, r.SelfReviewSHA, r.HeadSHA = true, "COMMENTED", "aaa", "bbb"
+		}), boardDraft},
+		{"merged", reviewing(func(r *registry.Registration) { r.Status = registry.StatusMerged }), boardDone},
+		{"closed", reviewing(func(r *registry.Registration) { r.Status = registry.StatusClosed }), boardDone},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -62,8 +111,17 @@ func TestBoardColumnPlacement(t *testing.T) {
 
 func boardTitleOf(id string) string { return "title of " + id }
 
-func cardsOf(p boardPayload, column string) []boardCard {
-	for _, c := range p.Columns {
+func viewOf(p boardPayload, view string) boardView {
+	for _, v := range p.Views {
+		if v.ID == view {
+			return v
+		}
+	}
+	return boardView{}
+}
+
+func cardsOf(p boardPayload, view, column string) []boardCard {
+	for _, c := range viewOf(p, view).Columns {
 		if c.ID == column {
 			return c.Cards
 		}
@@ -85,25 +143,39 @@ func TestBoardPayloadColumnsAndCards(t *testing.T) {
 	}
 	p := buildBoardPayload(regs, nil, boardTitleOf)
 
-	wantOrder := []string{boardNew, boardAttention, boardInReview, boardReady, boardDraft, boardDone}
-	var got []string
-	for _, c := range p.Columns {
-		got = append(got, c.ID)
+	var viewIDs []string
+	for _, v := range p.Views {
+		viewIDs = append(viewIDs, v.ID)
 	}
-	if !slices.Equal(got, wantOrder) {
-		t.Fatalf("column order = %v, want %v", got, wantOrder)
+	if want := []string{boardAuthorView, boardReviewerView}; !slices.Equal(viewIDs, want) {
+		t.Fatalf("views = %v, want %v", viewIDs, want)
+	}
+	wantColumns := map[string][]string{
+		boardAuthorView:   {boardAttention, boardInReview, boardReady, boardDraft, boardDone},
+		boardReviewerView: {boardNew, boardToReview, boardReReview, boardWaiting, boardApproved, boardDraft, boardDone},
 	}
 	titles := map[string]string{
 		boardNew: "New, not watched", boardAttention: "Needs attention", boardInReview: "In review",
-		boardReady: "Ready", boardDraft: "Draft", boardDone: "Done",
+		boardReady: "Ready", boardDraft: "Draft", boardDone: "Done", boardToReview: "To review",
+		boardReReview: "Re-review", boardWaiting: "Waiting on author", boardApproved: "Approved by you",
 	}
-	for _, c := range p.Columns {
-		if c.Title != titles[c.ID] {
-			t.Errorf("column %q title = %q, want %q", c.ID, c.Title, titles[c.ID])
+	for _, v := range p.Views {
+		var got []string
+		for _, c := range v.Columns {
+			got = append(got, c.ID)
+			if c.Title != titles[c.ID] {
+				t.Errorf("view %q column %q title = %q, want %q", v.ID, c.ID, c.Title, titles[c.ID])
+			}
+		}
+		if !slices.Equal(got, wantColumns[v.ID]) {
+			t.Errorf("view %q columns = %v, want %v", v.ID, got, wantColumns[v.ID])
 		}
 	}
+	if viewOf(p, boardAuthorView).Title != "Author" || viewOf(p, boardReviewerView).Title != "Reviewer" {
+		t.Errorf("view titles = %q and %q", viewOf(p, boardAuthorView).Title, viewOf(p, boardReviewerView).Title)
+	}
 
-	attention := cardsOf(p, boardAttention)
+	attention := cardsOf(p, boardAuthorView, boardAttention)
 	if len(attention) != 1 {
 		t.Fatalf("attention cards = %+v, want 1", attention)
 	}
@@ -117,9 +189,56 @@ func TestBoardPayloadColumnsAndCards(t *testing.T) {
 			t.Errorf("card facts = %v, want %q among them", c.Facts, want)
 		}
 	}
-	review := cardsOf(p, boardInReview)
+	review := cardsOf(p, boardAuthorView, boardInReview)
 	if len(review) != 1 || review[0].Ref != "g/p!2" || review[0].Provider != "gitlab" {
 		t.Errorf("in review cards = %+v, want the GitLab MR g/p!2 (stopped watches never show)", review)
+	}
+}
+
+func TestBoardPayloadPutsEachPersonaInItsOwnView(t *testing.T) {
+	regs := []registry.Registration{
+		watching(func(r *registry.Registration) { r.PRURL = "https://github.com/o/r/pull/1" }),
+		reviewing(func(r *registry.Registration) {
+			r.PRURL, r.SelfReviewState, r.SelfReviewSHA, r.HeadSHA = "https://github.com/o/r/pull/2", "CHANGES_REQUESTED", "aaa", "bbb"
+		}),
+		reviewing(func(r *registry.Registration) {
+			r.PRURL, r.SelfReviewState, r.SelfReviewSHA, r.HeadSHA = "https://github.com/o/r/pull/3", "APPROVED", "aaa", "aaa"
+		}),
+		reviewing(func(r *registry.Registration) { r.PRURL = "https://github.com/o/r/pull/4" }),
+		reviewing(func(r *registry.Registration) {
+			r.PRURL, r.Status = "https://github.com/o/r/pull/5", registry.StatusMerged
+		}),
+	}
+	p := buildBoardPayload(regs, nil, boardTitleOf)
+
+	refs := func(view, column string) []string {
+		var out []string
+		for _, c := range cardsOf(p, view, column) {
+			out = append(out, c.Ref)
+		}
+		return out
+	}
+	for _, want := range []struct {
+		view, column string
+		refs         []string
+	}{
+		{boardAuthorView, boardInReview, []string{"o/r#1"}},
+		{boardReviewerView, boardReReview, []string{"o/r#2"}},
+		{boardReviewerView, boardApproved, []string{"o/r#3"}},
+		{boardReviewerView, boardToReview, []string{"o/r#4"}},
+		{boardReviewerView, boardDone, []string{"o/r#5"}},
+	} {
+		if got := refs(want.view, want.column); !slices.Equal(got, want.refs) {
+			t.Errorf("%s/%s = %v, want %v", want.view, want.column, got, want.refs)
+		}
+	}
+	for _, c := range cardsOf(p, boardReviewerView, boardReReview) {
+		if c.Verdict != "changes-requested" {
+			t.Errorf("verdict = %q, want changes-requested", c.Verdict)
+		}
+	}
+	if got := cardsOf(p, boardAuthorView, boardInReview)[0].Verdict; got != "" {
+		t.Errorf("an author card has verdict %q, want none", got)
 	}
 }
 
@@ -134,7 +253,10 @@ func TestBoardPayloadUnwatchedColumnFromNotifySubscriptions(t *testing.T) {
 	}
 	p := buildBoardPayload(regs, tracked, boardTitleOf)
 
-	fresh := cardsOf(p, boardNew)
+	if len(viewOf(p, boardAuthorView).Columns) > 0 && viewOf(p, boardAuthorView).Columns[0].ID == boardNew {
+		t.Error("the author view has a New column; announced PRs belong to the reviewer view")
+	}
+	fresh := cardsOf(p, boardReviewerView, boardNew)
 	if len(fresh) != 2 {
 		t.Fatalf("new cards = %+v, want 2 (the one s already watches is not new)", fresh)
 	}
@@ -144,7 +266,7 @@ func TestBoardPayloadUnwatchedColumnFromNotifySubscriptions(t *testing.T) {
 	if slices.Contains(fresh[0].Facts, "pr:draft") || !slices.Contains(fresh[1].Facts, "pr:draft") {
 		t.Errorf("draft facts: %v and %v, want pr:draft on the second only", fresh[0].Facts, fresh[1].Facts)
 	}
-	if len(cardsOf(p, boardInReview)) != 1 {
+	if len(cardsOf(p, boardAuthorView, boardInReview)) != 1 {
 		t.Errorf("the watched PR must still show once, in its own column")
 	}
 }
@@ -162,7 +284,7 @@ func TestBoardPayloadDoneColumnShowsTheNewestFirst(t *testing.T) {
 		mk(3, registry.StatusMerged, now.Add(-2*time.Hour)),
 	}, nil, boardTitleOf)
 	var refs []string
-	for _, c := range cardsOf(p, boardDone) {
+	for _, c := range cardsOf(p, boardAuthorView, boardDone) {
 		refs = append(refs, c.Ref)
 	}
 	if want := []string{"o/r#2", "o/r#3", "o/r#1"}; !slices.Equal(refs, want) {
@@ -183,6 +305,15 @@ func TestBoardPayloadStaysUnderTheHostCapByDroppingOldFinishedCards(t *testing.T
 	}
 	open := watching(func(r *registry.Registration) { r.PRURL = "https://github.com/o/r/pull/9999" })
 	regs = append(regs, open)
+	// Reviewer-side finished cards compete for the same budget, and are older.
+	for i := range 400 {
+		i := i
+		regs = append(regs, reviewing(func(r *registry.Registration) {
+			r.PRURL = fmt.Sprintf("https://github.com/o/r/pull/%d", 1000+i)
+			r.Title = strings.Repeat("long title ", 12)
+			r.Status, r.MergedAt = registry.StatusMerged, now.Add(-time.Duration(i)*time.Minute-24*time.Hour)
+		}))
+	}
 
 	p := buildBoardPayload(regs, nil, boardTitleOf)
 	raw, err := json.Marshal(p)
@@ -195,21 +326,25 @@ func TestBoardPayloadStaysUnderTheHostCapByDroppingOldFinishedCards(t *testing.T
 	if p.Dropped == 0 {
 		t.Errorf("Dropped = 0, want the number of finished cards left out")
 	}
-	if len(cardsOf(p, boardInReview)) != 1 {
+	if len(cardsOf(p, boardAuthorView, boardInReview)) != 1 {
 		t.Errorf("the open PR must survive the cut")
 	}
-	done := cardsOf(p, boardDone)
-	if len(done) == 0 || done[0].Ref != "o/r#1" {
-		t.Errorf("done cards = %d, first %+v: the newest finished ones must be the ones kept", len(done), done)
+	authorDone := cardsOf(p, boardAuthorView, boardDone)
+	reviewerDone := cardsOf(p, boardReviewerView, boardDone)
+	if len(authorDone) == 0 || authorDone[0].Ref != "o/r#1" {
+		t.Errorf("author done cards = %d, first %+v: the newest finished ones must be the ones kept", len(authorDone), authorDone)
 	}
-	if len(done)+p.Dropped != 400 {
-		t.Errorf("kept %d + dropped %d != 400", len(done), p.Dropped)
+	if len(authorDone) < len(reviewerDone) {
+		t.Errorf("kept %d author and %d reviewer finished cards: the older (reviewer) ones go first", len(authorDone), len(reviewerDone))
+	}
+	if len(authorDone)+len(reviewerDone)+p.Dropped != 800 {
+		t.Errorf("kept %d + %d, dropped %d != 800", len(authorDone), len(reviewerDone), p.Dropped)
 	}
 }
 
 func TestBoardCardTitleIsShortened(t *testing.T) {
 	p := buildBoardPayload([]registry.Registration{watching(func(r *registry.Registration) { r.Title = strings.Repeat("x", 500) })}, nil, boardTitleOf)
-	if got := len([]rune(cardsOf(p, boardInReview)[0].Title)); got > 120 {
+	if got := len([]rune(cardsOf(p, boardAuthorView, boardInReview)[0].Title)); got > 120 {
 		t.Errorf("title is %d runes, want at most 120", got)
 	}
 }
@@ -217,7 +352,7 @@ func TestBoardCardTitleIsShortened(t *testing.T) {
 func TestHostRPCPushBoardPageSendsTheGlobalPageState(t *testing.T) {
 	var buf bytes.Buffer
 	h := newHostRPC(&buf)
-	if err := h.pushBoardPage(boardPayload{Columns: []boardColumn{{ID: boardNew, Title: "New"}}}); err != nil {
+	if err := h.pushBoardPage(boardPayload{Views: []boardView{{ID: boardReviewerView, Title: "Reviewer"}}}); err != nil {
 		t.Fatalf("pushBoardPage() error = %v", err)
 	}
 	var msg map[string]any
@@ -231,7 +366,7 @@ func TestHostRPCPushBoardPageSendsTheGlobalPageState(t *testing.T) {
 	if _, has := params["session_id"]; has {
 		t.Error("a page's state is global, it must not carry a session_id")
 	}
-	if cols, _ := params["payload"].(map[string]any)["columns"].([]any); len(cols) != 1 {
+	if views, _ := params["payload"].(map[string]any)["views"].([]any); len(views) != 1 {
 		t.Errorf("payload = %v", params["payload"])
 	}
 }
@@ -308,7 +443,7 @@ func TestPushUIStateShowsNotifySubscriptionMatchesInTheNewColumn(t *testing.T) {
 		if m.Params.Slot != boardPageSlot {
 			continue
 		}
-		fresh := cardsOf(m.Params.Payload, boardNew)
+		fresh := cardsOf(m.Params.Payload, boardReviewerView, boardNew)
 		if len(fresh) != 1 || fresh[0].Ref != "o/r#7" || fresh[0].Session != "orch" || !slices.Contains(fresh[0].Facts, "pr:draft") {
 			t.Errorf("new cards = %+v, want the tracked draft o/r#7 of session orch", fresh)
 		}
@@ -362,7 +497,8 @@ func TestBoardPayloadEncodesEmptyColumnsAsEmptyLists(t *testing.T) {
 	if bytes.Contains(raw, []byte(`"cards":null`)) {
 		t.Errorf("payload = %s, want no null card lists", raw)
 	}
-	if got := bytes.Count(raw, []byte(`"cards":[]`)); got != len(boardColumnTitles) {
-		t.Errorf("payload = %s, want %d empty card lists", raw, len(boardColumnTitles))
+	// Five author columns and seven reviewer columns.
+	if got := bytes.Count(raw, []byte(`"cards":[]`)); got != 12 {
+		t.Errorf("payload = %s, want 12 empty card lists", raw)
 	}
 }

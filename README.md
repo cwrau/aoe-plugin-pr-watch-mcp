@@ -22,7 +22,7 @@ a review, a comment, CI turning red, a conflict, a merge.
 
 ## Requirements
 
-- AoE v1.20.0 or newer (plugin `api_version` 15), with the plugin's
+- AoE v1.20.0 or newer (plugin `api_version` 16), with the plugin's
   `session.read` and `session.message` capabilities granted.
 - Go, in the version `go.mod` names: `aoe plugin install` builds the worker
   from source.
@@ -235,19 +235,44 @@ poll instead of pinging twice.
 
 **PR Board** is a dashboard page (button beside the top bar's search, or the
 command palette) that lays every watched PR/MR out as a card, in columns by
-state. It needs AoE 1.20 or newer. A card sits in the first column that fits:
+state. It needs AoE 1.20 or newer. Two tabs, **Author** and **Reviewer**,
+because the two need different things: a watch's persona decides the tab. A
+card sits in the first column of its tab that fits.
+
+**Author** (your own PRs/MRs):
+
+| Column | Holds |
+| --- | --- |
+| Needs attention | changes requested, CI failing or needing action, a conflict, or unresolved threads |
+| In review | open and waiting: no review yet, commented, partly approved, CI still running |
+| Ready | approved with nothing needing attention, or in the merge queue |
+| Draft | drafts, whatever their CI says |
+| Done | merged or closed, newest first |
+
+Author columns follow a watch's events filter like its badge chips do, so a
+failing check the watch is not told about does not put it under *Needs
+attention*.
+
+**Reviewer** (someone else's, which you review). CI, conflicts and other
+reviewers' verdicts are the author's business and never place a card; your own
+last review does:
 
 | Column | Holds |
 | --- | --- |
 | New, not watched | PRs/MRs a notify-mode subscription announced that no session watches yet |
-| Needs attention | changes requested, CI failing or needing action, a conflict, or unresolved threads |
-| In review | open and waiting: no review yet, commented, partly approved, CI still running |
-| Ready | approved (and nothing needing attention), in the merge queue, or, for the reviewer persona, approved by you |
-| Draft | drafts, whatever their CI says |
+| To review | you have no verdict yet |
+| Re-review | the author pushed new commits since your verdict, whatever it was |
+| Waiting on author | you asked for changes or commented, nothing new since |
+| Approved by you | you approved, nothing new since |
+| Draft | drafts |
 | Done | merged or closed, newest first |
 
-Columns follow a watch's events filter like its badge chips do, so a failing
-check the watch is not told about does not put it under *Needs attention*.
+"New commits since your review" compares the head with the commit your review
+was on. GitHub says which; GitLab approvals do not, so the head seen when the
+worker first saw your approval stands in (and GitLab has no "commented"
+verdict, so a commented-only MR stays under *To review*).
+
+The tab opens on the first one with anything open until you pick one.
 Each card shows the PR/MR, its title, status chips and the session that
 watches it. Clicking a card opens that session: the dashboard sandboxes pages
 and they cannot open links, so the PR/MR reference is shown as selectable

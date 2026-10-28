@@ -67,6 +67,7 @@ type CheckResult struct {
 	ForcePushed             bool              // true if the head was last moved by a force-push (GitHub only)
 	IsDraft                 bool              // true while the PR/MR is a draft
 	RequestedReviewers      []string          // logins/usernames a review is currently requested from (teams are not listed)
+	SelfReviewSHA           string            // the head commit that review was on, when the provider says (GitHub); empty otherwise
 	SelfReviewState         string            // the worker's own account's latest review state ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"), empty if it has none or it was dismissed; GitLab only ever reports "APPROVED"
 }
 

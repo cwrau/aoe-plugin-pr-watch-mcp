@@ -154,7 +154,7 @@ const githubPullRequestFieldsQuery = `      state
       queueEvents: timelineItems(last: 2, itemTypes: [ADDED_TO_MERGE_QUEUE_EVENT, REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { __typename ... on RemovedFromMergeQueueEvent { reason } } }
       isDraft
       reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on User { login } } } }
-      viewerLatestReview { state }
+      viewerLatestReview { state commit { oid } }
       pushEvents: timelineItems(last: 1, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) { nodes { ... on HeadRefForcePushedEvent { afterCommit { oid } } } }
       reviewDecision
       reviewCount: reviews { totalCount }
@@ -263,7 +263,10 @@ type githubPullRequestFields struct {
 	} `json:"reviewRequests"`
 	// ViewerLatestReview is the worker's own account's latest review.
 	ViewerLatestReview *struct {
-		State string `json:"state"`
+		State  string `json:"state"`
+		Commit *struct {
+			Oid string `json:"oid"`
+		} `json:"commit"`
 	} `json:"viewerLatestReview"`
 	// PushEvents is the newest force-push of the head branch: it is the
 	// current head's doing only while its afterCommit is the head itself.
@@ -411,6 +414,9 @@ func buildCheckResult(pr githubPullRequestFields) CheckResult {
 	// A dismissed review no longer counts as the account's verdict.
 	if v := pr.ViewerLatestReview; v != nil && v.State != "DISMISSED" {
 		result.SelfReviewState = v.State
+		if v.Commit != nil {
+			result.SelfReviewSHA = v.Commit.Oid
+		}
 	}
 	if n := pr.Commits.Nodes; len(n) > 0 {
 		author := n[0].Commit.Author

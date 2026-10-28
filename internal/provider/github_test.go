@@ -1382,3 +1382,41 @@ func TestGitHubCheckerRecordsWhoResolvedEachThread(t *testing.T) {
 		t.Error("an unresolved thread has a resolver")
 	}
 }
+
+func TestGitHubCheckerRecordsTheCommitOfTheViewersLatestReview(t *testing.T) {
+	body := `{"data": {"repo0": {"pr0": {
+	  "state": "OPEN", "title": "t", "headRefOid": "bbbb",
+	  "viewerLatestReview": {"state": "CHANGES_REQUESTED", "commit": {"oid": "aaaa"}},
+	  "reviewCount": {"totalCount": 0}, "latestReview": {"nodes": []}
+	}}, "rateLimit": {"limit": 5000, "remaining": 4998, "resetAt": "2026-09-20T23:00:00Z"}}}`
+	srv := fakeGitHubServer(t, body, 0)
+	defer srv.Close()
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	if r := results[url]; r.SelfReviewState != "CHANGES_REQUESTED" || r.SelfReviewSHA != "aaaa" || r.HeadSHA != "bbbb" {
+		t.Errorf("self review = %q on %q, head %q; want CHANGES_REQUESTED on aaaa, head bbbb", r.SelfReviewState, r.SelfReviewSHA, r.HeadSHA)
+	}
+}
+
+func TestGitHubCheckerLeavesTheSelfReviewCommitEmptyWithoutAVerdict(t *testing.T) {
+	body := `{"data": {"repo0": {"pr0": {
+	  "state": "OPEN", "title": "t", "headRefOid": "bbbb",
+	  "viewerLatestReview": {"state": "DISMISSED", "commit": {"oid": "aaaa"}},
+	  "reviewCount": {"totalCount": 0}, "latestReview": {"nodes": []}
+	}}, "rateLimit": {"limit": 5000, "remaining": 4998, "resetAt": "2026-09-20T23:00:00Z"}}}`
+	srv := fakeGitHubServer(t, body, 0)
+	defer srv.Close()
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	if r := results[url]; r.SelfReviewState != "" || r.SelfReviewSHA != "" {
+		t.Errorf("a dismissed review gave %q on %q, want no verdict and no commit", r.SelfReviewState, r.SelfReviewSHA)
+	}
+}

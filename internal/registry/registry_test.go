@@ -1386,3 +1386,26 @@ func TestSetSnoozedRoundTrips(t *testing.T) {
 		t.Error("snoozed was not cleared")
 	}
 }
+
+func TestSelfReviewCommitIsPersisted(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	now := time.Now()
+	r := Registration{PRURL: "https://github.com/o/r/pull/1", SessionID: "s1", Provider: "github", NextDueAt: now, CreatedAt: now, Persona: PersonaReviewer}
+	if err := s.Add(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateState(ctx, r.PRURL, "s1", StateUpdate{
+		CIBucket: "none", NextDueAt: now, HeadSHA: "bbb", SelfReviewState: "COMMENTED", SelfReviewSHA: "aaa",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ := s.Get(ctx, r.PRURL, "s1")
+	if got.SelfReviewSHA != "aaa" {
+		t.Errorf("Get() SelfReviewSHA = %q, want aaa", got.SelfReviewSHA)
+	}
+	list, _ := s.List(ctx)
+	if len(list) != 1 || list[0].SelfReviewSHA != "aaa" {
+		t.Errorf("List() = %+v, want SelfReviewSHA aaa", list)
+	}
+}

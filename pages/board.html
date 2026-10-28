@@ -47,7 +47,15 @@
     display: flex; justify-content: space-between;
   }
   .col.attention h2 { color: var(--danger); }
-  .col.ready h2 { color: var(--success); }
+  .col.ready h2, .col.approved h2 { color: var(--success); }
+  .col.re-review h2 { color: var(--warn); }
+  #tabs { display: flex; gap: 4px; }
+  .tab {
+    font: inherit; color: var(--muted); background: transparent; cursor: pointer;
+    border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--text); background: var(--card); border-color: var(--info); }
   .cards { overflow-y: auto; padding: 0 8px 8px; display: flex; flex-direction: column; gap: 8px; }
   .empty { color: var(--muted); padding: 4px 4px 10px; font-size: 12px; }
   button.card {
@@ -74,6 +82,7 @@
 <body>
 <header>
   <h1>PR Board</h1>
+  <nav id="tabs" role="tablist" aria-label="View"></nav>
   <input id="filter" type="search" placeholder="Filter by PR, title or session" aria-label="Filter cards">
   <span class="meta" id="meta"></span>
 </header>
@@ -115,8 +124,11 @@ const CHIPS = {
 };
 const PROVIDERS = { github: "GH", gitlab: "GL" };
 
-let cards = [];
+let cards = { views: [] };
+let activeView = null;
+let userPicked = false;
 const el = {
+  tabs: document.getElementById("tabs"),
   board: document.getElementById("board"),
   notice: document.getElementById("notice"),
   meta: document.getElementById("meta"),
@@ -185,7 +197,16 @@ function chip(label, tone) {
   return text("span", "chip" + (tone ? " " + tone : ""), label);
 }
 
-function renderCard(card) {
+// A reviewer's own last review, shown on their cards instead of the generic
+// review and "your review" facts.
+const VERDICTS = {
+  "approved": ["you approved", "success"],
+  "changes-requested": ["you asked for changes", "danger"],
+  "commented": ["you commented", "info"],
+};
+const HIDDEN_FOR_REVIEWER = new Set(["review:waiting", "persona:reviewer", "my_review:in-progress", "my_review:approved"]);
+
+function renderCard(card, viewId, columnId) {
   const node = document.createElement("button");
   node.className = "card";
   node.type = "button";
@@ -195,9 +216,19 @@ function renderCard(card) {
   if (card.title) node.append(text("span", "title", card.title));
   const chips = document.createElement("span");
   chips.className = "chips";
+  if (viewId === "reviewer") {
+    if (columnId === "re-review") chips.append(chip("new commits since your review", "warn"));
+    const verdict = VERDICTS[card.verdict];
+    if (verdict) chips.append(chip(verdict[0], verdict[1]));
+  }
   for (const fact of card.facts || []) {
+    if (viewId === "reviewer" && HIDDEN_FOR_REVIEWER.has(fact)) continue;
     const known = CHIPS[fact];
-    if (known) chips.append(chip(known[0], known[1]));
+    if (!known) continue;
+    // On a reviewer's card the review facts are the latest review by anyone,
+    // not their own verdict, which has its own chip above.
+    const label = viewId === "reviewer" && fact.startsWith("review:") ? "latest review: " + known[0] : known[0];
+    chips.append(chip(label, known[1]));
   }
   if (card.threads) chips.append(chip(card.threads + " unresolved", "warn"));
   if (chips.children.length) node.append(chips);
@@ -210,11 +241,43 @@ function renderCard(card) {
   return node;
 }
 
+// Open cards of a view, for its tab: finished ones do not need a look.
+function openCount(view) {
+  let n = 0;
+  for (const column of view.columns || []) if (column.id !== "done") n += (column.cards || []).length;
+  return n;
+}
+
+function renderTabs(views) {
+  el.tabs.replaceChildren();
+  for (const view of views) {
+    const tab = document.createElement("button");
+    tab.type = "button";
+    tab.className = "tab" + (view.id === activeView ? " active" : "");
+    tab.setAttribute("role", "tab");
+    tab.setAttribute("aria-selected", String(view.id === activeView));
+    tab.textContent = view.title + " (" + openCount(view) + ")";
+    tab.addEventListener("click", () => {
+      activeView = view.id;
+      userPicked = true;
+      render(cards);
+    });
+    el.tabs.append(tab);
+  }
+}
+
 function render(payload) {
+  const views = payload.views || [];
+  // Until the user picks a tab, show the first view that has anything open.
+  if (!userPicked || !views.some((v) => v.id === activeView)) {
+    activeView = (views.find((v) => openCount(v) > 0) || views[0] || {}).id;
+  }
+  renderTabs(views);
+  const view = views.find((v) => v.id === activeView) || { columns: [] };
   const query = el.filter.value.trim().toLowerCase();
   el.board.replaceChildren();
   let shown = 0;
-  for (const column of payload.columns || []) {
+  for (const column of view.columns || []) {
     const columnCards = column.cards || [];
     const col = document.createElement("section");
     col.className = "col " + column.id;
@@ -223,7 +286,7 @@ function render(payload) {
     const list = document.createElement("div");
     list.className = "cards";
     for (const card of columnCards) {
-      const node = renderCard(card);
+      const node = renderCard(card, view.id, column.id);
       if (query && !node.dataset.search.includes(query)) node.classList.add("hidden");
       else shown++;
       list.append(node);
@@ -250,7 +313,7 @@ async function refresh() {
   }
 }
 
-el.filter.addEventListener("input", () => cards && cards.columns && render(cards));
+el.filter.addEventListener("input", () => render(cards));
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 
 connect().then(refresh).catch(() => {
