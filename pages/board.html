@@ -76,7 +76,6 @@
   .chip.warn { color: var(--warn); border-color: var(--warn); }
   .chip.info { color: var(--info); border-color: var(--info); }
   .session { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
-  .hidden { display: none; }
 </style>
 </head>
 <body>
@@ -281,17 +280,22 @@ function render(payload) {
     const columnCards = column.cards || [];
     const col = document.createElement("section");
     col.className = "col " + column.id;
-    const head = document.createElement("h2");
-    head.append(text("span", "", column.title), text("span", "", String(columnCards.length)));
     const list = document.createElement("div");
     list.className = "cards";
+    // Cards that do not match the filter are not rendered at all, rather than
+    // hidden by a class: the card's own display rule would win over it.
+    let matching = 0;
     for (const card of columnCards) {
       const node = renderCard(card, view.id, column.id);
-      if (query && !node.dataset.search.includes(query)) node.classList.add("hidden");
-      else shown++;
+      if (query && !node.dataset.search.includes(query)) continue;
+      matching++;
       list.append(node);
     }
-    if (!columnCards.length) list.append(text("div", "empty", "Nothing here."));
+    shown += matching;
+    const head = document.createElement("h2");
+    const count = query ? matching + " / " + columnCards.length : String(columnCards.length);
+    head.append(text("span", "", column.title), text("span", "", count));
+    if (!matching) list.append(text("div", "empty", columnCards.length ? "No match." : "Nothing here."));
     col.append(head, list);
     el.board.append(col);
   }

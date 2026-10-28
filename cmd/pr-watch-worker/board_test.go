@@ -502,3 +502,18 @@ func TestBoardPayloadEncodesEmptyColumnsAsEmptyLists(t *testing.T) {
 		t.Errorf("payload = %s, want 12 empty card lists", raw)
 	}
 }
+
+// The card's own display rule outranks a ".hidden" class, so a filter that
+// hides cards by class shows everything. The page must leave non-matching
+// cards out instead.
+func TestBoardPageFilterDoesNotHideCardsByClass(t *testing.T) {
+	page, err := os.ReadFile("../../pages/board.html")
+	if err != nil {
+		t.Fatalf("read the page: %v", err)
+	}
+	for _, banned := range []string{`classList.add("hidden")`, ".hidden {"} {
+		if bytes.Contains(page, []byte(banned)) {
+			t.Errorf("page contains %q: a class-hidden card still shows, since button.card sets display itself", banned)
+		}
+	}
+}
