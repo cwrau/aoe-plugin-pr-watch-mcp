@@ -19,20 +19,40 @@ const SnoozeRecheckInterval = time.Minute
 // gateTimeout bounds one gate command so a hung check can't stall a Tick.
 const gateTimeout = 10 * time.Second
 
-// SnoozeRule mutes every registration whose URL matches one of Match, and none
-// of Exclude, while Gate reports closed. Gate is a shell command: exit 0 means
+// SnoozeRule mutes every registration of its persona whose URL matches one of
+// Match, and none of Exclude, while Gate reports closed. Gate is a shell command: exit 0 means
 // open (poll normally), any other exit means closed (snoozed).
 type SnoozeRule struct {
 	Match   []string
 	Exclude []string
+	// Persona limits the rule to watches of one persona (registry.PersonaAuthor
+	// or PersonaReviewer). Empty or SnoozePersonaBoth, which is what a rule
+	// saved before the setting existed has, covers both.
+	Persona string
 	Gate    string
 }
 
-// applies reports whether the rule governs url: a Match pattern hits and no
-// Exclude pattern does. A URL the rule does not apply to ignores it entirely,
-// its gate included.
-func (r SnoozeRule) applies(url string) bool {
-	return matchesSnooze(r.Match, url) && !matchesSnooze(r.Exclude, url)
+// SnoozePersonaBoth is the persona setting's value for a rule that covers
+// author and reviewer watches alike.
+const SnoozePersonaBoth = "both"
+
+// applies reports whether the rule governs reg: its persona is covered, a
+// Match pattern hits the URL and no Exclude pattern does. A watch the rule
+// does not apply to ignores it entirely, its gate included.
+func (r SnoozeRule) applies(reg registry.Registration) bool {
+	return r.coversPersona(reg.Persona) && matchesSnooze(r.Match, reg.PRURL) && !matchesSnooze(r.Exclude, reg.PRURL)
+}
+
+// coversPersona reports whether the rule governs watches of persona, where a
+// watch stored with no persona is an author's.
+func (r SnoozeRule) coversPersona(persona string) bool {
+	if r.Persona == "" || r.Persona == SnoozePersonaBoth {
+		return true
+	}
+	if persona == "" {
+		persona = registry.PersonaAuthor
+	}
+	return r.Persona == persona
 }
 
 // GateFunc evaluates a gate command. A non-nil error means the gate could
@@ -74,7 +94,7 @@ func (s *Scheduler) isSnoozed(ctx context.Context, reg registry.Registration) bo
 		return false
 	}
 	for _, rule := range s.Snooze() {
-		if rule.Gate == "" || !rule.applies(reg.PRURL) {
+		if rule.Gate == "" || !rule.applies(reg) {
 			continue
 		}
 		if !s.gateOpen(ctx, rule.Gate) {

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -74,9 +75,17 @@ func TestWorkerSurvivesAHugeSessionsListReply(t *testing.T) {
 		_, _ = stdin.Write(append(line, '\n'))
 	}
 	uiPush := make(chan struct{}, 1)
+	scanErr := make(chan error, 1)
 	go func() {
 		sc := bufio.NewScanner(stdout)
 		sc.Buffer(make([]byte, 0, 64<<10), 64<<20)
+		// A line the scanner cannot read (too long) stops it; say so instead of
+		// leaving the test to time out. The pipe closing at teardown is expected.
+		defer func() {
+			if err := sc.Err(); err != nil && !errors.Is(err, os.ErrClosed) {
+				scanErr <- err
+			}
+		}()
 		for sc.Scan() {
 			var msg struct {
 				ID     any    `json:"id"`
@@ -102,6 +111,8 @@ func TestWorkerSurvivesAHugeSessionsListReply(t *testing.T) {
 
 	select {
 	case <-uiPush:
+	case err := <-scanErr:
+		t.Fatalf("reading the worker's output: %v", err)
 	case err := <-exited:
 		t.Fatalf("worker exited early after the big reply: %v", err)
 	case <-time.After(30 * time.Second):

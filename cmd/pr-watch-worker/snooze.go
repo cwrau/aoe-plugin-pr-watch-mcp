@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/registry"
 	"github.com/cwrau/aoe-plugin-pr-watch-mcp/internal/scheduler"
 )
 
@@ -76,6 +77,7 @@ func parseSnoozeRules(raw json.RawMessage) ([]scheduler.SnoozeRule, error) {
 		Value []struct {
 			Match   []string `json:"match"`
 			Exclude []string `json:"exclude"`
+			Persona string   `json:"persona"`
 			Gate    string   `json:"gate"`
 		} `json:"value"`
 	}
@@ -86,12 +88,27 @@ func parseSnoozeRules(raw json.RawMessage) ([]scheduler.SnoozeRule, error) {
 	for _, item := range reply.Value {
 		gate := strings.TrimSpace(item.Gate)
 		patterns := trimmedPatterns(item.Match)
-		if gate == "" || len(patterns) == 0 {
+		persona, ok := snoozePersona(item.Persona)
+		if gate == "" || len(patterns) == 0 || !ok {
 			continue
 		}
-		rules = append(rules, scheduler.SnoozeRule{Match: patterns, Exclude: trimmedPatterns(item.Exclude), Gate: gate})
+		rules = append(rules, scheduler.SnoozeRule{Match: patterns, Exclude: trimmedPatterns(item.Exclude), Persona: persona, Gate: gate})
 	}
 	return rules, nil
+}
+
+// snoozePersona reads a rule's persona setting. A rule saved before the
+// setting existed has none and covers both personas, as "both" does. A value
+// that is none of those is not guessed at (ok is false), so a typo in a
+// hand-edited config drops the rule instead of muting the wrong watches.
+func snoozePersona(raw string) (persona string, ok bool) {
+	switch p := strings.ToLower(strings.TrimSpace(raw)); p {
+	case "", scheduler.SnoozePersonaBoth:
+		return scheduler.SnoozePersonaBoth, true
+	case registry.PersonaAuthor, registry.PersonaReviewer:
+		return p, true
+	}
+	return "", false
 }
 
 // trimmedPatterns trims each pattern and drops the blank ones.

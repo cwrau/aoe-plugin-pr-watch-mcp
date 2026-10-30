@@ -314,16 +314,22 @@ plugin's, without its platform prefix, since this plugin also watches GitLab.
 ## Snoozing
 
 Configure **Snooze rules** in the plugin's AoE settings (TUI or web). Each
-rule has a list of URL patterns (and optional exclude patterns) and a gate
-command. While the gate exits non-zero, every watched PR/MR matching one of
-the rule's patterns, and none of its exclude patterns, is snoozed:
-the worker skips the provider call entirely, so nothing is polled and nothing
+rule has a list of URL patterns (and optional exclude patterns), which
+personas it applies to, and a gate command. While the gate exits non-zero,
+every watched PR/MR of those personas matching one of the rule's patterns, and
+none of its exclude patterns, is snoozed: the worker skips the provider call entirely, so nothing is polled and nothing
 is notified. When the gate exits 0 again, the next check reports everything
 that happened in between in one go.
 
 - **Patterns** match the PR/MR URL without scheme, case-insensitively. `*`
   matches any characters including `/`, `?` exactly one. For example
   `gitlab.example.com/*` or `github.com/my-org/*`.
+- **Applies to** picks the persona: `both` (the default), `author` (PRs/MRs
+  you watch as their author) or `reviewer` (ones you review, see
+  [Personas](#personas)). A rule that is not set, such as one saved before
+  this setting existed, covers both. A reviewer-only rule leaves your own PRs
+  alone, so a usage-limit gate can hold reviews back while your PRs keep
+  flowing. A value that is none of the three drops the rule.
 - **Gate** runs through `sh -c`, once per scheduler tick per distinct command.
   Exit 0 is open, anything else closed. For example
   `systemctl --user is-active --quiet work.target`. A gate that cannot run at

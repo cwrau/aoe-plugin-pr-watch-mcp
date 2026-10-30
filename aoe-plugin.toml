@@ -155,7 +155,7 @@ id = "provider"
 [[settings]]
 key = "snooze"
 label = "Snooze rules"
-description = "Mute watched PRs/MRs while a gate command reports closed (exits non-zero). Every rule that applies to a PR/MR (a URL pattern matches and no exclude pattern does) counts, so it is only checked while all of its applying gates are open; PRs/MRs no rule applies to are never snoozed."
+description = "Mute watched PRs/MRs while a gate command reports closed (exits non-zero). Every rule that applies to a PR/MR (its persona is covered, a URL pattern matches and no exclude pattern does) counts, so it is only checked while all of its applying gates are open; PRs/MRs no rule applies to are never snoozed."
 type = "object_list"
 min_items = 0
 max_items = 20
@@ -172,6 +172,14 @@ key = "exclude"
 label = "Exclude patterns"
 description = "Optional. URLs matching any of these ignore this rule entirely (its gate is not run for them), even if a URL pattern matches. Same glob rules as the URL patterns. Example: github.com/my-org/*, so a catch-all rule leaves work PRs alone."
 type = "string_list"
+
+[[settings.fields]]
+key = "persona"
+label = "Applies to"
+description = "Which watches this rule holds back: both (the default, and what rules saved before this setting did), author (PRs/MRs you wrote and watch) or reviewer (ones you review). Example: a usage-limit rule for reviewer only keeps your own PRs flowing."
+type = "select"
+options = ["both", "author", "reviewer"]
+default = "both"
 
 [[settings.fields]]
 key = "gate"

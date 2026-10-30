@@ -409,7 +409,7 @@ func TestSnoozeRuleAppliesOnlyWhenMatchedAndNotExcluded(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.rule.applies(tt.url); got != tt.want {
+			if got := tt.rule.applies(registry.Registration{PRURL: tt.url}); got != tt.want {
 				t.Errorf("%+v.applies(%q) = %v, want %v", tt.rule, tt.url, got, tt.want)
 			}
 		})
@@ -491,5 +491,88 @@ func TestTickRunsNoGateWhenEveryMatchingRuleExcludesTheURL(t *testing.T) {
 	}
 	if gh.calls != 1 {
 		t.Errorf("GitHub checker calls = %d, want 1", gh.calls)
+	}
+}
+
+func TestSnoozeRuleAppliesOnlyToItsPersona(t *testing.T) {
+	url := "https://github.com/work/repo/pull/1"
+	tests := []struct {
+		name    string
+		persona string // the rule's
+		reg     string // the registration's
+		want    bool
+	}{
+		{"no persona set hits an author watch", "", "", true},
+		{"no persona set hits a reviewer watch", "", registry.PersonaReviewer, true},
+		{"both hits an author watch", SnoozePersonaBoth, "", true},
+		{"both hits a reviewer watch", SnoozePersonaBoth, registry.PersonaReviewer, true},
+		{"author-only hits an author watch", registry.PersonaAuthor, registry.PersonaAuthor, true},
+		{"author-only hits an author watch stored without a persona", registry.PersonaAuthor, "", true},
+		{"author-only leaves a reviewer watch", registry.PersonaAuthor, registry.PersonaReviewer, false},
+		{"reviewer-only hits a reviewer watch", registry.PersonaReviewer, registry.PersonaReviewer, true},
+		{"reviewer-only leaves an author watch", registry.PersonaReviewer, registry.PersonaAuthor, false},
+		{"reviewer-only leaves an author watch stored without a persona", registry.PersonaReviewer, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rule := SnoozeRule{Match: []string{"*"}, Persona: tt.persona}
+			if got := rule.applies(registry.Registration{PRURL: url, Persona: tt.reg}); got != tt.want {
+				t.Errorf("%+v.applies(persona %q) = %v, want %v", rule, tt.reg, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSnoozeRulePersonaStillNeedsAMatchAndNoExclude(t *testing.T) {
+	rev := registry.Registration{PRURL: "https://github.com/work/repo/pull/1", Persona: registry.PersonaReviewer}
+	if (SnoozeRule{Match: []string{"gitlab.example.com/*"}, Persona: registry.PersonaReviewer}).applies(rev) {
+		t.Error("a reviewer rule applied to a URL its patterns do not match")
+	}
+	if (SnoozeRule{Match: []string{"*"}, Exclude: []string{"github.com/work/*"}, Persona: registry.PersonaReviewer}).applies(rev) {
+		t.Error("a reviewer rule applied to a URL it excludes")
+	}
+}
+
+// A usage-limit rule that only holds reviewer watches back: an author's own PR
+// keeps flowing while the gate is closed, a reviewer's is snoozed.
+func TestTickSnoozesOnlyThePersonaTheRuleNames(t *testing.T) {
+	cases := []struct {
+		name      string
+		persona   string
+		wantCalls int
+	}{
+		{"author watch is not held by a reviewer-only rule", "", 1},
+		{"reviewer watch is held by a reviewer-only rule", registry.PersonaReviewer, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openTestStore(t)
+			now := time.Now()
+			if err := store.Add(ctx, registry.Registration{
+				PRURL: "https://github.com/o/r/pull/1", SessionID: "sess", Provider: "github", CIBucket: "pending",
+				NextDueAt: now.Add(-time.Minute), CreatedAt: now, Persona: c.persona,
+			}); err != nil {
+				t.Fatalf("Add() error = %v", err)
+			}
+			gh := &fakeGitHubChecker{result: provider.CheckResult{State: "open", CIBucket: "pending"}}
+			gate := &gateCalls{answers: map[string]bool{"usage": false}}
+			sched := &Scheduler{
+				Store: store, GitHub: gh, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{},
+				Snooze: func() []SnoozeRule {
+					return []SnoozeRule{{Match: []string{"*"}, Persona: registry.PersonaReviewer, Gate: "usage"}}
+				},
+				RunGate: gate.run,
+			}
+			if err := sched.Tick(ctx); err != nil {
+				t.Fatalf("Tick() error = %v", err)
+			}
+			if gh.calls != c.wantCalls {
+				t.Errorf("GitHub checker calls = %d, want %d", gh.calls, c.wantCalls)
+			}
+			if c.wantCalls == 1 && len(gate.calls) != 0 {
+				t.Errorf("gate calls = %v, want none: the rule does not apply to this watch", gate.calls)
+			}
+		})
 	}
 }

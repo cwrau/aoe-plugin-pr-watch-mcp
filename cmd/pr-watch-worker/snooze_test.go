@@ -240,3 +240,32 @@ func TestParseSnoozeRulesExclude(t *testing.T) {
 		}
 	}
 }
+
+func TestParseSnoozeRulesPersona(t *testing.T) {
+	raw := json.RawMessage(`{
+		"value": [
+			{"match": ["*"], "gate": "none-set"},
+			{"match": ["*"], "persona": "", "gate": "empty"},
+			{"match": ["*"], "persona": "both", "gate": "both"},
+			{"match": ["*"], "persona": "author", "gate": "author"},
+			{"match": ["*"], "persona": " Reviewer ", "gate": "reviewer"},
+			{"match": ["*"], "persona": "someone", "gate": "unknown"}
+		]
+	}`)
+	got, err := parseSnoozeRules(raw)
+	if err != nil {
+		t.Fatalf("parseSnoozeRules() error = %v", err)
+	}
+	want := map[string]string{
+		"none-set": scheduler.SnoozePersonaBoth, "empty": scheduler.SnoozePersonaBoth, "both": scheduler.SnoozePersonaBoth,
+		"author": "author", "reviewer": "reviewer",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("parseSnoozeRules() = %+v, want %d rules (an unknown persona drops the rule rather than guess whom it hits)", got, len(want))
+	}
+	for _, r := range got {
+		if r.Persona != want[r.Gate] {
+			t.Errorf("rule %q persona = %q, want %q", r.Gate, r.Persona, want[r.Gate])
+		}
+	}
+}
