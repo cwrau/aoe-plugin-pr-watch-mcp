@@ -166,6 +166,14 @@ type gitlabNote struct {
 // wording change would be a user-visible break for GitLab itself too.
 const gitlabApprovedNoteBody = "approved this merge request"
 
+// gitlabRequestedChangesStatus is the MR's detailed_merge_status while a
+// reviewer's "request changes" stands, and gitlabRequestedChangesNoteBody the
+// system note that records who made it.
+const (
+	gitlabRequestedChangesStatus   = "requested_changes"
+	gitlabRequestedChangesNoteBody = "requested changes"
+)
+
 type gitlabJobsResponse []struct {
 	Name   string `json:"name"`
 	WebURL string `json:"web_url"`
@@ -300,19 +308,36 @@ func (c *GitLabChecker) Check(ctx context.Context, mrURL string) (CheckResult, R
 		result.SelfReviewState = "APPROVED"
 	}
 
-	if result.ReviewCount > 0 {
+	// GitLab's "request changes" shows only as the MR's detailed merge status
+	// (it blocks merging even next to approvals), so it outranks them.
+	changesRequested := mrData.DetailedMergeStatus == gitlabRequestedChangesStatus
+	if changesRequested {
+		result.LatestReviewState = "CHANGES_REQUESTED"
+	}
+	if result.ReviewCount > 0 || changesRequested {
 		var notes []gitlabNote
 		if _, _, err := c.getJSON(ctx, token, fmt.Sprintf("%s/api/v4/projects/%s/merge_requests/%d/notes?sort=desc&order_by=created_at&per_page=20", base, encodedPath, iid), &notes); err != nil {
 			return CheckResult{}, RateBudget{}, err
 		}
 		for _, n := range notes {
-			if n.System && strings.Contains(n.Body, gitlabApprovedNoteBody) {
-				result.LatestReviewer = n.Author.Username
-				result.LatestReviewState = approvals.reviewState()
-				result.LatestReviewAt = parseRFC3339OrZero(n.CreatedAt)
-				result.ReviewHref = fmt.Sprintf("%s#note_%d", mrURL, n.ID)
-				break
+			if !n.System {
+				continue
 			}
+			state := ""
+			switch {
+			case changesRequested && strings.TrimSpace(n.Body) == gitlabRequestedChangesNoteBody:
+				state = "CHANGES_REQUESTED"
+			case !changesRequested && strings.Contains(n.Body, gitlabApprovedNoteBody):
+				state = approvals.reviewState()
+			}
+			if state == "" {
+				continue
+			}
+			result.LatestReviewer = n.Author.Username
+			result.LatestReviewState = state
+			result.LatestReviewAt = parseRFC3339OrZero(n.CreatedAt)
+			result.ReviewHref = fmt.Sprintf("%s#note_%d", mrURL, n.ID)
+			break
 		}
 	}
 

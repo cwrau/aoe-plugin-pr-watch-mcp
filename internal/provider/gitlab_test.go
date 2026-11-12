@@ -180,6 +180,69 @@ func TestGitLabCheckerBlockedFromDetailedMergeStatus(t *testing.T) {
 	}
 }
 
+// GitLab's "request changes" is neither an approval nor a note-borne review: it
+// only shows as detailed_merge_status "requested_changes", plus a system note
+// "requested changes" naming who did it.
+func TestGitLabCheckerRequestedChanges(t *testing.T) {
+	tests := []struct {
+		name         string
+		status       string
+		approvedBy   int
+		wantState    string
+		wantReviewer string
+	}{
+		{name: "requested changes, no approvals", status: "requested_changes", wantState: "CHANGES_REQUESTED", wantReviewer: "st"},
+		{name: "requested changes outranks an approval", status: "requested_changes", approvedBy: 1, wantState: "CHANGES_REQUESTED", wantReviewer: "st"},
+		{name: "approval alone stays approval", status: "mergeable", approvedBy: 1, wantState: "APPROVED", wantReviewer: "mw"},
+		{name: "no review", status: "mergeable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			setRateHeaders := func(w http.ResponseWriter) {
+				w.Header().Set("RateLimit-Limit", "2000")
+				w.Header().Set("RateLimit-Remaining", "1999")
+				w.Header().Set("RateLimit-Reset", "9999999999")
+			}
+			mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17", func(w http.ResponseWriter, r *http.Request) {
+				setRateHeaders(w)
+				_ = json.NewEncoder(w).Encode(map[string]any{"state": "opened", "detailed_merge_status": tt.status, "pipeline": nil, "head_pipeline": nil})
+			})
+			mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/approvals", func(w http.ResponseWriter, r *http.Request) {
+				setRateHeaders(w)
+				_ = json.NewEncoder(w).Encode(map[string]any{"approved_by": make([]map[string]any, tt.approvedBy), "approved": true})
+			})
+			mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/notes", func(w http.ResponseWriter, r *http.Request) {
+				setRateHeaders(w)
+				// Newest first, as requested.
+				_ = json.NewEncoder(w).Encode([]map[string]any{
+					{"id": 3, "system": false, "body": "looks odd", "created_at": "2026-05-29T10:00:00Z", "author": map[string]any{"username": "other"}},
+					{"id": 2, "system": true, "body": "requested changes", "created_at": "2026-05-29T09:47:06Z", "author": map[string]any{"username": "st"}},
+					{"id": 1, "system": true, "body": "approved this merge request", "created_at": "2026-05-29T08:00:00Z", "author": map[string]any{"username": "mw"}},
+				})
+			})
+			mux.HandleFunc("/api/v4/projects/team%2Fproject/merge_requests/17/discussions", func(w http.ResponseWriter, r *http.Request) {
+				setRateHeaders(w)
+				_ = json.NewEncoder(w).Encode([]map[string]any{})
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			c := &GitLabChecker{HTTPClient: srv.Client(), TokenFunc: func(context.Context, string) (string, error) { return "test-token", nil }, apiBaseOverride: srv.URL}
+			result, _, err := c.Check(t.Context(), "https://gitlab.corp.example/team/project/-/merge_requests/17")
+			if err != nil {
+				t.Fatalf("Check() error = %v", err)
+			}
+			if result.LatestReviewState != tt.wantState {
+				t.Errorf("LatestReviewState = %q, want %q", result.LatestReviewState, tt.wantState)
+			}
+			if result.LatestReviewer != tt.wantReviewer {
+				t.Errorf("LatestReviewer = %q, want %q", result.LatestReviewer, tt.wantReviewer)
+			}
+		})
+	}
+}
+
 func TestGitLabCheckerNotBlockedOnOtherDetailedMergeStatus(t *testing.T) {
 	srv := fakeGitLabServer(t, "opened", "success", 0, 0)
 	defer srv.Close()
