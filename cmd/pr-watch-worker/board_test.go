@@ -503,6 +503,26 @@ func TestBoardPayloadEncodesEmptyColumnsAsEmptyLists(t *testing.T) {
 	}
 }
 
+// The sandboxed page cannot open links, so each card carries a button that
+// copies the PR URL. A button inside the card's own button is invalid HTML (the
+// click would land on the wrong one), so the card is a container holding
+// separate open and copy buttons.
+func TestBoardPageCardHasACopyLinkButtonNotNestedInAButton(t *testing.T) {
+	page, err := os.ReadFile("../../pages/board.html")
+	if err != nil {
+		t.Fatalf("read the page: %v", err)
+	}
+	for _, want := range []string{`card.url`, `className = "copy"`, `execCommand("copy")`} {
+		if !bytes.Contains(page, []byte(want)) {
+			t.Errorf("page lacks %q: no copy-link button on the cards", want)
+		}
+	}
+	if bytes.Contains(page, []byte(`createElement("button");
+  node.className = "card"`)) {
+		t.Error("card is itself a button, so a copy button inside it would be nested")
+	}
+}
+
 // The card's own display rule outranks a ".hidden" class, so a filter that
 // hides cards by class shows everything. The page must leave non-matching
 // cards out instead.

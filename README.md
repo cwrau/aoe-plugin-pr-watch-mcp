@@ -275,8 +275,8 @@ verdict, so a commented-only MR stays under *To review*).
 The tab opens on the first one with anything open until you pick one.
 Each card shows the PR/MR, its title, status chips and the session that
 watches it. Clicking a card opens that session: the dashboard sandboxes pages
-and they cannot open links, so the PR/MR reference is shown as selectable
-text. The page filters by text, refreshes every 10 seconds, and is read-only.
+and they cannot open links, so each card has a "Copy link" button (shown on
+hover or focus) that copies the PR/MR URL for pasting. The page filters by text, refreshes every 10 seconds, and is read-only.
 The host caps a page's state at 64 KiB, so the oldest finished cards are left
 out when there are very many; the header says how many.
 
