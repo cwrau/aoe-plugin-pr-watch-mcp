@@ -63,9 +63,10 @@ type BitbucketChecker struct {
 
 	// authMu guards the Authorization header that last worked, with the token
 	// it was built for: a changed token starts the search over.
-	authMu     sync.Mutex
-	authToken  string
-	authWorked string
+	authMu          sync.Mutex
+	authToken       string
+	authWorked      string
+	authWorkedLabel string
 
 	selfMu   sync.Mutex
 	selfName string
@@ -101,7 +102,7 @@ func basicHeader(user, token string) string {
 //
 // Each attempt is built on demand, and an empty header means "nothing to try":
 // the git email is only looked up once Bearer has actually been rejected.
-func (c *BitbucketChecker) authAttempts(ctx context.Context) (attempts []func() string, token string) {
+func (c *BitbucketChecker) authAttempts(ctx context.Context) (attempts []authAttempt, token string) {
 	if c.Credentials == nil {
 		return nil, ""
 	}
@@ -109,38 +110,60 @@ func (c *BitbucketChecker) authAttempts(ctx context.Context) (attempts []func() 
 	if token == "" {
 		return nil, ""
 	}
-	fixed := func(h string) func() string { return func() string { return h } }
+	fixed := func(label, h string) authAttempt {
+		return authAttempt{label: label, header: func() string { return h }}
+	}
 	if email != "" {
-		return []func() string{fixed(basicHeader(email, token))}, token
+		return []authAttempt{fixed("Basic (email setting)", basicHeader(email, token))}, token
 	}
 	c.authMu.Lock()
-	worked := ""
-	if c.authToken == token {
-		worked = c.authWorked
+	var worked authAttempt
+	if c.authToken == token && c.authWorked != "" {
+		worked = fixed(c.authWorkedLabel, c.authWorked)
 	}
 	c.authMu.Unlock()
-	if worked != "" {
-		return []func() string{fixed(worked)}, token
+	if worked.header != nil {
+		return []authAttempt{worked}, token
 	}
-	attempts = []func() string{fixed("Bearer " + token)}
+	attempts = []authAttempt{fixed("Bearer", "Bearer "+token)}
 	if c.GitEmail != nil {
-		attempts = append(attempts, func() string {
+		attempts = append(attempts, authAttempt{label: "Basic (git email)", header: func() string {
 			if git := c.GitEmail(ctx); git != "" {
 				return basicHeader(git, token)
 			}
 			return ""
-		})
+		}})
 	}
 	return attempts, token
 }
 
+// authAttempt is one Authorization scheme to try. header builds it on demand
+// and returns "" when there is nothing to try.
+type authAttempt struct {
+	label  string
+	header func() string
+}
+
 // rememberAuth records the header that worked for token. A cached header that
 // then fails is dropped so the next request searches again.
-func (c *BitbucketChecker) rememberAuth(token, header string) {
+func (c *BitbucketChecker) rememberAuth(token, label, header string) {
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
-	c.authToken, c.authWorked = token, header
+	c.authToken, c.authWorkedLabel, c.authWorked = token, label, header
 }
+
+// bitbucketAuthError reports every scheme that was refused, so the one that
+// matters (usually the first) is not hidden behind the last fallback's answer.
+type bitbucketAuthError struct {
+	refusals []string
+	last     error
+}
+
+func (e *bitbucketAuthError) Error() string {
+	return "every authorization scheme was refused: " + strings.Join(e.refusals, "; ")
+}
+
+func (e *bitbucketAuthError) Unwrap() error { return e.last }
 
 type bitbucketAccount struct {
 	Nickname    string `json:"nickname"`
@@ -472,25 +495,26 @@ func (c *BitbucketChecker) getJSON(ctx context.Context, endpoint string, out any
 	if len(attempts) == 0 {
 		return errors.New("no bitbucket token configured (set it in the plugin's settings)")
 	}
-	var lastErr error
-	for _, build := range attempts {
-		header := build()
+	refused := &bitbucketAuthError{}
+	for _, attempt := range attempts {
+		header := attempt.header()
 		if header == "" {
 			continue
 		}
 		err := c.getJSONWith(ctx, header, endpoint, out)
 		if err == nil {
-			c.rememberAuth(token, header)
+			c.rememberAuth(token, attempt.label, header)
 			return nil
 		}
-		lastErr = err
 		if !isUnauthorized(err) {
 			return err
 		}
+		refused.refusals = append(refused.refusals, attempt.label+": "+err.Error())
+		refused.last = err
 	}
 	// Every header was rejected: a remembered one must not stick.
-	c.rememberAuth(token, "")
-	return lastErr
+	c.rememberAuth(token, "", "")
+	return refused
 }
 
 func (c *BitbucketChecker) getJSONWith(ctx context.Context, auth, endpoint string, out any) error {

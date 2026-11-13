@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"regexp"
 	"strings"
@@ -43,6 +47,25 @@ func TestManifestDeclaresTheBitbucketSettings(t *testing.T) {
 		if !re.Match(manifest) {
 			t.Errorf("manifest declares no string setting %q", key)
 		}
+	}
+}
+
+// The log says which token the worker holds without revealing it, so a token
+// that "works in curl" can be compared with the one the worker really loaded.
+func TestBitbucketCredentialsLogAFingerprintNotTheToken(t *testing.T) {
+	h := newReplyingHost(`{"value": "s3cret-token"}`)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	(&bitbucketCredentials{}).refresh(context.Background(), h.rpc, logger)
+
+	sum := sha256.Sum256([]byte("s3cret-token"))
+	want := "token_fingerprint=" + hex.EncodeToString(sum[:])[:8]
+	out := buf.String()
+	if !strings.Contains(out, want) {
+		t.Errorf("log = %q, want %q", out, want)
+	}
+	if strings.Contains(out, "s3cret-token") {
+		t.Errorf("log = %q leaks the token", out)
 	}
 }
 

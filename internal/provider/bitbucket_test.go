@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -471,6 +472,27 @@ func TestBitbucketAuthFallbackNeedsAGitEmail(t *testing.T) {
 	}
 	if want := []string{"Bearer tok"}; !slices.Equal(a.seen, want) {
 		t.Errorf("headers = %v, want only %v", a.seen, want)
+	}
+}
+
+// When every scheme is refused the error names each one: reporting only the
+// last (the Basic fallback) hid that Bearer was refused first, and why.
+func TestBitbucketAuthErrorNamesEveryRefusedScheme(t *testing.T) {
+	a := &bbAuthServer{accepted: map[string]bool{}}
+	c := authChecker(a.start(t), "", "tok", "git@example.com", nil)
+	var v struct{}
+	err := c.getJSON(t.Context(), c.base()+"/anything", &v)
+	if err == nil {
+		t.Fatal("getJSON() error = nil, want the refusal")
+	}
+	msg := err.Error()
+	for _, want := range []string{"Bearer", "Basic (git email)"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error = %q, want it to name %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "tok") && strings.Contains(msg, "Bearer tok") {
+		t.Errorf("error = %q leaks the token", msg)
 	}
 }
 

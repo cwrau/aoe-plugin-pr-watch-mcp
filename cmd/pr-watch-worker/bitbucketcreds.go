@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -48,9 +50,20 @@ func (b *bitbucketCredentials) refresh(ctx context.Context, rpc *hostRPC, logger
 	b.email, b.token, b.loaded = email, token, true
 	b.mu.Unlock()
 	if changed {
-		// Never the values themselves.
-		logger.Info("bitbucket credentials loaded", "token_set", token != "", "email_set", email != "")
+		// Never the values themselves: a short hash tells which token this is.
+		logger.Info("bitbucket credentials loaded", "token_set", token != "", "token_fingerprint", tokenFingerprint(token), "email_set", email != "")
 	}
+}
+
+// tokenFingerprint is the first 8 hex digits of the token's SHA-256: enough to
+// tell two tokens apart in a log, nothing that helps recover one. Empty for no
+// token.
+func tokenFingerprint(token string) string {
+	if token == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])[:8]
 }
 
 func readStringSetting(ctx context.Context, rpc *hostRPC, logger *slog.Logger, key string) (string, bool) {
