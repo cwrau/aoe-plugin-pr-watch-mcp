@@ -253,5 +253,11 @@ func liveRepos(s Summary) []WorkspaceRepo {
 	if s.Worktree != nil && s.ProjectPath != "" && !seen[s.ProjectPath] {
 		repos = append(repos, WorkspaceRepo{SourcePath: s.ProjectPath, Branch: s.Worktree.Branch})
 	}
+	// A session started in an ordinary checkout has neither: the project path
+	// is the only thing the host reports. The branch is left empty, as
+	// discovery reads it from git anyway.
+	if len(repos) == 0 && s.ProjectPath != "" {
+		repos = append(repos, WorkspaceRepo{SourcePath: s.ProjectPath})
+	}
 	return repos
 }

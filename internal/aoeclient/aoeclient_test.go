@@ -122,6 +122,20 @@ func TestWorkspaceReposCoversWorktreeSessionRoot(t *testing.T) {
 	}
 }
 
+// TestWorkspaceReposFallsBackToAPlainCheckoutRoot: a session started straight
+// in an ordinary checkout (no worktree, no workspace) is reported by the host
+// with neither Worktree nor WorkspaceRepos, only its project path.
+func TestWorkspaceReposFallsBackToAPlainCheckoutRoot(t *testing.T) {
+	c, _ := newTestClient(t, Summary{ID: "a", ProjectPath: "/w/proj"})
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	want := []WorkspaceRepo{{SourcePath: "/w/proj"}}
+	if got := c.WorkspaceRepos("a"); !slices.Equal(got, want) {
+		t.Errorf("WorkspaceRepos(a) = %+v, want the project root", got)
+	}
+}
+
 func TestWorkspaceReposCombinesWorktreeAndWorkspaceRepos(t *testing.T) {
 	c, _ := newTestClient(t, Summary{
 		ID:             "a",
