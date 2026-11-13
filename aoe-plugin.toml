@@ -154,13 +154,13 @@ id = "provider"
 [[settings]]
 key = "bitbucket_token"
 label = "Bitbucket token"
-description = "Token for Bitbucket Cloud (bitbucket.org). Either an Atlassian API token (also set the email below) or a workspace/repository access token (leave the email empty). Needs read access to pull requests and repositories. Empty means Bitbucket PRs are not watched. Stored as plain text."
+description = "Token for Bitbucket Cloud (bitbucket.org): a workspace/repository access token, or an Atlassian API token. Needs read access to pull requests and repositories. Empty means Bitbucket PRs are not watched. Stored as plain text."
 type = "string"
 
 [[settings]]
 key = "bitbucket_email"
 label = "Bitbucket account email"
-description = "Atlassian account email, only for an Atlassian API token (sent as HTTP Basic with the token). Leave empty for a workspace or repository access token, which is sent as a Bearer token."
+description = "Optional. Atlassian account email for an Atlassian API token (sent as HTTP Basic with the token). Leave empty and the token is tried as an access token (Bearer) first, then as an API token with your git email (git config user.email) if Bitbucket refuses it. Set it when your git email is not your Atlassian account email."
 type = "string"
 
 # Snooze rules: while a rule's gate command exits non-zero, registrations

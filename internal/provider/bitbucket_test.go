@@ -369,6 +369,124 @@ func TestBitbucketCheckerDiscoverBranchPR(t *testing.T) {
 	}
 }
 
+// bbAuthServer answers 401 unless the Authorization header is one of accepted,
+// and records every header it saw.
+type bbAuthServer struct {
+	accepted map[string]bool
+	seen     []string
+}
+
+func (a *bbAuthServer) start(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := r.Header.Get("Authorization")
+		a.seen = append(a.seen, h)
+		if !a.accepted[h] {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"nickname": "me", "uuid": "{me}"})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+const (
+	basicGitEmail = "Basic Z2l0QGV4YW1wbGUuY29tOnRvaw==" // git@example.com:tok
+	basicExplicit = "Basic bWVAZXhhbXBsZS5jb206dG9r"     // me@example.com:tok
+)
+
+func authChecker(srv *httptest.Server, email, token, gitEmail string, gitCalls *int) *BitbucketChecker {
+	return &BitbucketChecker{
+		HTTPClient:      srv.Client(),
+		Credentials:     func() (string, string) { return email, token },
+		apiBaseOverride: srv.URL,
+		GitEmail: func(context.Context) string {
+			if gitCalls != nil {
+				*gitCalls++
+			}
+			return gitEmail
+		},
+	}
+}
+
+func TestBitbucketAuthBearerWorksAndNeverAsksForTheGitEmail(t *testing.T) {
+	a := &bbAuthServer{accepted: map[string]bool{"Bearer tok": true}}
+	gitCalls := 0
+	c := authChecker(a.start(t), "", "tok", "git@example.com", &gitCalls)
+	if _, err := c.SelfAccount(t.Context()); err != nil {
+		t.Fatalf("SelfAccount() error = %v", err)
+	}
+	if gitCalls != 0 {
+		t.Errorf("git email asked for %d times, want 0 when Bearer is accepted", gitCalls)
+	}
+}
+
+func TestBitbucketAuthFallsBackToBasicWithTheGitEmailAndRemembersIt(t *testing.T) {
+	a := &bbAuthServer{accepted: map[string]bool{basicGitEmail: true}}
+	c := authChecker(a.start(t), "", "tok", "git@example.com", nil)
+
+	if _, err := c.SelfAccount(t.Context()); err != nil {
+		t.Fatalf("SelfAccount() error = %v", err)
+	}
+	if want := []string{"Bearer tok", basicGitEmail}; !slices.Equal(a.seen, want) {
+		t.Fatalf("first call headers = %v, want %v", a.seen, want)
+	}
+
+	a.seen = nil
+	var pr struct{}
+	if err := c.getJSON(t.Context(), c.base()+"/anything", &pr); err != nil {
+		t.Fatalf("second request error = %v", err)
+	}
+	if want := []string{basicGitEmail}; !slices.Equal(a.seen, want) {
+		t.Errorf("later request headers = %v, want %v straight away (the working scheme is remembered)", a.seen, want)
+	}
+}
+
+func TestBitbucketAuthForgetsTheSchemeWhenTheTokenChanges(t *testing.T) {
+	a := &bbAuthServer{accepted: map[string]bool{basicGitEmail: true}}
+	token := "tok"
+	c := authChecker(a.start(t), "", "", "git@example.com", nil)
+	c.Credentials = func() (string, string) { return "", token }
+
+	if _, err := c.SelfAccount(t.Context()); err != nil {
+		t.Fatalf("SelfAccount() error = %v", err)
+	}
+	token = "other"
+	a.seen = nil
+	var v struct{}
+	_ = c.getJSON(t.Context(), c.base()+"/anything", &v)
+	if len(a.seen) == 0 || a.seen[0] != "Bearer other" {
+		t.Errorf("headers after a token change = %v, want to start over with Bearer other", a.seen)
+	}
+}
+
+func TestBitbucketAuthFallbackNeedsAGitEmail(t *testing.T) {
+	a := &bbAuthServer{accepted: map[string]bool{basicGitEmail: true}}
+	c := authChecker(a.start(t), "", "tok", "", nil)
+	var v struct{}
+	err := c.getJSON(t.Context(), c.base()+"/anything", &v)
+	if err == nil {
+		t.Fatal("getJSON() error = nil, want the 401 when there is no git email to fall back to")
+	}
+	if want := []string{"Bearer tok"}; !slices.Equal(a.seen, want) {
+		t.Errorf("headers = %v, want only %v", a.seen, want)
+	}
+}
+
+func TestBitbucketAuthExplicitEmailIsBasicOnlyWithNoFallback(t *testing.T) {
+	a := &bbAuthServer{accepted: map[string]bool{}}
+	gitCalls := 0
+	c := authChecker(a.start(t), "me@example.com", "tok", "git@example.com", &gitCalls)
+	var v struct{}
+	if err := c.getJSON(t.Context(), c.base()+"/anything", &v); err == nil {
+		t.Fatal("getJSON() error = nil, want the 401")
+	}
+	if want := []string{basicExplicit}; !slices.Equal(a.seen, want) || gitCalls != 0 {
+		t.Errorf("headers = %v, git calls = %d; want only %v and no git email lookup", a.seen, gitCalls, want)
+	}
+}
+
 func TestBitbucketCheckerDiscoverWithoutATokenFindsNothing(t *testing.T) {
 	c := &BitbucketChecker{HTTPClient: http.DefaultClient, Credentials: func() (string, string) { return "", "" }}
 	if _, found, _, err := c.DiscoverBranchPR(t.Context(), "acme", "widgets", "main"); found || err != nil {

@@ -45,10 +45,15 @@ shown as `workspace/repo#n`) are watched like the others: auto-discovery from
 the checkout's remote, `register`, reviews, CI, conflicts, comments and merges.
 Set the token in the plugin's settings:
 
-- **Bitbucket token** with **Bitbucket account email** for an Atlassian API
-  token (sent as HTTP Basic), or the token alone for a workspace or repository
-  access token (sent as Bearer). It needs read access to pull requests and
-  repositories. Without a token, Bitbucket watches are skipped.
+- **Bitbucket token**, and optionally **Bitbucket account email**. With an
+  email the token is an Atlassian API token, sent as HTTP Basic. Without one
+  the token is tried as a workspace or repository access token (Bearer) first;
+  if Bitbucket refuses that, it is tried as an API token with your git email
+  (`git config user.email`, as the worker sees it). The scheme that worked is
+  remembered until the token changes. Set the email yourself when your git
+  email is not your Atlassian account email. The token needs read access to
+  pull requests and repositories. Without a token, Bitbucket watches are
+  skipped.
 - AoE has no masked setting type, so the token is stored in the config and
   shown as plain text.
 - The token is only ever sent to `api.bitbucket.org`.

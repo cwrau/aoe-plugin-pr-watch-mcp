@@ -153,6 +153,17 @@ func main() {
 	bbChecker := &provider.BitbucketChecker{
 		HTTPClient:  httpClient,
 		Credentials: bbCredentials.get,
+		// An Atlassian API token needs its account email; when none is set
+		// the git identity's is tried, only once a Bearer attempt was refused.
+		GitEmail: func(ctx context.Context) string {
+			ctx, cancel := context.WithTimeout(ctx, tokenTimeout)
+			defer cancel()
+			email, err := runToken(ctx, "git", "config", "--get", "user.email")
+			if err != nil {
+				return ""
+			}
+			return email
+		},
 	}
 
 	snooze := &snoozeRules{}

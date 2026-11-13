@@ -54,8 +54,18 @@ type BitbucketChecker struct {
 	// token means Bitbucket is not configured.
 	Credentials func() (email, token string)
 
+	// GitEmail returns the git identity's email, tried as the Basic username
+	// when no email is configured and Bearer is rejected. Optional.
+	GitEmail func(ctx context.Context) string
+
 	// apiBaseOverride replaces bitbucketAPIBase (test-only).
 	apiBaseOverride string
+
+	// authMu guards the Authorization header that last worked, with the token
+	// it was built for: a changed token starts the search over.
+	authMu     sync.Mutex
+	authToken  string
+	authWorked string
 
 	selfMu   sync.Mutex
 	selfName string
@@ -69,19 +79,67 @@ func (c *BitbucketChecker) base() string {
 	return bitbucketAPIBase
 }
 
-// authHeader builds the Authorization header, or "" when no token is set.
-func (c *BitbucketChecker) authHeader() string {
+// hasToken reports whether a token is configured.
+func (c *BitbucketChecker) hasToken() bool {
 	if c.Credentials == nil {
-		return ""
+		return false
+	}
+	_, token := c.Credentials()
+	return token != ""
+}
+
+func basicHeader(user, token string) string {
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+token))
+}
+
+// authAttempts lists the Authorization headers to try, in order. A configured
+// email means an Atlassian API token: Basic with it, nothing else. Without one
+// the token is assumed to be an access token (Bearer); if Bitbucket rejects
+// that, the git email is tried as the Basic username, since an API token
+// accepts that. The header that last worked is tried alone, until the token
+// changes.
+//
+// Each attempt is built on demand, and an empty header means "nothing to try":
+// the git email is only looked up once Bearer has actually been rejected.
+func (c *BitbucketChecker) authAttempts(ctx context.Context) (attempts []func() string, token string) {
+	if c.Credentials == nil {
+		return nil, ""
 	}
 	email, token := c.Credentials()
 	if token == "" {
-		return ""
+		return nil, ""
 	}
+	fixed := func(h string) func() string { return func() string { return h } }
 	if email != "" {
-		return "Basic " + base64.StdEncoding.EncodeToString([]byte(email+":"+token))
+		return []func() string{fixed(basicHeader(email, token))}, token
 	}
-	return "Bearer " + token
+	c.authMu.Lock()
+	worked := ""
+	if c.authToken == token {
+		worked = c.authWorked
+	}
+	c.authMu.Unlock()
+	if worked != "" {
+		return []func() string{fixed(worked)}, token
+	}
+	attempts = []func() string{fixed("Bearer " + token)}
+	if c.GitEmail != nil {
+		attempts = append(attempts, func() string {
+			if git := c.GitEmail(ctx); git != "" {
+				return basicHeader(git, token)
+			}
+			return ""
+		})
+	}
+	return attempts, token
+}
+
+// rememberAuth records the header that worked for token. A cached header that
+// then fails is dropped so the next request searches again.
+func (c *BitbucketChecker) rememberAuth(token, header string) {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	c.authToken, c.authWorked = token, header
 }
 
 type bitbucketAccount struct {
@@ -161,14 +219,13 @@ func (c *BitbucketChecker) Check(ctx context.Context, prURL string) (CheckResult
 	if err != nil {
 		return CheckResult{}, RateBudget{}, err
 	}
-	auth := c.authHeader()
-	if auth == "" {
+	if !c.hasToken() {
 		return CheckResult{}, RateBudget{}, errors.New("no bitbucket token configured (set it in the plugin's settings)")
 	}
 	prBase := fmt.Sprintf("%s/repositories/%s/%s/pullrequests/%d", c.base(), url.PathEscape(workspace), url.PathEscape(repo), id)
 
 	var pr bitbucketPR
-	if err := c.getJSON(ctx, auth, prBase, &pr); err != nil {
+	if err := c.getJSON(ctx, prBase, &pr); err != nil {
 		return CheckResult{}, RateBudget{}, err
 	}
 	result := CheckResult{
@@ -188,14 +245,14 @@ func (c *BitbucketChecker) Check(ctx context.Context, prURL string) (CheckResult
 		return result, RateBudget{}, nil
 	}
 
-	self, selfUUID, err := c.self(ctx, auth)
+	self, selfUUID, err := c.self(ctx)
 	if err != nil {
 		return CheckResult{}, RateBudget{}, err
 	}
 	c.applyReviews(&result, pr, prURL, self, selfUUID)
 
 	var statuses []bitbucketStatus
-	if err := getBitbucketPages(ctx, c, auth, prBase+"/statuses?pagelen=100", &statuses); err != nil {
+	if err := getBitbucketPages(ctx, c, prBase+"/statuses?pagelen=100", &statuses); err != nil {
 		return CheckResult{}, RateBudget{}, err
 	}
 	result.CIBucket, result.CIDetail, result.CIHref = bitbucketCI(statuses)
@@ -204,7 +261,7 @@ func (c *BitbucketChecker) Check(ctx context.Context, prURL string) (CheckResult
 	// destination: any entry is a conflict. A pull request it cannot resolve
 	// (404) simply has none to report.
 	var conflicts []json.RawMessage
-	if err := getBitbucketPages(ctx, c, auth, prBase+"/conflicts?pagelen=1", &conflicts); err != nil {
+	if err := getBitbucketPages(ctx, c, prBase+"/conflicts?pagelen=1", &conflicts); err != nil {
 		if status, ok := errors.AsType[*httpStatusError](err); !ok || status.Code != http.StatusNotFound {
 			return CheckResult{}, RateBudget{}, err
 		}
@@ -212,7 +269,7 @@ func (c *BitbucketChecker) Check(ctx context.Context, prURL string) (CheckResult
 	result.HasConflict = len(conflicts) > 0
 
 	var comments []bitbucketComment
-	if err := getBitbucketPages(ctx, c, auth, prBase+"/comments?pagelen=100", &comments); err != nil {
+	if err := getBitbucketPages(ctx, c, prBase+"/comments?pagelen=100", &comments); err != nil {
 		return CheckResult{}, RateBudget{}, err
 	}
 	applyBitbucketComments(&result, comments, prURL)
@@ -337,7 +394,7 @@ func applyBitbucketComments(result *CheckResult, comments []bitbucketComment, pr
 }
 
 // self resolves and caches the token's own account.
-func (c *BitbucketChecker) self(ctx context.Context, auth string) (name, uuid string, err error) {
+func (c *BitbucketChecker) self(ctx context.Context) (name, uuid string, err error) {
 	c.selfMu.Lock()
 	name, uuid = c.selfName, c.selfUUID
 	c.selfMu.Unlock()
@@ -345,7 +402,7 @@ func (c *BitbucketChecker) self(ctx context.Context, auth string) (name, uuid st
 		return name, uuid, nil
 	}
 	var me bitbucketAccount
-	if err := c.getJSON(ctx, auth, c.base()+"/user", &me); err != nil {
+	if err := c.getJSON(ctx, c.base()+"/user", &me); err != nil {
 		return "", "", err
 	}
 	c.selfMu.Lock()
@@ -358,11 +415,10 @@ func (c *BitbucketChecker) self(ctx context.Context, auth string) (name, uuid st
 // keep a session from being pinged about its own reviews and comments. Empty
 // with no error when no token is configured.
 func (c *BitbucketChecker) SelfAccount(ctx context.Context) (string, error) {
-	auth := c.authHeader()
-	if auth == "" {
+	if !c.hasToken() {
 		return "", nil
 	}
-	name, _, err := c.self(ctx, auth)
+	name, _, err := c.self(ctx)
 	return name, err
 }
 
@@ -370,8 +426,7 @@ func (c *BitbucketChecker) SelfAccount(ctx context.Context) (string, error) {
 // branch in workspace/repo, for auto-watch. A repository with no such pull
 // request, or no token configured, finds nothing without being an error.
 func (c *BitbucketChecker) DiscoverBranchPR(ctx context.Context, workspace, repo, branch string) (prURL string, found bool, budget RateBudget, err error) {
-	auth := c.authHeader()
-	if auth == "" {
+	if !c.hasToken() {
 		return "", false, RateBudget{}, nil
 	}
 	quoted := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(branch)
@@ -395,7 +450,7 @@ func (c *BitbucketChecker) DiscoverBranchPR(ctx context.Context, workspace, repo
 			} `json:"repository"`
 		} `json:"destination"`
 	}
-	if err := getBitbucketPages(ctx, c, auth, endpoint, &prs); err != nil {
+	if err := getBitbucketPages(ctx, c, endpoint, &prs); err != nil {
 		return "", false, RateBudget{}, err
 	}
 	// The repository's list also holds pull requests from forks that happen to
@@ -409,8 +464,36 @@ func (c *BitbucketChecker) DiscoverBranchPR(ctx context.Context, workspace, repo
 	return "", false, RateBudget{}, nil
 }
 
-// getJSON issues one authenticated GET and decodes the body into out.
-func (c *BitbucketChecker) getJSON(ctx context.Context, auth, endpoint string, out any) error {
+// getJSON issues one authenticated GET and decodes the body into out. A 401
+// moves on to the next Authorization header authAttempts offers; the one that
+// works is remembered, and one that stops working is forgotten.
+func (c *BitbucketChecker) getJSON(ctx context.Context, endpoint string, out any) error {
+	attempts, token := c.authAttempts(ctx)
+	if len(attempts) == 0 {
+		return errors.New("no bitbucket token configured (set it in the plugin's settings)")
+	}
+	var lastErr error
+	for _, build := range attempts {
+		header := build()
+		if header == "" {
+			continue
+		}
+		err := c.getJSONWith(ctx, header, endpoint, out)
+		if err == nil {
+			c.rememberAuth(token, header)
+			return nil
+		}
+		lastErr = err
+		if !isUnauthorized(err) {
+			return err
+		}
+	}
+	// Every header was rejected: a remembered one must not stick.
+	c.rememberAuth(token, "")
+	return lastErr
+}
+
+func (c *BitbucketChecker) getJSONWith(ctx context.Context, auth, endpoint string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return err
@@ -434,13 +517,13 @@ func (c *BitbucketChecker) getJSON(ctx context.Context, auth, endpoint string, o
 // getBitbucketPages reads a paginated list into out (a pointer to a slice),
 // following "next" links, but only ones under the API base: a link pointing
 // anywhere else is not followed with the credential.
-func getBitbucketPages[T any](ctx context.Context, c *BitbucketChecker, auth, endpoint string, out *[]T) error {
+func getBitbucketPages[T any](ctx context.Context, c *BitbucketChecker, endpoint string, out *[]T) error {
 	for range bitbucketMaxPages {
 		var page struct {
 			Values []T    `json:"values"`
 			Next   string `json:"next"`
 		}
-		if err := c.getJSON(ctx, auth, endpoint, &page); err != nil {
+		if err := c.getJSON(ctx, endpoint, &page); err != nil {
 			return err
 		}
 		*out = append(*out, page.Values...)
