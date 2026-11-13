@@ -571,6 +571,45 @@ func TestTickFiresConflictEventOnNewConflict(t *testing.T) {
 	}
 }
 
+// While GitHub recomputes mergeability (UNKNOWN) a standing conflict has not
+// cleared. Reading it as "no conflict" made the next answer, CONFLICTING again,
+// look like a new conflict and ping every time the target branch moved.
+func TestTickUnknownMergeabilityKeepsAStandingConflictAndStaysSilent(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+	reg := registry.Registration{
+		PRURL: "https://github.com/o/r/pull/1", SessionID: "sess1", Provider: "github",
+		NextDueAt: now.Add(-time.Minute), CreatedAt: now, HasConflict: true,
+	}
+	if err := store.Add(ctx, reg); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	gh := &fakeGitHubChecker{result: provider.CheckResult{State: "open", ConflictUnknown: true}}
+	notify := &fakeNotifier{}
+	sched := &Scheduler{Store: store, GitHub: gh, GitLab: &fakeGitLabChecker{}, Sessions: alwaysLiveSessions(), Notify: notify}
+
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if got := getReg(t, store, reg.PRURL, "sess1"); !got.HasConflict {
+		t.Error("HasConflict = false after an UNKNOWN poll, want the standing conflict kept")
+	}
+
+	// The answer arrives: still conflicting, so nothing new to say.
+	gh.result = provider.CheckResult{State: "open", HasConflict: true}
+	kept := getReg(t, store, reg.PRURL, "sess1")
+	if err := store.UpdateState(ctx, kept.PRURL, kept.SessionID, stateUpdateFromReg(kept, now.Add(-time.Second))); err != nil {
+		t.Fatalf("UpdateState() error = %v", err)
+	}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if len(notify.sent) != 0 {
+		t.Errorf("notify.sent = %v, want none: the conflict never cleared", notify.sent)
+	}
+}
+
 // TestTickFilteredOutConflictStillUpdatesBadgeSilently matches the exact
 // scenario reported live: a registration filtered to
 // ["MERGED","CLOSED","MERGE_QUEUE"] must keep persisting HasConflict (so

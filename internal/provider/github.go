@@ -403,8 +403,11 @@ func buildCheckResult(pr githubPullRequestFields) CheckResult {
 		Description: pr.Body,
 		ReviewCount: pr.ReviewCount.TotalCount,
 		HasConflict: pr.Mergeable == "CONFLICTING",
-		HeadSHA:     pr.HeadRefOid,
-		IsDraft:     pr.IsDraft,
+		// UNKNOWN is GitHub still computing mergeability (after any push to the
+		// target branch), not a verdict.
+		ConflictUnknown: pr.Mergeable == "UNKNOWN",
+		HeadSHA:         pr.HeadRefOid,
+		IsDraft:         pr.IsDraft,
 	}
 	for _, n := range pr.ReviewRequests.Nodes {
 		if n.RequestedReviewer.Login != "" {

@@ -519,6 +519,11 @@ func (s *Scheduler) finish(ctx context.Context, reg registry.Registration, resul
 	if s.CommentFilters != nil {
 		result.ApplyCommentFilters(s.CommentFilters())
 	}
+	// No verdict on mergeability yet: the last known one stands, so a standing
+	// conflict neither clears nor, when the answer lands, "appears" again.
+	if result.ConflictUnknown {
+		result.HasConflict = reg.HasConflict
+	}
 	prev := provider.PrevState{
 		ReviewCount:         reg.ReviewCount,
 		CIBucket:            reg.CIBucket,

@@ -58,6 +58,7 @@ type CheckResult struct {
 	LatestCommentAuthor     string            // login/username of the most recent top-level comment's author; empty if none — used for self-authored-event suppression, same as LatestReviewer
 	MergedAt                time.Time         // zero unless State == "merged"
 	HasConflict             bool              // true if the PR/MR can't currently be merged due to a conflict with its target branch
+	ConflictUnknown         bool              // true while the provider has not computed mergeability yet (GitHub "UNKNOWN", after the target branch moved): HasConflict is then no verdict, so the last known value stands
 	MergeQueueState         string            // GitHub merge queue entry state ("QUEUED" | "AWAITING_CHECKS" | "LOCKED" | "MERGEABLE" | "UNMERGEABLE"); empty if not in a merge queue (also always empty for GitLab, which has no merge-queue support here)
 	MergeQueuePosition      int               // this entry's position in the merge queue; meaningless when MergeQueueState == ""
 	MergeQueueRemovalReason string            // GitHub's recorded reason the PR left the merge queue ("merged", "invalidated", ...) when its latest queue event is a removal; empty if it is still queued, was never queued, or the removal is not recorded yet

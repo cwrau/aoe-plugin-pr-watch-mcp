@@ -484,6 +484,27 @@ func TestGitHubCheckerHasConflictFromMergeableState(t *testing.T) {
 	}
 }
 
+// GitHub answers "UNKNOWN" while it recomputes mergeability, which it does
+// after every push to the target branch. That is no verdict either way.
+func TestGitHubCheckerMergeableUnknownIsNotAVerdict(t *testing.T) {
+	body := strings.Replace(graphqlOpenSuccessBody, `"headRefOid": "deadbeef",`, `"headRefOid": "deadbeef", "mergeable": "UNKNOWN",`, 1)
+	srv := fakeGitHubServer(t, body, 0)
+	defer srv.Close()
+
+	c := &GitHubChecker{HTTPClient: srv.Client(), Token: "test-token", BaseURL: srv.URL}
+	url := "https://github.com/o/r/pull/1"
+	results, _, err := c.CheckBatch(t.Context(), []string{url})
+	if err != nil {
+		t.Fatalf("CheckBatch() error = %v", err)
+	}
+	if !results[url].ConflictUnknown {
+		t.Error("CheckBatch() result.ConflictUnknown = false, want true when mergeable is UNKNOWN")
+	}
+	if results[url].HasConflict {
+		t.Error("CheckBatch() result.HasConflict = true, want false when mergeable is UNKNOWN")
+	}
+}
+
 func TestGitHubCheckerNoConflictWhenMergeable(t *testing.T) {
 	srv := fakeGitHubServer(t, graphqlOpenSuccessBody, 0)
 	defer srv.Close()
