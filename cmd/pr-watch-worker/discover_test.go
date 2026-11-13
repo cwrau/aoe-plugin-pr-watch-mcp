@@ -66,6 +66,9 @@ func TestGitRemoteResolverResolvesBitbucketCloud(t *testing.T) {
 		"https://bitbucket.org/acme/widgets.git",
 		"https://someone@bitbucket.org/acme/widgets.git",
 		"ssh://git@bitbucket.org/acme/widgets.git",
+		"ssh://git@ssh.bitbucket.org/acme/widgets.git",
+		"ssh://git@altssh.bitbucket.org:443/acme/widgets.git",
+		"git@ssh.bitbucket.org:acme/widgets.git",
 	} {
 		dir := gitCheckoutWithRemote(t, remote)
 		r := &gitRemoteResolver{glabTokenFunc: func(context.Context, string) (string, error) {

@@ -219,7 +219,7 @@ func (r *gitRemoteResolver) resolveIdentity(ctx context.Context, sourcePath stri
 	}
 	// bitbucket.org is as fixed a host as github.com, so no credential probe
 	// decides it; its repositories are exactly workspace/repo.
-	if strings.EqualFold(host, "bitbucket.org") {
+	if isBitbucketCloudHost(host) {
 		if workspace, repo, ok := strings.Cut(path, "/"); ok && workspace != "" && repo != "" && !strings.Contains(repo, "/") {
 			return remoteIdentity{provider: "bitbucket", remoteKey: workspace + "/" + repo, ok: true}
 		}
@@ -229,6 +229,17 @@ func (r *gitRemoteResolver) resolveIdentity(ctx context.Context, sourcePath stri
 		return remoteIdentity{}
 	}
 	return remoteIdentity{provider: "gitlab", remoteKey: host + "/" + path, ok: true}
+}
+
+// isBitbucketCloudHost reports whether a git remote's host is Bitbucket Cloud:
+// the web host, and the ssh ones its remotes commonly name (ssh.bitbucket.org,
+// and altssh.bitbucket.org for ssh over port 443).
+func isBitbucketCloudHost(host string) bool {
+	switch strings.ToLower(host) {
+	case "bitbucket.org", "www.bitbucket.org", "ssh.bitbucket.org", "altssh.bitbucket.org":
+		return true
+	}
+	return false
 }
 
 // credentialFor reports whether a GitLab credential is configured for host,
