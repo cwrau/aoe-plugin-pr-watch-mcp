@@ -61,6 +61,27 @@ func (s *Store) SetAutoDiscoveryRemotes(ctx context.Context, sessionID, sourcePa
 	return nil
 }
 
+// AutoDiscoveryPathsForRemote returns the distinct checkout paths known for
+// one repository (provider and remote key, e.g. "bitbucket", "workspace/repo"),
+// across all sessions and whether or not a PR was found for them: the places
+// to read that project's own git identity from.
+func (s *Store) AutoDiscoveryPathsForRemote(ctx context.Context, provider, remoteKey string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT source_path FROM auto_discovery WHERE provider = ? AND remote_key = ?`, provider, remoteKey)
+	if err != nil {
+		return nil, fmt.Errorf("query auto-discovery paths: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("scan auto-discovery path: %w", err)
+		}
+		paths = append(paths, p)
+	}
+	return paths, rows.Err()
+}
+
 // MarkAutoDiscoveryResolved records that branch's answer is now known for
 // sessionID/sourcePath (whether or not a PR/MR was actually found), so it's
 // skipped until the branch changes again.

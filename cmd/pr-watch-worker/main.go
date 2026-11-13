@@ -154,15 +154,10 @@ func main() {
 		HTTPClient:  httpClient,
 		Credentials: bbCredentials.get,
 		// An Atlassian API token needs its account email; when none is set
-		// the git identity's is tried, only once a Bearer attempt was refused.
-		GitEmail: func(ctx context.Context) string {
-			ctx, cancel := context.WithTimeout(ctx, tokenTimeout)
-			defer cancel()
-			email, err := runToken(ctx, "git", "config", "--get", "user.email")
-			if err != nil {
-				return ""
-			}
-			return email
+		// the git email of the project in question is tried, only once a
+		// Bearer attempt was refused (see gitEmailFor).
+		GitEmail: func(ctx context.Context, workspace, repo string) string {
+			return gitEmailFor(ctx, store, workspace, repo)
 		},
 	}
 

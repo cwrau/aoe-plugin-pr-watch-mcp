@@ -49,7 +49,9 @@ Set the token in the plugin's settings:
   email the token is an Atlassian API token, sent as HTTP Basic. Without one
   the token is tried as a workspace or repository access token (Bearer) first;
   if Bitbucket refuses that, it is tried as an API token with your git email
-  (`git config user.email`, as the worker sees it). The scheme that worked is
+  (`git config user.email`, read in a checkout of that repository a session
+  has open, so a directory-scoped identity applies; for a repository with no
+  known checkout, the worker's own identity). The scheme that worked is
   remembered until the token changes. Set the email yourself when your git
   email is not your Atlassian account email. The token needs read access to
   pull requests and repositories. Without a token, Bitbucket watches are

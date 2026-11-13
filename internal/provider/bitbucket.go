@@ -54,9 +54,11 @@ type BitbucketChecker struct {
 	// token means Bitbucket is not configured.
 	Credentials func() (email, token string)
 
-	// GitEmail returns the git identity's email, tried as the Basic username
-	// when no email is configured and Bearer is rejected. Optional.
-	GitEmail func(ctx context.Context) string
+	// GitEmail returns the git identity's email for the project that owns
+	// workspace/repo (git identities are per directory), tried as the Basic
+	// username when no email is configured and Bearer is rejected. Both names
+	// are empty for a request that is about no repository. Optional.
+	GitEmail func(ctx context.Context, workspace, repo string) string
 
 	// apiBaseOverride replaces bitbucketAPIBase (test-only).
 	apiBaseOverride string
@@ -127,14 +129,28 @@ func (c *BitbucketChecker) authAttempts(ctx context.Context) (attempts []authAtt
 	}
 	attempts = []authAttempt{fixed("Bearer", "Bearer "+token)}
 	if c.GitEmail != nil {
+		workspace, repo := bitbucketRepoFrom(ctx)
 		attempts = append(attempts, authAttempt{label: "Basic (git email)", header: func() string {
-			if git := c.GitEmail(ctx); git != "" {
+			if git := c.GitEmail(ctx, workspace, repo); git != "" {
 				return basicHeader(git, token)
 			}
 			return ""
 		}})
 	}
 	return attempts, token
+}
+
+type bitbucketRepoKey struct{}
+
+// withBitbucketRepo marks ctx as serving requests about workspace/repo, so the
+// auth fallback can ask for that project's git email.
+func withBitbucketRepo(ctx context.Context, workspace, repo string) context.Context {
+	return context.WithValue(ctx, bitbucketRepoKey{}, [2]string{workspace, repo})
+}
+
+func bitbucketRepoFrom(ctx context.Context) (workspace, repo string) {
+	pair, _ := ctx.Value(bitbucketRepoKey{}).([2]string)
+	return pair[0], pair[1]
 }
 
 // authAttempt is one Authorization scheme to try. header builds it on demand
@@ -245,6 +261,7 @@ func (c *BitbucketChecker) Check(ctx context.Context, prURL string) (CheckResult
 	if !c.hasToken() {
 		return CheckResult{}, RateBudget{}, errors.New("no bitbucket token configured (set it in the plugin's settings)")
 	}
+	ctx = withBitbucketRepo(ctx, workspace, repo)
 	prBase := fmt.Sprintf("%s/repositories/%s/%s/pullrequests/%d", c.base(), url.PathEscape(workspace), url.PathEscape(repo), id)
 
 	var pr bitbucketPR
@@ -452,6 +469,7 @@ func (c *BitbucketChecker) DiscoverBranchPR(ctx context.Context, workspace, repo
 	if !c.hasToken() {
 		return "", false, RateBudget{}, nil
 	}
+	ctx = withBitbucketRepo(ctx, workspace, repo)
 	quoted := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(branch)
 	q := url.Values{"q": {fmt.Sprintf(`source.branch.name="%s" AND state="OPEN"`, quoted)}, "pagelen": {"20"}}
 	endpoint := fmt.Sprintf("%s/repositories/%s/%s/pullrequests?%s", c.base(), url.PathEscape(workspace), url.PathEscape(repo), q.Encode())

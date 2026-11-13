@@ -160,7 +160,7 @@ type = "string"
 [[settings]]
 key = "bitbucket_email"
 label = "Bitbucket account email"
-description = "Optional. Atlassian account email for an Atlassian API token (sent as HTTP Basic with the token). Leave empty and the token is tried as an access token (Bearer) first, then as an API token with your git email (git config user.email) if Bitbucket refuses it. Set it when your git email is not your Atlassian account email."
+description = "Optional. Atlassian account email for an Atlassian API token (sent as HTTP Basic with the token). Leave empty and the token is tried as an access token (Bearer) first, then as an API token with the git email of that project's checkout (git config user.email) if Bitbucket refuses it. Set it when your git email is not your Atlassian account email."
 type = "string"
 
 # Snooze rules: while a rule's gate command exits non-zero, registrations

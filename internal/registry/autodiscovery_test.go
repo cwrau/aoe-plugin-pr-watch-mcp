@@ -30,6 +30,37 @@ func TestUpsertAutoDiscoveryTargetThenUnresolved(t *testing.T) {
 	}
 }
 
+// The checkouts that hold a repository, whichever session they belong to and
+// whether or not a PR was found: the place to read that project's git identity.
+func TestAutoDiscoveryPathsForRemote(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	for _, row := range [][]string{
+		{"sess1", "/ws/app", "bitbucket", "acme/widgets", "feature"},
+		{"sess2", "/other/app", "bitbucket", "acme/widgets", "main"},
+		{"sess2", "/other/app-again", "bitbucket", "acme/widgets", "main"},
+		{"sess1", "/ws/lib", "bitbucket", "acme/other", "feature"},
+		{"sess1", "/ws/gh", "github", "acme/widgets", "feature"},
+	} {
+		if err := s.UpsertAutoDiscoveryTarget(ctx, row[0], row[1], row[2], row[3], row[4]); err != nil {
+			t.Fatalf("UpsertAutoDiscoveryTarget() error = %v", err)
+		}
+	}
+	// A resolved target still names where the repository is checked out.
+	if err := s.MarkAutoDiscoveryResolved(ctx, "sess1", "/ws/app", "feature"); err != nil {
+		t.Fatalf("MarkAutoDiscoveryResolved() error = %v", err)
+	}
+
+	got, err := s.AutoDiscoveryPathsForRemote(ctx, "bitbucket", "acme/widgets")
+	if err != nil {
+		t.Fatalf("AutoDiscoveryPathsForRemote() error = %v", err)
+	}
+	slices.Sort(got)
+	if want := []string{"/other/app", "/other/app-again", "/ws/app"}; !slices.Equal(got, want) {
+		t.Errorf("AutoDiscoveryPathsForRemote() = %v, want %v (this provider and repository only)", got, want)
+	}
+}
+
 func TestMarkAutoDiscoveryResolvedStopsItShowingAsUnresolved(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)

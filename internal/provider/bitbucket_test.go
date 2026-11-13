@@ -402,7 +402,7 @@ func authChecker(srv *httptest.Server, email, token, gitEmail string, gitCalls *
 		HTTPClient:      srv.Client(),
 		Credentials:     func() (string, string) { return email, token },
 		apiBaseOverride: srv.URL,
-		GitEmail: func(context.Context) string {
+		GitEmail: func(_ context.Context, _, _ string) string {
 			if gitCalls != nil {
 				*gitCalls++
 			}
@@ -493,6 +493,38 @@ func TestBitbucketAuthErrorNamesEveryRefusedScheme(t *testing.T) {
 	}
 	if strings.Contains(msg, "tok") && strings.Contains(msg, "Bearer tok") {
 		t.Errorf("error = %q leaks the token", msg)
+	}
+}
+
+// Git identities are per directory, so the fallback email has to come from
+// the project the request is about: the checker names the repository to the
+// callback, for polls and for discovery alike.
+func TestBitbucketAuthAsksForTheGitEmailOfTheRepositoryInQuestion(t *testing.T) {
+	a := &bbAuthServer{accepted: map[string]bool{basicGitEmail: true}}
+	var asked [][2]string
+	c := authChecker(a.start(t), "", "tok", "", nil)
+	c.GitEmail = func(_ context.Context, workspace, repo string) string {
+		asked = append(asked, [2]string{workspace, repo})
+		return "git@example.com"
+	}
+
+	if _, _, _, err := c.DiscoverBranchPR(t.Context(), "acme", "widgets", "feature"); err != nil {
+		t.Fatalf("DiscoverBranchPR() error = %v", err)
+	}
+	if want := [][2]string{{"acme", "widgets"}}; !slices.Equal(asked, want) {
+		t.Errorf("GitEmail asked for %v, want %v", asked, want)
+	}
+
+	// A request that is about no repository (the account lookup) passes none.
+	asked = nil
+	c.authMu.Lock()
+	c.authWorked = "" // forget the scheme learned above
+	c.authMu.Unlock()
+	if _, err := c.SelfAccount(t.Context()); err != nil {
+		t.Fatalf("SelfAccount() error = %v", err)
+	}
+	if want := [][2]string{{"", ""}}; !slices.Equal(asked, want) {
+		t.Errorf("GitEmail asked for %v on the account lookup, want %v", asked, want)
 	}
 }
 
