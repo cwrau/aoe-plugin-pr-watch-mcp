@@ -133,10 +133,10 @@ func (s *Scheduler) syncSessionTargets(ctx context.Context, sessionID string, re
 		// cached branch can't be trusted here.
 		var prov, remoteKey, branch string
 		var ok bool
-		if repo.CheckoutPath != "" && repo.CheckoutPath != repo.SourcePath {
-			prov, remoteKey, branch, ok = s.Remotes.Resolve(ctx, repo.CheckoutPath)
+		if repo.WorktreePath != "" && repo.WorktreePath != repo.SourcePath {
+			prov, remoteKey, branch, ok = s.Remotes.Resolve(ctx, repo.WorktreePath)
 			if ok {
-				path = repo.CheckoutPath
+				path = repo.WorktreePath
 			}
 		}
 		if !ok {

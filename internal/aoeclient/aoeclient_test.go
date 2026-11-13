@@ -86,22 +86,25 @@ func TestWorkspaceReposFromMultiRepoWorkspace(t *testing.T) {
 }
 
 // In a multi-repo workspace the host names each repo's original checkout
-// (SourcePath, usually on its default branch) and the workspace holds a
-// worktree of it under the repo's name: that is where the session's branch is.
-func TestWorkspaceReposNameTheWorkspacesOwnCheckout(t *testing.T) {
-	c, _ := newTestClient(t, Summary{ID: "a", ProjectPath: "/w/ws-1", WorkspaceRepos: []WorkspaceRepo{
-		{Name: "app", SourcePath: "/src/app", Branch: "feature-x"},
-		{SourcePath: "/src/nameless", Branch: "main"},
-	}})
-	if err := c.Refresh(context.Background()); err != nil {
-		t.Fatalf("Refresh() error = %v", err)
+// (source_path, usually on its default branch) and, since AoE 1.22, the
+// workspace's own worktree of it (worktree_path), where the session's branch
+// is. The wire field name is what ties the two together, so it is tested on the
+// host's actual JSON shape.
+func TestSummaryDecodesTheWorkspaceReposWorktreePath(t *testing.T) {
+	raw := `{"id": "a", "workspace_repos": [
+		{"source_path": "/src/app", "branch": "feat/x", "worktree_path": "/ws/app"},
+		{"source_path": "/src/old", "branch": "main"}
+	]}`
+	var s Summary
+	if err := json.Unmarshal([]byte(raw), &s); err != nil {
+		t.Fatalf("unmarshal: %v", err)
 	}
 	want := []WorkspaceRepo{
-		{Name: "app", SourcePath: "/src/app", Branch: "feature-x", CheckoutPath: "/w/ws-1/app"},
-		{SourcePath: "/src/nameless", Branch: "main"},
+		{SourcePath: "/src/app", Branch: "feat/x", WorktreePath: "/ws/app"},
+		{SourcePath: "/src/old", Branch: "main"}, // an older host sends none
 	}
-	if got := c.WorkspaceRepos("a"); !slices.Equal(got, want) {
-		t.Errorf("WorkspaceRepos(a) = %+v, want %+v", got, want)
+	if !slices.Equal(s.WorkspaceRepos, want) {
+		t.Errorf("WorkspaceRepos = %+v, want %+v", s.WorkspaceRepos, want)
 	}
 }
 

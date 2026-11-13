@@ -152,7 +152,7 @@ func TestDiscoverTickUsesTheWorkspacesWorktreeOfAMultiRepoSession(t *testing.T) 
 	store := openTestStore(t)
 
 	workspaces := &fakeWorkspaceSource{workspaces: map[string][]aoeclient.WorkspaceRepo{
-		"sess1": {{Name: "app", SourcePath: "/src/app", CheckoutPath: "/ws/app", Branch: "stale"}},
+		"sess1": {{SourcePath: "/src/app", WorktreePath: "/ws/app", Branch: "stale"}},
 	}}
 	remotes := &fakeRemoteResolver{resolutions: map[string]resolution{
 		"/src/app": {provider: "github", remoteKey: "o/r", branch: "master"},
@@ -179,7 +179,7 @@ func TestDiscoverTickFallsBackToTheSourcePathWhenTheWorktreeDoesNotResolve(t *te
 	store := openTestStore(t)
 
 	workspaces := &fakeWorkspaceSource{workspaces: map[string][]aoeclient.WorkspaceRepo{
-		"sess1": {{Name: "app", SourcePath: "/src/app", CheckoutPath: "/ws/app", Branch: "x"}},
+		"sess1": {{SourcePath: "/src/app", WorktreePath: "/ws/app", Branch: "x"}},
 	}}
 	remotes := &fakeRemoteResolver{resolutions: map[string]resolution{
 		"/src/app": {provider: "github", remoteKey: "o/r", branch: "master"},

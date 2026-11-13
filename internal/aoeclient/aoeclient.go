@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"sync"
 	"time"
 )
@@ -33,15 +32,12 @@ const defaultResyncEvery = 10 * time.Minute
 // scanning directories itself. Branch is as of the last summary the host
 // sent; discovery re-reads the real branch from git anyway.
 type WorkspaceRepo struct {
-	// Name is the repo's directory name inside a multi-repo workspace.
-	Name       string `json:"name"`
 	SourcePath string `json:"source_path"`
 	Branch     string `json:"branch"`
-	// CheckoutPath is the workspace's own worktree of the repo (ProjectPath/Name),
-	// where the session's branch lives; SourcePath is the original checkout,
-	// usually on its default branch. Set by the client, never by the host, and
-	// empty when the repo has no name or the session no root.
-	CheckoutPath string `json:"-"`
+	// WorktreePath is the workspace's own worktree of the repo, where the
+	// session's branch lives; SourcePath is the original checkout, usually on
+	// its default branch. Sent by AoE 1.22 and later, empty from older hosts.
+	WorktreePath string `json:"worktree_path"`
 }
 
 // Worktree is set when the session's own root (ProjectPath) is itself a git
@@ -250,9 +246,6 @@ func liveRepos(s Summary) []WorkspaceRepo {
 			continue
 		}
 		seen[r.SourcePath] = true
-		if r.Name != "" && s.ProjectPath != "" {
-			r.CheckoutPath = filepath.Join(s.ProjectPath, r.Name)
-		}
 		repos = append(repos, r)
 	}
 	// The session's own root is a separate case from WorkspaceRepos: see
