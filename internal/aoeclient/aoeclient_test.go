@@ -85,6 +85,26 @@ func TestWorkspaceReposFromMultiRepoWorkspace(t *testing.T) {
 	}
 }
 
+// In a multi-repo workspace the host names each repo's original checkout
+// (SourcePath, usually on its default branch) and the workspace holds a
+// worktree of it under the repo's name: that is where the session's branch is.
+func TestWorkspaceReposNameTheWorkspacesOwnCheckout(t *testing.T) {
+	c, _ := newTestClient(t, Summary{ID: "a", ProjectPath: "/w/ws-1", WorkspaceRepos: []WorkspaceRepo{
+		{Name: "app", SourcePath: "/src/app", Branch: "feature-x"},
+		{SourcePath: "/src/nameless", Branch: "main"},
+	}})
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	want := []WorkspaceRepo{
+		{Name: "app", SourcePath: "/src/app", Branch: "feature-x", CheckoutPath: "/w/ws-1/app"},
+		{SourcePath: "/src/nameless", Branch: "main"},
+	}
+	if got := c.WorkspaceRepos("a"); !slices.Equal(got, want) {
+		t.Errorf("WorkspaceRepos(a) = %+v, want %+v", got, want)
+	}
+}
+
 // TestWorkspaceReposCoversWorktreeSessionRoot: a plain single-repo worktree
 // session's own root is the worktree itself. Confirmed live that omitting
 // this case made auto-watch discovery find nothing for the common case.

@@ -123,21 +123,36 @@ func (s *Scheduler) DiscoverSessions(ctx context.Context, sessionIDs []string) e
 func (s *Scheduler) syncSessionTargets(ctx context.Context, sessionID string, repos []aoeclient.WorkspaceRepo) {
 	keepPaths := make([]string, 0, len(repos))
 	for _, repo := range repos {
+		// A multi-repo workspace keeps its own worktree of each repo, on the
+		// session's branch, while SourcePath is the original checkout (usually
+		// on its default branch): ask the worktree first, and fall back to the
+		// original when it does not resolve. The chosen path keys the target.
+		path := repo.SourcePath
 		// branch comes from Resolve's own live git read, not repo.Branch —
 		// see RemoteResolver's doc comment for why WorkspaceSource's
 		// cached branch can't be trusted here.
-		prov, remoteKey, branch, ok := s.Remotes.Resolve(ctx, repo.SourcePath)
+		var prov, remoteKey, branch string
+		var ok bool
+		if repo.CheckoutPath != "" && repo.CheckoutPath != repo.SourcePath {
+			prov, remoteKey, branch, ok = s.Remotes.Resolve(ctx, repo.CheckoutPath)
+			if ok {
+				path = repo.CheckoutPath
+			}
+		}
+		if !ok {
+			prov, remoteKey, branch, ok = s.Remotes.Resolve(ctx, repo.SourcePath)
+		}
 		if !ok {
 			continue
 		}
-		keepPaths = append(keepPaths, repo.SourcePath)
-		if err := s.Store.UpsertAutoDiscoveryTarget(ctx, sessionID, repo.SourcePath, prov, remoteKey, branch); err != nil {
-			s.log().Error("upsert auto-discovery target", "session_id", sessionID, "source_path", repo.SourcePath, "error", err)
+		keepPaths = append(keepPaths, path)
+		if err := s.Store.UpsertAutoDiscoveryTarget(ctx, sessionID, path, prov, remoteKey, branch); err != nil {
+			s.log().Error("upsert auto-discovery target", "session_id", sessionID, "source_path", path, "error", err)
 		}
 		if fr, ok := s.Remotes.(ForkRemoteResolver); ok && prov == "github" {
-			extra, owners := fr.ExtraRemotes(ctx, repo.SourcePath)
-			if err := s.Store.SetAutoDiscoveryRemotes(ctx, sessionID, repo.SourcePath, extra, owners); err != nil {
-				s.log().Error("set auto-discovery remotes", "session_id", sessionID, "source_path", repo.SourcePath, "error", err)
+			extra, owners := fr.ExtraRemotes(ctx, path)
+			if err := s.Store.SetAutoDiscoveryRemotes(ctx, sessionID, path, extra, owners); err != nil {
+				s.log().Error("set auto-discovery remotes", "session_id", sessionID, "source_path", path, "error", err)
 			}
 		}
 	}

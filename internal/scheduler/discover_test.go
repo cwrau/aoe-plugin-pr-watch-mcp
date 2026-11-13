@@ -144,6 +144,60 @@ func TestDiscoverTickNeverResurrectsAnUnregisteredPR(t *testing.T) {
 	}
 }
 
+// A multi-repo workspace's repo names its original checkout (on master) and
+// the workspace's worktree of it (on the session's branch). Discovery has to
+// ask about the worktree's branch, or it probes master forever.
+func TestDiscoverTickUsesTheWorkspacesWorktreeOfAMultiRepoSession(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+
+	workspaces := &fakeWorkspaceSource{workspaces: map[string][]aoeclient.WorkspaceRepo{
+		"sess1": {{Name: "app", SourcePath: "/src/app", CheckoutPath: "/ws/app", Branch: "stale"}},
+	}}
+	remotes := &fakeRemoteResolver{resolutions: map[string]resolution{
+		"/src/app": {provider: "github", remoteKey: "o/r", branch: "master"},
+		"/ws/app":  {provider: "github", remoteKey: "o/r", branch: "feature-x"},
+	}}
+	sched := &Scheduler{Store: store, GitHub: &fakeGitHubChecker{}, GitLab: &fakeGitLabChecker{}, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{}, Workspaces: workspaces, Remotes: remotes}
+
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	targets, err := store.UnresolvedAutoDiscoveryForSessions(ctx, []string{"sess1"})
+	if err != nil {
+		t.Fatalf("UnresolvedAutoDiscoveryForSessions() error = %v", err)
+	}
+	if len(targets) != 1 || targets[0].SourcePath != "/ws/app" || targets[0].Branch != "feature-x" {
+		t.Errorf("targets = %+v, want one for the worktree /ws/app on feature-x (not /src/app on master)", targets)
+	}
+}
+
+// A workspace whose worktree is not a resolvable checkout (gone, not a git
+// directory) falls back to the original checkout, as before.
+func TestDiscoverTickFallsBackToTheSourcePathWhenTheWorktreeDoesNotResolve(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+
+	workspaces := &fakeWorkspaceSource{workspaces: map[string][]aoeclient.WorkspaceRepo{
+		"sess1": {{Name: "app", SourcePath: "/src/app", CheckoutPath: "/ws/app", Branch: "x"}},
+	}}
+	remotes := &fakeRemoteResolver{resolutions: map[string]resolution{
+		"/src/app": {provider: "github", remoteKey: "o/r", branch: "master"},
+	}}
+	sched := &Scheduler{Store: store, GitHub: &fakeGitHubChecker{}, GitLab: &fakeGitLabChecker{}, Sessions: alwaysLiveSessions(), Notify: &fakeNotifier{}, Workspaces: workspaces, Remotes: remotes}
+
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	targets, err := store.UnresolvedAutoDiscoveryForSessions(ctx, []string{"sess1"})
+	if err != nil {
+		t.Fatalf("UnresolvedAutoDiscoveryForSessions() error = %v", err)
+	}
+	if len(targets) != 1 || targets[0].SourcePath != "/src/app" {
+		t.Errorf("targets = %+v, want the fallback to /src/app", targets)
+	}
+}
+
 func TestDiscoverTickFindsOpenGitLabMR(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
