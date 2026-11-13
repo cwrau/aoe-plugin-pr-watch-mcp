@@ -18,7 +18,7 @@ import (
 
 type registerInput struct {
 	ReportExisting bool     `json:"report_existing,omitempty" jsonschema:"optional: send a ping for the activity the PR/MR already has (reviews, comments, failing CI, conflict) on the first poll; by default that first poll is only recorded as the baseline and stays silent, and later changes ping as usual"`
-	PRURLs         []string `json:"pr_urls" jsonschema:"one or more GitHub PR or GitLab MR URLs to watch — a single-element list registers just one, same as before"`
+	PRURLs         []string `json:"pr_urls" jsonschema:"one or more GitHub PR, GitLab MR or Bitbucket Cloud PR URLs to watch — a single-element list registers just one, same as before"`
 	SessionID      string   `json:"session_id" jsonschema:"the calling AoE session's id — pass $AOE_ARTIFACT_DIR's raw value directly, its basename is extracted automatically, no need to run basename yourself"`
 	Events         []string `json:"events,omitempty" jsonschema:"optional: only notify for these event kinds (REVIEW, REVIEW_DISMISSED, COMMENT, CI, CI_RECOVERED, CI_SUCCESS, CONFLICT, MERGED, CLOSED, REOPENED, MERGE_QUEUE, PUSH, REVIEW_REQUESTED, READY_FOR_REVIEW, DRAFTED, THREAD_RESOLVED), e.g. [\"MERGED\"] to only hear about the merge; omit for the persona's default kinds. Applies to every URL in pr_urls alike. Re-registering the same pr_url/session_id with a different events list just replaces the filter, same as register's other idempotent-refresh behavior."`
 	Persona        string   `json:"persona,omitempty" jsonschema:"optional: author (default: you watch your own PR/MR, so CI, conflicts, reviews and comments matter) or reviewer (you review someone else's PR/MR: new commits, review requests for you, draft changes and resolved threads matter, CI and conflicts do not, and the row badge shows only the PR and your own review progress). Only sets the default events and badge; an explicit events list always wins."`
@@ -182,7 +182,10 @@ func detectProvider(prURL string) (string, error) {
 	if _, _, _, err := provider.ParseGitLabMRURL(prURL); err == nil {
 		return "gitlab", nil
 	}
-	return "", fmt.Errorf("pr_url %q is not a recognized GitHub PR or GitLab MR URL", prURL)
+	if _, _, _, err := provider.ParseBitbucketPRURL(prURL); err == nil {
+		return "bitbucket", nil
+	}
+	return "", fmt.Errorf("pr_url %q is not a recognized GitHub PR, GitLab MR or Bitbucket Cloud PR URL", prURL)
 }
 
 // NewHandler builds the MCP-over-HTTP handler exposing register/unregister/

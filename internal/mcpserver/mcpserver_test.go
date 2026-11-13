@@ -167,6 +167,39 @@ func TestRegisterThenListThenUnregister(t *testing.T) {
 	}
 }
 
+func TestRegisterAcceptsABitbucketCloudPR(t *testing.T) {
+	store := openTestStore(t)
+	srv := httptest.NewServer(NewHandler(store, &fakeGitHubReviewClient{}, &fakeSessionValidator{}, &fakeUIPusher{}))
+	defer srv.Close()
+
+	callTool(t, srv, "register", map[string]any{
+		"pr_urls":    []string{"https://bitbucket.org/acme/widgets/pull-requests/12"},
+		"session_id": "sess1",
+	})
+
+	regs, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(regs) != 1 || regs[0].Provider != "bitbucket" {
+		t.Fatalf("store.List() = %+v, want one bitbucket registration", regs)
+	}
+}
+
+func TestRegisterRejectsALookalikeBitbucketHost(t *testing.T) {
+	store := openTestStore(t)
+	srv := httptest.NewServer(NewHandler(store, &fakeGitHubReviewClient{}, &fakeSessionValidator{}, &fakeUIPusher{}))
+	defer srv.Close()
+
+	callToolExpectError(t, srv, "register", map[string]any{
+		"pr_urls":    []string{"https://bitbucket.evil.example/acme/widgets/pull-requests/12"},
+		"session_id": "sess1",
+	})
+	if regs, _ := store.List(context.Background()); len(regs) != 0 {
+		t.Errorf("store.List() = %+v, want nothing registered", regs)
+	}
+}
+
 func TestRegisterMultiplePRsInOneCall(t *testing.T) {
 	store := openTestStore(t)
 	push := &fakeUIPusher{}

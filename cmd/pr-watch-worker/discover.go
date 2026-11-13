@@ -217,6 +217,14 @@ func (r *gitRemoteResolver) resolveIdentity(ctx context.Context, sourcePath stri
 	if !ok {
 		return remoteIdentity{}
 	}
+	// bitbucket.org is as fixed a host as github.com, so no credential probe
+	// decides it; its repositories are exactly workspace/repo.
+	if strings.EqualFold(host, "bitbucket.org") {
+		if workspace, repo, ok := strings.Cut(path, "/"); ok && workspace != "" && repo != "" && !strings.Contains(repo, "/") {
+			return remoteIdentity{provider: "bitbucket", remoteKey: workspace + "/" + repo, ok: true}
+		}
+		return remoteIdentity{}
+	}
 	if !r.credentialFor(ctx, host) {
 		return remoteIdentity{}
 	}

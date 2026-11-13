@@ -1082,3 +1082,15 @@ func TestGroupingKeepsManyIdenticalPRsInFullMode(t *testing.T) {
 		t.Errorf("chips = %v, want %v", got, want)
 	}
 }
+
+// Ordering and merge-queue grouping read the PR number and repo from the URL,
+// for every provider, Bitbucket included.
+func TestPRNumberAndRepoKeyForBitbucket(t *testing.T) {
+	r := registry.Registration{Provider: "bitbucket", PRURL: "https://bitbucket.org/acme/widgets/pull-requests/12"}
+	if got := prNumber(r); got != 12 {
+		t.Errorf("prNumber() = %d, want 12", got)
+	}
+	if got := repoKey(r); got != "acme/widgets" {
+		t.Errorf("repoKey() = %q, want acme/widgets", got)
+	}
+}

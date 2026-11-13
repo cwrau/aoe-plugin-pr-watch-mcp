@@ -13,6 +13,17 @@ import (
 	"time"
 )
 
+// Subscriptions scan with GitHub and GitLab search; Bitbucket Cloud has none
+// wired in, and its host must not be mistaken for a GitLab instance.
+func TestParseScanScopeURLRefusesBitbucket(t *testing.T) {
+	for _, raw := range []string{"https://bitbucket.org", "https://bitbucket.org/acme", "https://bitbucket.org/acme/widgets"} {
+		_, err := ParseScanScopeURL(raw)
+		if err == nil || !strings.Contains(err.Error(), "Bitbucket") {
+			t.Errorf("ParseScanScopeURL(%q) error = %v, want one saying Bitbucket subscriptions are not supported", raw, err)
+		}
+	}
+}
+
 func TestParseScanScopeURL(t *testing.T) {
 	cases := []struct {
 		raw  string

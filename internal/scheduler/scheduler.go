@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -34,6 +35,15 @@ type GitLabChecker interface {
 	Check(ctx context.Context, url string) (provider.CheckResult, provider.RateBudget, error)
 	DiscoverBranchMR(ctx context.Context, host, projectPath, branch string) (string, bool, provider.RateBudget, error)
 	SelfUsername(ctx context.Context, host string) (string, error)
+}
+
+// BitbucketChecker is the narrow view of provider.BitbucketChecker. Bitbucket
+// Cloud reports no rate-limit headers, so its checks carry no budget and are
+// paced by the fallback interval.
+type BitbucketChecker interface {
+	Check(ctx context.Context, url string) (provider.CheckResult, provider.RateBudget, error)
+	DiscoverBranchPR(ctx context.Context, workspace, repo, branch string) (string, bool, provider.RateBudget, error)
+	SelfAccount(ctx context.Context) (string, error)
 }
 
 // SessionClassifier is the narrow view of aoeclient.Client the scheduler
@@ -95,6 +105,7 @@ type Scheduler struct {
 	Store      *registry.Store
 	GitHub     GitHubChecker
 	GitLab     GitLabChecker
+	Bitbucket  BitbucketChecker // optional: nil backs Bitbucket registrations off until it is set
 	Sessions   SessionClassifier
 	Notify     Sender
 	Workspaces WorkspaceSource // optional: nil disables auto-watch discovery entirely
@@ -192,8 +203,11 @@ func (s *Scheduler) Tick(ctx context.Context) error {
 	var githubReady []registry.Registration
 	gitlabCache := make(map[string]gitlabCheckResult)
 	gitlabChecked := make(map[string]int) // host -> number of distinct MRs checked against it this tick
+	bitbucketCache := make(map[string]gitlabCheckResult)
 	for _, reg := range due {
 		switch reg.Provider {
+		case "bitbucket":
+			s.processBitbucketRegistration(ctx, reg, now, counts, bitbucketCache)
 		case "github":
 			if s.preflight(ctx, reg, now) {
 				githubReady = append(githubReady, reg)
@@ -455,6 +469,39 @@ func (s *Scheduler) processGitLabRegistration(ctx context.Context, reg registry.
 	}
 	cache[reg.PRURL] = gitlabCheckResult{result: result, interval: interval, checkErr: checkErr}
 
+	if checkErr != nil {
+		s.finishError(ctx, reg, checkErr)
+	} else {
+		s.finish(ctx, reg, result, interval)
+	}
+}
+
+// processBitbucketRegistration handles one due Bitbucket registration like
+// GitLab's: session state first, then this tick's cached result for the URL
+// (another session watching the same PR) or one real check. There is no budget
+// to consult: Bitbucket Cloud sends no rate-limit headers.
+func (s *Scheduler) processBitbucketRegistration(ctx context.Context, reg registry.Registration, now time.Time, counts map[string]int, cache map[string]gitlabCheckResult) {
+	if !s.classifySession(ctx, reg, now) {
+		return
+	}
+	if cached, ok := cache[reg.PRURL]; ok {
+		if cached.checkErr != nil {
+			s.finishError(ctx, reg, cached.checkErr)
+		} else {
+			s.finish(ctx, reg, cached.result, cached.interval)
+		}
+		return
+	}
+	if s.Bitbucket == nil {
+		s.finishError(ctx, reg, errors.New("bitbucket is not configured"))
+		return
+	}
+	result, budget, checkErr := s.Bitbucket.Check(ctx, reg.PRURL)
+	var interval time.Duration
+	if checkErr == nil {
+		interval = ComputeInterval(budget, counts["bitbucket"], time.Now())
+	}
+	cache[reg.PRURL] = gitlabCheckResult{result: result, interval: interval, checkErr: checkErr}
 	if checkErr != nil {
 		s.finishError(ctx, reg, checkErr)
 	} else {
@@ -797,6 +844,16 @@ func (s *Scheduler) selfAuthor(ctx context.Context, reg registry.Registration) s
 			return ""
 		}
 		return username
+	case "bitbucket":
+		if s.Bitbucket == nil {
+			return ""
+		}
+		account, err := s.Bitbucket.SelfAccount(ctx)
+		if err != nil {
+			s.log().Warn("cannot resolve the worker's own account, so its own reviews and comments are not filtered out of pings; retrying on the next poll", "provider", "bitbucket", "error", err)
+			return ""
+		}
+		return account
 	}
 	return ""
 }

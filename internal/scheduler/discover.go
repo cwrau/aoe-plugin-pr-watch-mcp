@@ -154,8 +154,11 @@ func (s *Scheduler) probeTargets(ctx context.Context, due []registry.AutoDiscove
 	}
 	var githubDue []registry.AutoDiscoveryTarget
 	var gitlabDue []registry.AutoDiscoveryTarget
+	var bitbucketDue []registry.AutoDiscoveryTarget
 	for _, t := range due {
 		switch t.Provider {
+		case "bitbucket":
+			bitbucketDue = append(bitbucketDue, t)
 		case "github":
 			githubDue = append(githubDue, t)
 		case "gitlab":
@@ -169,6 +172,27 @@ func (s *Scheduler) probeTargets(ctx context.Context, due []registry.AutoDiscove
 	for _, t := range gitlabDue {
 		s.discoverGitLabOne(ctx, t, now)
 	}
+	for _, t := range bitbucketDue {
+		s.discoverBitbucketOne(ctx, t, now)
+	}
+}
+
+// discoverBitbucketOne resolves one unresolved Bitbucket auto-discovery target
+// (remote key "workspace/repo"), one REST call like GitLab's.
+func (s *Scheduler) discoverBitbucketOne(ctx context.Context, t registry.AutoDiscoveryTarget, now time.Time) {
+	if s.Bitbucket == nil {
+		return
+	}
+	workspace, repo, ok := strings.Cut(t.RemoteKey, "/")
+	if !ok {
+		return
+	}
+	prURL, found, _, err := s.Bitbucket.DiscoverBranchPR(ctx, workspace, repo, t.Branch)
+	if err != nil {
+		s.log().Warn("bitbucket branch discovery failed, retrying on the next pass", "session_id", t.SessionID, "source_path", t.SourcePath, "error", err)
+		return
+	}
+	s.finishDiscovery(ctx, t, prURL, found, now)
 }
 
 // discoverGitHub resolves every unresolved GitHub auto-discovery target in one

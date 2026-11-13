@@ -58,6 +58,35 @@ func TestGitRemoteResolverResolvesGitHubHost(t *testing.T) {
 	}
 }
 
+// bitbucket.org is a fixed host like github.com: no credential probe decides
+// it, and the key is "workspace/repo".
+func TestGitRemoteResolverResolvesBitbucketCloud(t *testing.T) {
+	for _, remote := range []string{
+		"git@bitbucket.org:acme/widgets.git",
+		"https://bitbucket.org/acme/widgets.git",
+		"https://someone@bitbucket.org/acme/widgets.git",
+		"ssh://git@bitbucket.org/acme/widgets.git",
+	} {
+		dir := gitCheckoutWithRemote(t, remote)
+		r := &gitRemoteResolver{glabTokenFunc: func(context.Context, string) (string, error) {
+			t.Error("glab was asked for a token for bitbucket.org")
+			return "", nil
+		}}
+		prov, remoteKey, branch, ok := r.Resolve(context.Background(), dir)
+		if !ok || prov != "bitbucket" || remoteKey != "acme/widgets" || branch != "resolver-test-branch" {
+			t.Errorf("Resolve(%q) = (%q, %q, %q, %v), want (bitbucket, acme/widgets, resolver-test-branch, true)", remote, prov, remoteKey, branch, ok)
+		}
+	}
+}
+
+func TestGitRemoteResolverRejectsABitbucketRemoteThatIsNotWorkspaceSlashRepo(t *testing.T) {
+	dir := gitCheckoutWithRemote(t, "https://bitbucket.org/acme/widgets/extra.git")
+	r := &gitRemoteResolver{glabTokenFunc: func(context.Context, string) (string, error) { return "", nil }}
+	if _, _, _, ok := r.Resolve(context.Background(), dir); ok {
+		t.Error("Resolve() ok = true for a bitbucket path that is not workspace/repo, want false")
+	}
+}
+
 func TestGitRemoteResolverResolvesConfiguredGitLabHost(t *testing.T) {
 	dir := gitCheckoutWithRemote(t, "https://gitlab.corp.example/team/project.git")
 	r := &gitRemoteResolver{glabTokenFunc: func(ctx context.Context, host string) (string, error) {

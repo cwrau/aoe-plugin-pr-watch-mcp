@@ -1,6 +1,6 @@
 # PR Watch
 
-Persistent GitHub PR / GitLab MR watcher for
+Persistent GitHub PR / GitLab MR / Bitbucket Cloud PR watcher for
 [Agent of Empires](https://github.com/agent-of-empires/agent-of-empires)
 (AoE). It watches the PRs/MRs your sessions work on and pings the owning
 session, via AoE's own message channel, when something needs attention:
@@ -33,9 +33,31 @@ a review, a comment, CI turning red, a conflict, a merge.
   - The GitLab token comes from `glab config get token --host <host>`, per
     host, at check time. A host with no configured credential is never sent
     one, and a checkout on such a host is not auto-watched.
+  - Bitbucket Cloud has no CLI: see [Bitbucket Cloud](#bitbucket-cloud).
 - Optional: AoE's `session.lifecycle.changed` notification (not in a release
   yet). Without it new sessions are picked up by the 10-minute resync instead
   of immediately.
+
+## Bitbucket Cloud
+
+bitbucket.org PRs (`https://bitbucket.org/<workspace>/<repo>/pull-requests/<n>`,
+shown as `workspace/repo#n`) are watched like the others: auto-discovery from
+the checkout's remote, `register`, reviews, CI, conflicts, comments and merges.
+Set the token in the plugin's settings:
+
+- **Bitbucket token** with **Bitbucket account email** for an Atlassian API
+  token (sent as HTTP Basic), or the token alone for a workspace or repository
+  access token (sent as Bearer). It needs read access to pull requests and
+  repositories. Without a token, Bitbucket watches are skipped.
+- AoE has no masked setting type, so the token is stored in the config and
+  shown as plain text.
+- The token is only ever sent to `api.bitbucket.org`.
+
+Mapping: approvals and "request changes" come from the participants (a request
+for changes outranks approvals), CI from the PR's build statuses, conflicts
+from the conflicts endpoint, review threads from inline comments without a
+resolution. Not supported: Bitbucket Server/Data Center, and `subscribe`
+(register individual PRs instead).
 
 ## Install
 
@@ -309,7 +331,7 @@ plugin's, without its platform prefix, since this plugin also watches GitLab.
 | Your review | in progress, approved (reviewer persona) |
 | Snoozed | snoozed |
 | Subscription | watching matches, notifying about matches |
-| Provider | GitHub, GitLab |
+| Provider | GitHub, GitLab, Bitbucket |
 
 ## Snoozing
 
@@ -394,6 +416,9 @@ threads.
 - GitLab: one request per distinct MR per poll, a few more when it has
   approvals, discussions or a failing pipeline. An instance without the
   approvals endpoint just shows no approvals.
+- Bitbucket Cloud: four to five requests per poll (the PR, its build statuses,
+  conflicts and comments, once the token's own account is cached). It reports
+  no rate-limit headers, so polls are paced by the fallback interval.
 - A row badge has an 8KB payload cap on the host. Chips of different PRs that
   say the same thing are merged first: twelve open PRs with passing CI and no
   review show one eye with `12`, `success ×12` and `no review ×12`, whose
@@ -413,9 +438,11 @@ threads.
   `dismiss_review` acts with your GitHub token. Browsers are kept out: a
   non-loopback `Host` (DNS rebinding) and any cross-site `Origin` or
   `Sec-Fetch-Site` are rejected with 403.
-- Credentials are never stored: tokens come from `gh`/`glab` at request time,
-  are cached in memory, and are re-read only after a 401. A GitLab token is
-  only sent to a host it is configured for.
+- GitHub and GitLab credentials are never stored: tokens come from
+  `gh`/`glab` at request time, are cached in memory, and are re-read only
+  after a 401. A GitLab token is only sent to a host it is configured for.
+  The Bitbucket token is the exception: it lives in the plugin's settings (as
+  plain text) and is only sent to `api.bitbucket.org`.
 - PR/MR text (titles, descriptions, comments) is untrusted. Pings carry
   author names and short summaries, descriptions are shown through the host's
   sanitising `markdown` pane block, and the worker never executes anything it

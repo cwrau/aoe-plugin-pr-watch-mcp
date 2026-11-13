@@ -43,6 +43,9 @@ func ParseScanScopeURL(raw string) (ScanScope, error) {
 	if host == "" {
 		return ScanScope{}, fmt.Errorf("scope_url %q has no host", raw)
 	}
+	if host == "bitbucket.org" || host == "www.bitbucket.org" {
+		return ScanScope{}, fmt.Errorf("scope_url %q: Bitbucket subscriptions are not supported; register individual Bitbucket PRs instead", raw)
+	}
 	var segs []string
 	for s := range strings.SplitSeq(strings.Trim(u.Path, "/"), "/") {
 		if s != "" {

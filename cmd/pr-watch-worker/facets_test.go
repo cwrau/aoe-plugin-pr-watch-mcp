@@ -36,6 +36,8 @@ func TestFilterValuesPerRegistrationState(t *testing.T) {
 		{"plain open github watch", watching(nil), []string{"persona:author", "pr:open", "provider:github", "review:waiting"}},
 		{"gitlab provider", watching(func(r *registry.Registration) { r.Provider = "gitlab" }),
 			[]string{"persona:author", "pr:open", "provider:gitlab", "review:waiting"}},
+		{"bitbucket provider", watching(func(r *registry.Registration) { r.Provider = "bitbucket" }),
+			[]string{"persona:author", "pr:open", "provider:bitbucket", "review:waiting"}},
 		{"draft", watching(func(r *registry.Registration) { r.IsDraft = true }),
 			[]string{"persona:author", "pr:draft", "provider:github", "review:waiting"}},
 		{"ci passing", watching(func(r *registry.Registration) { r.CIBucket = "success" }),
@@ -141,6 +143,7 @@ func TestEveryEmittedFilterValueIsAnOfferedFacetOption(t *testing.T) {
 		watching(func(r *registry.Registration) {
 			r.Snoozed, r.IsDraft, r.SubscriptionID, r.Provider = true, true, "sub", "gitlab"
 		}),
+		watching(func(r *registry.Registration) { r.Provider = "bitbucket" }),
 		watching(func(r *registry.Registration) { r.Persona = registry.PersonaReviewer }),
 		watching(func(r *registry.Registration) { r.Persona, r.SelfReviewState = registry.PersonaReviewer, "APPROVED" }),
 		watching(func(r *registry.Registration) { r.Status = registry.StatusMerged }),

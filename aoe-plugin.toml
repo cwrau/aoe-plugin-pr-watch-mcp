@@ -8,7 +8,7 @@ name = "PR Watch"
 version = "0.2.0"
 api_version = 16
 aoe_version = ">=1.20.0, <2.0.0"
-description = "Persistent GitHub PR / GitLab MR watcher: register once, get woken on review/CI/merge activity, even across session restarts."
+description = "Persistent GitHub PR / GitLab MR / Bitbucket Cloud PR watcher: register once, get woken on review/CI/merge activity, even across session restarts."
 
 # net             - GitHub GraphQL/REST calls, GitLab REST calls, and the
 #                   worker's own MCP-over-HTTP listener (loopback, but still
@@ -146,6 +146,22 @@ id = "subscription"
 [[ui]]
 slot = "filter-facet"
 id = "provider"
+
+# Bitbucket Cloud credentials. GitHub and GitLab tokens come from the gh and
+# glab CLIs; Bitbucket has no such CLI, so the token is a setting. AoE has no
+# masked setting type, so it is stored and shown as plain text. The token is
+# only ever sent to api.bitbucket.org.
+[[settings]]
+key = "bitbucket_token"
+label = "Bitbucket token"
+description = "Token for Bitbucket Cloud (bitbucket.org). Either an Atlassian API token (also set the email below) or a workspace/repository access token (leave the email empty). Needs read access to pull requests and repositories. Empty means Bitbucket PRs are not watched. Stored as plain text."
+type = "string"
+
+[[settings]]
+key = "bitbucket_email"
+label = "Bitbucket account email"
+description = "Atlassian account email, only for an Atlassian API token (sent as HTTP Basic with the token). Leave empty for a workspace or repository access token, which is sent as a Bearer token."
+type = "string"
 
 # Snooze rules: while a rule's gate command exits non-zero, registrations
 # whose PR/MR URL matches one of its patterns (and none of its optional

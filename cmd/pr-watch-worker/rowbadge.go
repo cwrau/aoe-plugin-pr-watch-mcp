@@ -307,6 +307,12 @@ func prNumber(r registry.Registration) int {
 		}
 		return 0
 	}
+	if r.Provider == "bitbucket" {
+		if _, _, n, err := provider.ParseBitbucketPRURL(r.PRURL); err == nil {
+			return n
+		}
+		return 0
+	}
 	if _, _, n, err := provider.ParseGitLabMRURL(r.PRURL); err == nil {
 		return n
 	}
@@ -325,6 +331,12 @@ func repoKey(r registry.Registration) string {
 	if r.Provider == "github" {
 		if owner, repo, _, err := provider.ParseGitHubPRURL(r.PRURL); err == nil {
 			return owner + "/" + repo
+		}
+		return ""
+	}
+	if r.Provider == "bitbucket" {
+		if workspace, repo, _, err := provider.ParseBitbucketPRURL(r.PRURL); err == nil {
+			return workspace + "/" + repo
 		}
 		return ""
 	}

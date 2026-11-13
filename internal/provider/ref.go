@@ -18,6 +18,10 @@ func ShortRef(prURL, prov string) string {
 		if _, path, iid, err := ParseGitLabMRURL(prURL); err == nil {
 			return fmt.Sprintf("%s!%d", path, iid)
 		}
+	case "bitbucket":
+		if workspace, repo, id, err := ParseBitbucketPRURL(prURL); err == nil {
+			return fmt.Sprintf("%s/%s#%d", workspace, repo, id)
+		}
 	}
 	return prURL
 }

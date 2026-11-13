@@ -147,6 +147,14 @@ func main() {
 		TokenFunc: glabTokenFunc,
 	}
 
+	// Bitbucket Cloud has no CLI to ask for a token, so it comes from the
+	// plugin's settings (read below with the other settings).
+	bbCredentials := &bitbucketCredentials{}
+	bbChecker := &provider.BitbucketChecker{
+		HTTPClient:  httpClient,
+		Credentials: bbCredentials.get,
+	}
+
 	snooze := &snoozeRules{}
 	filters := &commentFilters{}
 
@@ -156,6 +164,7 @@ func main() {
 		Store:          store,
 		GitHub:         ghChecker,
 		GitLab:         glChecker,
+		Bitbucket:      bbChecker,
 		GitHubScan:     ghChecker,
 		GitLabScan:     glChecker,
 		Sessions:       aoe,
@@ -173,6 +182,7 @@ func main() {
 	refreshSettings := func() {
 		snooze.refresh(ctx, rpc, logger)
 		filters.refresh(ctx, rpc, logger)
+		bbCredentials.refresh(ctx, rpc, logger)
 	}
 	rpc.onSettingsChanged = refreshSettings
 	discovery := newDiscoveryTrigger(discoveryDebounce)

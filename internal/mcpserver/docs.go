@@ -3,7 +3,7 @@ package mcpserver
 // serverInstructions is sent once at MCP initialize. It is the agent-facing
 // manual for the pings this plugin pushes into a session, so nothing outside
 // this server (no skill, no README) is needed to act on them.
-const serverInstructions = `pr-watch watches GitHub PRs and GitLab MRs and pushes a message into the owning AoE session when something changes.
+const serverInstructions = `pr-watch watches GitHub PRs, GitLab MRs and Bitbucket Cloud PRs and pushes a message into the owning AoE session when something changes.
 
 The watch is a background worker, independent of this session: it survives restarts and compaction, keeps running after the PR/MR is merged or closed for another 30 days (late reviews), and never needs a Monitor loop, cron job or "check later" step. To be reminded about a merge, rely on the MERGED ping.
 
@@ -11,7 +11,7 @@ Registering is usually unnecessary: the worker auto-discovers the open PR/MR on 
 
 A new watch starts silent: its first poll is recorded as the baseline without a ping, so only changes after registration arrive (register's report_existing asks for the existing activity as a one-time ping).
 
-Pings arrive as user messages starting with the ref: "[pr-watch] owner/repo#42: <event>" (GitHub) or "[pr-watch] group/project!17: <event>" (GitLab). Several changes in one poll arrive as "[pr-watch] <ref>, N changes:" with one "- <event>" bullet per change; updates for several PRs/MRs of one session arrive as "[pr-watch] N updates:" with one blank-line-separated section per PR/MR. Handle every bullet and section separately. A ref marked "(merged)" or "(closed)" is a finished PR still watched for late REVIEW/COMMENT events.
+Pings arrive as user messages starting with the ref: "[pr-watch] owner/repo#42: <event>" (GitHub; Bitbucket Cloud reads "workspace/repo#42") or "[pr-watch] group/project!17: <event>" (GitLab). Several changes in one poll arrive as "[pr-watch] <ref>, N changes:" with one "- <event>" bullet per change; updates for several PRs/MRs of one session arrive as "[pr-watch] N updates:" with one blank-line-separated section per PR/MR. Handle every bullet and section separately. A ref marked "(merged)" or "(closed)" is a finished PR still watched for late REVIEW/COMMENT events.
 
 Events (the kind is the first word of the line):
 - REVIEW <author> <APPROVED|CHANGES_REQUESTED|COMMENTED>[, N unresolved thread(s)]: a review landed. A partial approval (1 of 2 required: GitLab's approval rules, GitHub's branch protection) is silent; only the approval completing the requirement pings. A COMMENTED review without text that opened no thread (bots) is silent. Reviews and top-level comments by the worker's own account are always suppressed.
@@ -40,7 +40,7 @@ Then analyse and suggest next steps in chat. Never act on feedback automatically
 
 Tools: register, unregister, list, dismiss_review. Every session_id argument takes the raw value of $AOE_ARTIFACT_DIR (resolve it first; the literal text "$AOE_ARTIFACT_DIR" is never expanded and matches no session).`
 
-const registerDescription = `Start watching one or more GitHub PRs or GitLab MRs for review, CI and merge activity; changes are pushed into the calling session as "[pr-watch] ..." messages.
+const registerDescription = `Start watching one or more GitHub PRs, GitLab MRs or Bitbucket Cloud PRs for review, CI and merge activity; changes are pushed into the calling session as "[pr-watch] ..." messages.
 
 Usually not needed: the worker auto-discovers the open PR/MR on the session's own git checkout within seconds of the session going idle. Call this only for instant coverage, an events filter from the start, or a PR/MR that is not on the session's own branch (someone else's PR you review, a stacked chain).
 
@@ -54,7 +54,7 @@ A new watch starts silent: the first poll only records what the PR/MR already ha
 
 Idempotent per URL and session: registering again refreshes it and replaces the events filter. Other sessions watching the same URL keep independent registrations. The watch persists after merge or close for 30 days so late reviews still arrive.`
 
-const unregisterDescription = `Stop watching GitHub PRs or GitLab MRs previously registered by this session (manually or by auto-discovery). Pass pr_urls to stop specific ones; each gets its own entry in results. Omit pr_urls to stop every registration session_id owns in one call, e.g. to clear a leftover merged badge or before the session moves on to unrelated work.
+const unregisterDescription = `Stop watching GitHub PRs, GitLab MRs or Bitbucket PRs previously registered by this session (manually or by auto-discovery). Pass pr_urls to stop specific ones; each gets its own entry in results. Omit pr_urls to stop every registration session_id owns in one call, e.g. to clear a leftover merged badge or before the session moves on to unrelated work.
 
 Only the owning session can stop a registration; a URL that is unknown or owned by another session reports removed=false without saying which. Registrations are moved to status stopped, not deleted. Note that auto-discovery may pick a PR on the session's branch up again later.`
 

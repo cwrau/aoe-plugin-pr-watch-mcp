@@ -93,6 +93,7 @@ var filterFacets = []facetDef{
 	{ID: "provider", Label: "Provider", Column: rowColumnID, Options: []facetOption{
 		opt("provider", "github", "GitHub", "neutral"),
 		opt("provider", "gitlab", "GitLab", "neutral"),
+		opt("provider", "bitbucket", "Bitbucket", "neutral"),
 	}},
 }
 
